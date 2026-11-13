@@ -1,7 +1,6 @@
 @import 'lib';
 
 .amo-header {
-    font-family: @head-sans;
     margin-bottom: 25px;
 
     /* Log in link loader */
@@ -148,7 +147,7 @@
                     text-decoration: none;
                     display: block;
                     padding: 6px 8px;
-                    word-wrap: break-word;
+                    overflow-wrap: break-word;
 
                     &:hover {
                         background: #ebf4fe;
@@ -456,7 +455,7 @@ button.search-button {
     .border-radius(4px);
     .box-shadow(0 0 2px rgba(0, 0, 0, 0.4) inset);
     float: left;
-    font: 14px @head-sans;
+    font-size: 14px;
     text-overflow: ellipsis;
     padding: 6px 6px 6px 32px;
     .width-calc(~'100% - 42px', 238px);

@@ -1,75 +1,80 @@
-{% extends "devhub/base_impala.html" %}
+{% extends "devhub/base.html" %}
 
 {% block title %}{{ dev_page_title(title) }}{% endblock %}
 
 {% block content %}
 <header>
-  <h1>{{ title }}</h1>
+  <h2>{{ title }}</h2>
 </header>
 
 <section class="primary full">
-  <div class="island prettyform row">
-    <form method="post" class="item api-credentials">
-      {% csrf_token %}
-      <fieldset>
-        <legend>
-          {{ _('API Credentials') }}
-        </legend>
-        <p>
-        {% trans
-            docs_url='https://addons-server.readthedocs.io/en/latest/topics/api/index.html' %}
-          For detailed instructions, consult the <a href="{{ docs_url }}">API documentation</a>.
-        {% endtrans %}
-        </p>
-
-        <p class="notification-box error">
-          {{ _('Keep your API keys secret and <strong>never share them with anyone</strong>, including Mozilla contributors.') }}
-        </p>
-        {% if credentials %}
-          <ul class="api-credentials">
-            <li class="row api-input key-input">
-              <label for="jwtkey" class="row">{{ _('JWT issuer') }}</label>
-              <input type="text" name="jwtkey" value="{{ credentials.key }}" readonly/>
-            </li>
-            <li class="row api-input">
-              <label for="jwtsecret" class="row">{{ _('JWT secret') }}</label>
-              <input type="text" name="jwtsecret" value="{{ credentials.secret }}" readonly/>
-            </li>
-          </ul>
-          <p>
-          {% trans
-              docs_url='https://addons-server.readthedocs.io/en/latest/topics/api/auth.html',
-              jwt_url='https://self-issued.info/docs/draft-ietf-oauth-json-web-token.html' %}
-            To make API requests, send a <a href="{{ jwt_url }}">JSON Web Token (JWT)</a> as the authorization header.
-            You'll need to generate a JWT for every request as explained in the
-            <a href="{{ docs_url }}">API documentation</a>.
-          {% endtrans %}
-          </p>
-        {% else %}
-          <p>
-          {% trans %}
-            You don't have any API credentials.
-          {% endtrans %}
-          </p>
-        {% endif %}
-      </fieldset>
-      <div class="listing-footer">
-        <p class="footer-submit">
-          {% if credentials %}
-            <button id="revoke-key" class="button prominent" type="submit" name="action" value="revoke">
-              {{ _('Revoke') }}
-            </button>
-            <button id="generate-key" class="button prominent" type="submit" name="action" value="generate">
-              {{ _('Revoke and regenerate credentials') }}
-            </button>
+  <form method="post" class="api-credentials" name="api-credentials-form">
+    {% csrf_token %}
+    {% if '__all__' in form.errors %}
+      <p class="text-danger">
+        {{ form.errors.__all__ }}
+      </p>
+    {% endif %}
+    <p>
+      {% trans jwt_url='https://datatracker.ietf.org/doc/html/rfc7519', docs_url='https://mozilla.github.io/addons-server/topics/api/index.html',
+      a_attrs='target="_blank" rel="noopener noreferrer"', auth_header_name='Authorization' %}
+        To execute authenticated calls against the <a {{ a_attrs }} href="{{ docs_url }}">API</a> as an external consumer, you need to include a <a {{ a_attrs }} href="{{ jwt_url }}">JSON Web Token (JWT)</a> in the <code>{{ auth_header_name }}</code> header for every request.
+      {% endtrans %}
+      {% trans %}
+        Keep your API keys secret and never share them with anyone, including Mozilla staff or contributors.
+      {% endtrans %}
+    </p>
+    {% if form.credentials %}
+      <dl>
+        <dt>{{ _('Created') }}</dt>
+        <dd>{{ form.credentials.created|date }}</dd>
+        <dt>{{ _('JWT issuer') }}</dt>
+        <dd><code>{{ form.credentials.key }}</code></dd>
+        <dt>{{ _('JWT secret') }}</dt>
+        <dd>
+          {% if generated %}
+            <code>{{ form.credentials.secret }}</code>&nbsp;<a href="#" class="widget copy tooltip"></a>
           {% else %}
-            <button id="generate-key" class="button prominent" type="submit" name="action" value="generate">
-              {{ _('Generate new credentials') }}
-            </button>
+            <code>{{ form.credentials.secret[:8] }}{{ "." * 48 }}{{ form.credentials.secret[-8:] }}</code>
           {% endif %}
-        </p>
+        </dd>
+      </dl>
+    {% elif 'resend_confirm' in form.available_actions or 'confirm' in form.available_actions %}
+      <p>
+        {% trans %}
+          After following the confirmation link that was sent to your email address, you will find your API keys on this page.
+        {% endtrans %}
+        {% if 'resend_confirm' in form.available_actions %}
+          <a class="show-resend-button" href="#">{{ _("Haven't received the email yet?") }}</a>
+        {% endif %}
+      </p>
+    {% endif %}
+    {% for field in form %}
+      <div class="row api-input key-input">
+        {% if field.help_text %}
+          <p>{{ field.help_text|format_html(name=form.request.user.name) }}</p>
+        {% endif %}
+        {% if field.errors %}
+          <div class="text-danger">
+              {{ field.errors }}
+          </div>
+        {% endif %}
+        <label for="{{ field.id_for_label }}">{{ field.label }}</label>
+        {{ field }}
       </div>
-    </form>
-  </div>
+    {% endfor %}
+    <div>
+      {% for action in form.available_actions %}
+        <button
+          class="button prominent {{ 'hidden' if action == 'resend_confirm' and request.method == 'GET' else ''}}"
+          type="submit"
+          name="action"
+          value="{{ action }}"
+        >
+          {{ form.ACTION_CHOICES(action).label }}
+        </button>
+      {% endfor %}
+    </div>
+  </form>
 </section>
 {% endblock content %}

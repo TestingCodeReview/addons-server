@@ -1,12 +1,16 @@
-import mock
+from unittest import mock
+
+from django.conf import settings
 
 from rest_framework import generics, serializers, status
 from rest_framework.test import APIRequestFactory
 
 from olympia.amo.tests import TestCase
 from olympia.api.pagination import (
-    CustomPageNumberPagination, ESPageNumberPagination,
-    OneOrZeroPageNumberPagination)
+    CustomPageNumberPagination,
+    ESPageNumberPagination,
+    OneOrZeroPageNumberPagination,
+)
 
 
 class PassThroughSerializer(serializers.BaseSerializer):
@@ -20,7 +24,7 @@ class TestCustomPageNumberPagination(TestCase):
         self.view = generics.ListAPIView.as_view(
             serializer_class=PassThroughSerializer,
             queryset=list(range(1, 101)),
-            pagination_class=CustomPageNumberPagination
+            pagination_class=CustomPageNumberPagination,
         )
 
     def test_metadata_with_page_size(self):
@@ -33,7 +37,7 @@ class TestCustomPageNumberPagination(TestCase):
             'results': list(range(11, 21)),
             'previous': 'http://testserver/?page_size=10',
             'next': 'http://testserver/?page=3&page_size=10',
-            'count': 100
+            'count': 100,
         }
 
     def test_metadata_with_default_page_size(self):
@@ -46,43 +50,49 @@ class TestCustomPageNumberPagination(TestCase):
             'results': list(range(1, 26)),
             'previous': None,
             'next': 'http://testserver/?page=2',
-            'count': 100
+            'count': 100,
         }
 
 
 class TestESPageNumberPagination(TestCustomPageNumberPagination):
-
     def test_next_page_never_exeeds_max_result_window(self):
+        total = 50000
         mocked_qs = mock.MagicMock()
-        mocked_qs.__getitem__().execute().hits.total = 30000
+        mocked_qs.__getitem__().execute().hits.total = total
 
         view = generics.ListAPIView.as_view(
             serializer_class=PassThroughSerializer,
             queryset=mocked_qs,
-            pagination_class=ESPageNumberPagination
+            pagination_class=ESPageNumberPagination,
         )
 
-        request = self.factory.get('/', {'page_size': 5, 'page': 4999})
+        # Request the last page that still has a `next`.
+        page_size = 5
+        page = int(settings.ES_MAX_RESULT_WINDOW / page_size) - 1
+        request = self.factory.get('/', {'page_size': page_size, 'page': page})
         response = view(request)
         assert response.data == {
-            'page_size': 5,
-            'page_count': 5000,
+            'page_size': page_size,
+            'page_count': page + 1,  # We know there should be one more.
             'results': mock.ANY,
-            'previous': 'http://testserver/?page=4998&page_size=5',
-            'next': 'http://testserver/?page=5000&page_size=5',
-            'count': 30000
+            'previous': f'http://testserver/?page={page - 1}&page_size={page_size}',
+            'next': f'http://testserver/?page={page + 1}&page_size={page_size}',
+            'count': total,
         }
 
-        request = self.factory.get('/', {'page_size': 5, 'page': 5000})
+        # Request the page that doesn't have a `next` because it's over the
+        # max result window.
+        page = int(settings.ES_MAX_RESULT_WINDOW / page_size)
+        request = self.factory.get('/', {'page_size': page_size, 'page': page})
         response = view(request)
         assert response.data == {
-            'page_size': 5,
-            'page_count': 5000,
+            'page_size': page_size,
+            'page_count': page,  # We know it should be the last one.
             'results': mock.ANY,
-            'previous': 'http://testserver/?page=4999&page_size=5',
+            'previous': f'http://testserver/?page={page - 1}&page_size={page_size}',
             'next': None,
             # We don't lie about the total count
-            'count': 30000
+            'count': total,
         }
 
 
@@ -92,7 +102,7 @@ class TestOneOrZeroPageNumberPagination(TestCase):
         self.view = generics.ListAPIView.as_view(
             serializer_class=PassThroughSerializer,
             queryset=list(range(1, 101)),
-            pagination_class=OneOrZeroPageNumberPagination
+            pagination_class=OneOrZeroPageNumberPagination,
         )
 
     def test_response(self):
@@ -105,14 +115,14 @@ class TestOneOrZeroPageNumberPagination(TestCase):
             'results': list(range(1, 2)),
             'previous': None,
             'next': None,
-            'count': 1
+            'count': 1,
         }
 
     def test_response_with_empty_queryset(self):
         self.view = generics.ListAPIView.as_view(
             serializer_class=PassThroughSerializer,
             queryset=[],
-            pagination_class=OneOrZeroPageNumberPagination
+            pagination_class=OneOrZeroPageNumberPagination,
         )
         request = self.factory.get('/')
         response = self.view(request)
@@ -122,5 +132,5 @@ class TestOneOrZeroPageNumberPagination(TestCase):
             'results': [],
             'previous': None,
             'next': None,
-            'count': 0
+            'count': 0,
         }

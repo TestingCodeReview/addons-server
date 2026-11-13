@@ -1,306 +1,169 @@
-import json
-import os.path
-import random
-import re
 import uuid
-import zipfile
 
 from django import forms
-from django.conf import settings
-from django.core.cache import cache
-from django.db.models import Q
-from django.forms import ValidationError
-from django.utils.translation import ugettext
+from django.core.files.storage import default_storage as storage
+from django.core.signing import BadSignature, SignatureExpired, TimestampSigner
+from django.utils.translation import gettext
 
-import six
 import waffle
 
-from django_statsd.clients import statsd
+from olympia import amo, core
+from olympia.access.acl import action_allowed_for
+from olympia.amo.utils import validate_name
 
-from olympia import amo
-from olympia.amo.utils import normalize_string, to_language
-from olympia.constants.categories import CATEGORIES_BY_ID
-from olympia.discovery.utils import call_recommendation_server
-from olympia.lib.cache import memoize, memoize_key
-from olympia.translations.fields import LocaleErrorMessage
+
+log = core.logger.getLogger('z.addons')
 
 
 def generate_addon_guid():
     return '{%s}' % str(uuid.uuid4())
 
 
-def clear_get_featured_ids_cache(*args, **kwargs):
-    cache_key = memoize_key('addons:featured', *args, **kwargs)
-    cache.delete(cache_key)
+def validate_addon_summary(summary, user, form=None):
+    """
+    Validate that an add-on summary is allowed.
+    """
+    # For the moment we don't do anything other than checking the summary isn't
+    # too complex, so we apply this regardless of the user.
+    return validate_name(
+        summary,
+        check_function=None,
+        # Make the string generic so that it can be used in devhub but also
+        # when importing the summary from the 'description' field in the
+        # manifest.
+        error_message=gettext('This add-on summary or description cannot be used.'),
+        form=form,
+        field_name='summary',
+    )
 
 
-@memoize('addons:featured', timeout=60 * 10)
-def get_featured_ids(app=None, lang=None, type=None, types=None):
-    from olympia.addons.models import Addon
-    ids = []
-    is_featured = Q(collections__featuredcollection__isnull=False)
-    if app:
-        is_featured &= Q(collections__featuredcollection__application=app.id)
-    qs = Addon.objects.valid()
+def validate_addon_name(name, *, user, form=None):
+    """
+    Validate that an add-on name is allowed.
 
-    if type:
-        qs = qs.filter(type=type)
-    elif types:
-        qs = qs.filter(type__in=types)
-    if lang:
-        has_locale = qs.filter(
-            is_featured &
-            Q(collections__featuredcollection__locale__iexact=lang))
-        if has_locale.exists():
-            ids += list(has_locale.distinct().values_list('id', flat=True))
-        none_qs = qs.filter(
-            is_featured &
-            Q(collections__featuredcollection__locale__isnull=True))
-        blank_qs = qs.filter(is_featured &
-                             Q(collections__featuredcollection__locale=''))
-        qs = none_qs | blank_qs
-    else:
-        qs = qs.filter(is_featured)
-    other_ids = list(qs.distinct().values_list('id', flat=True))
-    random.shuffle(ids)
-    random.shuffle(other_ids)
-    ids += other_ids
-    return list(map(int, ids))
+    name can either be  a string or a dict of locale (string) -> name (string)
+    items.
 
-
-@memoize('addons:creatured', timeout=60 * 10)
-def get_creatured_ids(category, lang=None):
-    from olympia.addons.models import Addon
-    from olympia.bandwagon.models import FeaturedCollection
-    if lang:
-        lang = lang.lower()
-    per_locale = set()
-    if isinstance(category, int):
-        category = CATEGORIES_BY_ID[category]
-    app_id = category.application
-
-    others = (Addon.objects.public()
-              .filter(
-                  Q(collections__featuredcollection__locale__isnull=True) |
-                  Q(collections__featuredcollection__locale=''),
-                  collections__featuredcollection__isnull=False,
-                  collections__featuredcollection__application=app_id,
-                  category=category.id)
-              .distinct()
-              .values_list('id', flat=True))
-
-    if lang is not None and lang != '':
-        possible_lang_match = FeaturedCollection.objects.filter(
-            locale__icontains=lang,
-            application=app_id,
-            collection__addons__category=category.id).distinct()
-        for fc in possible_lang_match:
-            if lang in fc.locale.lower().split(','):
-                per_locale.update(
-                    fc.collection.addons
-                    .filter(category=category.id)
-                    .values_list('id', flat=True))
-
-    others = list(others)
-    per_locale = list(per_locale)
-    random.shuffle(others)
-    random.shuffle(per_locale)
-    return list(map(int, filter(None, per_locale + others)))
-
-
-def verify_mozilla_trademark(name, user, form=None):
+    Users with TRADEMARK_BYPASS permission bypass checks performed by this
+    function.
+    """
     skip_trademark_check = (
-        user and user.is_authenticated and user.email and
-        user.email.endswith(amo.ALLOWED_TRADEMARK_SUBMITTING_EMAILS))
+        user
+        and user.is_authenticated
+        and action_allowed_for(user, amo.permissions.TRADEMARK_BYPASS)
+    )
 
-    def _check(name):
-        name = normalize_string(name, strip_punctuation=True).lower()
+    def check_function(normalized_name, variant):
+        if skip_trademark_check:
+            return
 
         for symbol in amo.MOZILLA_TRADEMARK_SYMBOLS:
-            if waffle.switch_is_active('content-optimization'):
-                violates_trademark = symbol in name
-
-            else:
-                violates_trademark = (
-                    name.count(symbol) > 1 or (
-                        name.count(symbol) >= 1 and not
-                        name.endswith(' for {}'.format(symbol))))
+            symbol_count = variant.count(symbol)
+            violates_trademark = symbol_count > 1 or (
+                symbol_count >= 1
+                # 'XXX for Mozilla' or 'XXX for Firefox' is allowed.
+                and not normalized_name.endswith(f' for {symbol}')
+            )
 
             if violates_trademark:
-                raise forms.ValidationError(ugettext(
-                    u'Add-on names cannot contain the Mozilla or '
-                    u'Firefox trademarks.'))
+                msg = gettext(
+                    'Add-on names cannot contain the Mozilla or Firefox trademarks.'
+                )
+                raise forms.ValidationError(msg)
 
-    if not skip_trademark_check:
-        if not isinstance(name, dict):
-            _check(name)
-        else:
-            for locale, localized_name in name.items():
-                try:
-                    _check(localized_name)
-                except forms.ValidationError as exc:
-                    if form is not None:
-                        for message in exc.messages:
-                            error_message = LocaleErrorMessage(
-                                message=message, locale=locale)
-                            form.add_error('name', error_message)
-                    else:
-                        raise
+    validate_name(name, check_function=check_function, form=form)
+
     return name
 
 
-TAAR_LITE_FALLBACKS = [
-    'enhancerforyoutube@maximerf.addons.mozilla.org',  # /enhancer-for-youtube/
-    '{2e5ff8c8-32fe-46d0-9fc8-6b8986621f3c}',          # /search_by_image/
-    'uBlock0@raymondhill.net',                         # /ublock-origin/
-    'newtaboverride@agenedia.com']                     # /new-tab-override/
+RECOMMENDATIONS = [
+    'addon@darkreader.org',  # Dark Reader
+    'treestyletab@piro.sakura.ne.jp',  # Tree Style Tab
+    'languagetool-webextension@languagetool.org',  # LanguageTool
+    '{2e5ff8c8-32fe-46d0-9fc8-6b8986621f3c}',  # Search by Image
+    'simple-tab-groups@drive4ik',  # Simple Tab Groups
+]
 
-TAAR_LITE_OUTCOME_REAL_SUCCESS = 'recommended'
-TAAR_LITE_OUTCOME_REAL_FAIL = 'recommended_fallback'
-TAAR_LITE_OUTCOME_CURATED = 'curated'
-TAAR_LITE_FALLBACK_REASON_TIMEOUT = 'timeout'
-TAAR_LITE_FALLBACK_REASON_EMPTY = 'no_results'
-TAAR_LITE_FALLBACK_REASON_INVALID = 'invalid_results'
+RECOMMENDATION_OUTCOME_CURATED = 'curated'
 
 
-def get_addon_recommendations(guid_param, taar_enable):
-    guids = None
-    fail_reason = None
-    if taar_enable:
-        guids = call_recommendation_server(
-            settings.TAAR_LITE_RECOMMENDATION_ENGINE_URL, guid_param, {})
-        outcome = (TAAR_LITE_OUTCOME_REAL_SUCCESS if guids
-                   else TAAR_LITE_OUTCOME_REAL_FAIL)
-        if not guids:
-            fail_reason = (TAAR_LITE_FALLBACK_REASON_EMPTY if guids == []
-                           else TAAR_LITE_FALLBACK_REASON_TIMEOUT)
+def get_addon_recommendations(guid_param):
+    return get_filtered_fallbacks(guid_param)
+
+
+def get_filtered_fallbacks(current_guid=None):
+    # Filter out the current_guid from RECOMMENDATIONS.
+    # A maximum of 4 should be returned at a time.
+    # See https://mozilla.github.io/addons-server/topics/api/addons.html#recommendations
+    return [guid for guid in RECOMMENDATIONS if guid != current_guid][:4]
+
+
+def compute_last_updated(addon):
+    """Compute the value of last_updated for a single add-on."""
+    from olympia.addons.models import Addon
+
+    queries = Addon._last_updated_queries()
+    if addon.status == amo.STATUS_APPROVED:
+        q = 'public'
     else:
-        outcome = TAAR_LITE_OUTCOME_CURATED
-    if not guids:
-        guids = TAAR_LITE_FALLBACKS
-    return guids, outcome, fail_reason
+        q = 'exp'
+    values = (
+        queries[q]
+        .filter(pk=addon.pk)
+        .using('default')
+        .values_list('last_updated', flat=True)
+    )
+    return values[0] if values else None
 
 
-def is_outcome_recommended(outcome):
-    return outcome == TAAR_LITE_OUTCOME_REAL_SUCCESS
+class DeleteTokenSigner(TimestampSigner):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **{'salt': 'addon-delete', **kwargs})
+
+    def generate(self, addon_id):
+        return self.sign_object({'addon_id': addon_id})
+
+    def validate(self, token, addon_id):
+        try:
+            token_payload = self.unsign_object(token, max_age=60)
+        except (SignatureExpired, BadSignature) as exc:
+            log.debug(exc)
+            return False
+        return token_payload['addon_id'] == addon_id
 
 
-def get_addon_recommendations_invalid():
-    return (
-        TAAR_LITE_FALLBACKS, TAAR_LITE_OUTCOME_REAL_FAIL,
-        TAAR_LITE_FALLBACK_REASON_INVALID)
+def remove_icons(addon):
+    for size in amo.ADDON_ICON_SIZES + ('original',):
+        filepath = addon.get_icon_path(size)
+        if storage.exists(filepath):
+            storage.delete(filepath)
 
 
-MULTIPLE_STOPS_REGEX = re.compile(r'\.{2,}')
+def trigger_content_review(addon, activity_log):
+    from olympia.abuse.tasks import submit_addon_change_for_content_review
+    from olympia.addons.models import AddonApprovalsCounter
+
+    AddonApprovalsCounter.reset_content_for_addon(addon=addon)
+
+    if addon.type in amo.ADDON_CONTENT_REVIEW_TYPES and waffle.switch_is_active(
+        'content-review-in-cinder'
+    ):
+        submit_addon_change_for_content_review.delay(activity_log_pk=activity_log.pk)
 
 
-@statsd.timer('addons.tasks.migrate_lwts_to_static_theme.build_xpi')
-def build_static_theme_xpi_from_lwt(lwt, upload_zip):
-    # create manifest
-    accentcolor = (('#%s' % lwt.persona.accentcolor) if lwt.persona.accentcolor
-                   else amo.THEME_ACCENTCOLOR_DEFAULT)
-    textcolor = '#%s' % (lwt.persona.textcolor or '000')
+def request_content_review(addon, activity_log):
+    from olympia.abuse.tasks import submit_addon_change_for_content_review
+    from olympia.addons.models import AddonApprovalsCounter
 
-    lwt_header = MULTIPLE_STOPS_REGEX.sub(
-        u'.', six.text_type(lwt.persona.header))
-    manifest = {
-        "manifest_version": 2,
-        "name": six.text_type(lwt.name) or six.text_type(lwt.slug),
-        "version": '1.0',
-        "theme": {
-            "images": {
-                "headerURL": lwt_header
-            },
-            "colors": {
-                "accentcolor": accentcolor,
-                "textcolor": textcolor
-            }
-        }
-    }
-    if lwt.description:
-        manifest['description'] = six.text_type(lwt.description)
+    if (
+        addon.status == amo.STATUS_REJECTED
+        and not addon.has_ongoing_content_review_request
+    ):
+        AddonApprovalsCounter.request_new_content_review_for_addon(addon=addon)
 
-    # build zip with manifest and background file
-    with zipfile.ZipFile(upload_zip, 'w', zipfile.ZIP_DEFLATED) as dest:
-        dest.writestr('manifest.json', json.dumps(manifest))
-        dest.write(lwt.persona.header_path, arcname=lwt_header)
-
-
-def build_webext_dictionary_from_legacy(addon, destination):
-    """Create a webext package of a legacy dictionary `addon`, and put it in
-    `destination` path."""
-    from olympia.files.utils import SafeZip  # Avoid circular import.
-    old_path = addon.current_version.all_files[0].file_path
-    old_zip = SafeZip(old_path)
-    if not old_zip.is_valid:
-        raise ValidationError('Current dictionary xpi is not valid')
-
-    dictionary_path = ''
-
-    with zipfile.ZipFile(destination, 'w', zipfile.ZIP_DEFLATED) as new_zip:
-        for obj in old_zip.filelist:
-            splitted = obj.filename.split('/')
-            # Ignore useless directories and files.
-            if splitted[0] in ('META-INF', '__MACOSX', 'chrome',
-                               'chrome.manifest', 'install.rdf'):
-                continue
-
-            # Also ignore javascript (regardless of where they are, not just at
-            # the root), since dictionaries should not contain any code.
-            if splitted[-1].endswith('.js'):
-                continue
-
-            # Store the path of the last .dic file we find. It can be inside a
-            # directory.
-            if (splitted[-1].endswith('.dic')):
-                dictionary_path = obj.filename
-
-            new_zip.writestr(obj.filename, old_zip.read(obj.filename))
-
-        # Now that all files we want from the old zip are copied, build and
-        # add manifest.json.
-        if not dictionary_path:
-            # This should not happen... It likely means it's an invalid
-            # dictionary to begin with, or one that has its .dic file in a
-            # chrome/ directory for some reason. Abort!
-            raise ValidationError('Current dictionary xpi has no .dic file')
-
-        if addon.target_locale:
-            target_language = addon.target_locale
-        else:
-            # Guess target_locale since we don't have one already. Note that
-            # for extra confusion, target_locale is a language, not a locale.
-            target_language = to_language(os.path.splitext(
-                os.path.basename(dictionary_path))[0])
-            if target_language not in settings.AMO_LANGUAGES:
-                # We couldn't find that language in the list we support. Let's
-                # try with just the prefix.
-                target_language = target_language.split('-')[0]
-                if target_language not in settings.AMO_LANGUAGES:
-                    # We tried our best.
-                    raise ValidationError(u'Addon has no target_locale and we'
-                                          u' could not guess one from the xpi')
-
-        # Dumb version number increment. This will be invalid in some cases,
-        # but some of the dictionaries we have currently already have wild
-        # version numbers anyway.
-        version_number = addon.current_version.version
-        if version_number.endswith('.1-typefix'):
-            version_number = version_number.replace('.1-typefix', '.2webext')
-        else:
-            version_number = '%s.1webext' % version_number
-
-        manifest = {
-            'manifest_version': 2,
-            'name': six.text_type(addon.name),
-            'browser_specific_settings': {
-                'gecko': {
-                    'id': addon.guid,
-                },
-            },
-            'version': version_number,
-            'dictionaries': {target_language: dictionary_path},
-        }
-
-        # Write manifest.json we just build.
-        new_zip.writestr('manifest.json', json.dumps(manifest))
+        if addon.type in amo.ADDON_CONTENT_REVIEW_TYPES and waffle.switch_is_active(
+            'content-review-in-cinder'
+        ):
+            submit_addon_change_for_content_review.delay(
+                activity_log_pk=activity_log.pk
+            )

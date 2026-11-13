@@ -1,20 +1,16 @@
-[
-    {
+[{
         "pk": 1,
         "model": "addons.addon",
         "fields": {
             "slug": "24007",
             "_current_version": 24007,
             "eula": null,
-            "public_stats": 0,
             "modified": "2010-01-06 18:16:38",
             "weekly_downloads": 112297,
             "support_email": null,
             "average_rating": "3.98",
             "total_ratings": 1106,
-            "view_source": 0,
             "average_daily_users": 1343482,
-            "total_downloads": 17046775,
             "icon_type": "image/png",
             "homepage": null,
             "status": 4,
@@ -40,15 +36,12 @@
             "slug": "2",
             "_current_version": 2,
             "eula": null,
-            "public_stats": 0,
             "modified": "2010-01-06 18:16:38",
             "weekly_downloads": 112297,
             "support_email": null,
             "average_rating": "3.98",
             "total_ratings": 1106,
-            "view_source": 0,
             "average_daily_users": 1343482,
-            "total_downloads": 17046775,
             "icon_type": "image/png",
             "homepage": null,
             "status": 4,
@@ -73,15 +66,12 @@
         "fields": {
             "slug": "3",
             "eula": null,
-            "public_stats": 0,
             "modified": "2010-01-06 18:16:38",
             "weekly_downloads": 112297,
             "support_email": null,
             "average_rating": "3.98",
             "total_ratings": 1106,
-            "view_source": 0,
             "average_daily_users": 1343482,
-            "total_downloads": 17046775,
             "icon_type": "image/png",
             "homepage": null,
             "status": 3,
@@ -131,10 +121,10 @@
             "hash": "sha256:5b5aaf7b38e332cc95d92ba759c01c3076b53a840f6c16e01dc272eefcb29566",
             "created": "2007-03-05 13:19:15",
             "modified": "2007-04-04 12:30:11",
-            "filename": "del.icio.us_bookmarks-1.0.43-fx.xpi",
-            "platform": 1,
+            "file": "01/0001/1/del.icio.us_bookmarks-1.0.43.xpi",
             "version": 24007,
             "datestatuschanged": null,
+            "manifest_version": 2,
             "size": 173056
         }
     },
@@ -168,21 +158,11 @@
             "hash": "sha256:5b5aaf7b38e332cc95d92ba759c01c3076b53a840f6c16e01dc272eefcb29566",
             "created": "2007-03-05 13:19:15",
             "modified": "2007-04-04 12:30:11",
-            "filename": "del.icio.us_bookmarks-1.0.43-fx.xpi",
-            "platform": 1,
+            "file": "02/0002/2/del.icio.us_bookmarks-1.0.43.xpi",
             "version": 2,
             "datestatuschanged": null,
+            "manifest_version": 2,
             "size": 173056
-        }
-    },
-    {
-        "pk": 1186,
-        "model": "addons.appsupport",
-        "fields": {
-            "app": 1,
-            "addon": 1,
-            "modified": "2010-10-02 07:30:34",
-            "created": "2010-10-02 07:30:34"
         }
     }
 ]

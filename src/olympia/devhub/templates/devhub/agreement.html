@@ -1,32 +1,20 @@
-<form method="post">
-  <p>
-  {% trans %}
-    Before starting, please read and accept our Firefox Add-on Distribution
-    Agreement as well as our Review Policies and Rules. The Firefox
-    Add-on Distribution Agreement also links to our Privacy Notice which
-    explains how we handle your information.
-  {% endtrans %}
-  </p>
-  <ul class="agreement-links">
-    <li>{{ agreement_form.distribution_agreement }}<a href="{{ url('devhub.docs', 'policies/agreement') }}" target="_blank" rel="noopener noreferrer">{{ _('Firefox Add-on Distribution Agreement') }}</a> {{ agreement_form.distribution_agreement.errors }}</li>
-    <li>{{ agreement_form.review_policy }}<a href="{{ url('devhub.docs', 'policies/reviews') }}" target="_blank" rel="noopener noreferrer">{{ _('Review Policies and Rules') }}</a> {{ agreement_form.review_policy.errors }}</li>
-  </ul>
-  <p>
-    {{ _('I have read and accept this Agreement and the Rules and Policies') }}.
-  </p>
+{% extends "devhub/base.html" %}
 
-  {% if 'recaptcha' in agreement_form.fields %}
-  <p>
-    {{ agreement_form.recaptcha }}
-    {{ agreement_form.recaptcha.errors }}
-  </p>
-  {% endif %}
+{% set title = _('Firefox Add-on Distribution Agreement') %}
 
-  <div class="submit-buttons">
-      {% csrf_token %}
-      <button id="accept-agreement" type="submit">
-        {{ _('Accept') }}
-      </button>
-    {{ _('or <a href="{0}">Cancel</a>')|format_html(url('devhub.index')) }}
-  </div>
-</form>
+{% block title %}
+{{ dev_page_title(title) }}
+{% endblock %}
+
+{% block content %}
+
+{% set page_title = _('Firefox Add-on Distribution Agreement') %}
+<header>
+  <h2 class="is_addon">{{ title }}</h2>
+</header>
+
+<section class="addon-submission-process" role="main">
+  {% include "devhub/includes/agreement.html" %}
+</section>
+{% endblock content %}
+

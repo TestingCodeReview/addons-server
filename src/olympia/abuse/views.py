@@ -1,125 +1,568 @@
+import hashlib
+import hmac
+
+from django import forms
+from django.conf import settings
+from django.core.exceptions import PermissionDenied, ValidationError
 from django.http import Http404
+from django.shortcuts import get_object_or_404
+from django.template.response import TemplateResponse
+from django.utils.encoding import force_bytes
 
 from rest_framework import status
-from rest_framework.exceptions import ParseError
+from rest_framework.decorators import (
+    api_view,
+    authentication_classes,
+    permission_classes,
+)
 from rest_framework.mixins import CreateModelMixin
 from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet
 
-from olympia.abuse.models import AbuseReport
-from olympia.abuse.serializers import (
-    AddonAbuseReportSerializer, UserAbuseReportSerializer)
+import olympia.core.logger
+from olympia.abuse.tasks import appeal_to_cinder
+from olympia.accounts.utils import redirect_for_login
 from olympia.accounts.views import AccountViewSet
 from olympia.addons.views import AddonViewSet
-from olympia.api.throttling import GranularUserRateThrottle
+from olympia.api.throttling import GranularIPRateThrottle, GranularUserRateThrottle
+from olympia.bandwagon.views import CollectionViewSet
+from olympia.constants.abuse import DECISION_ACTIONS
+from olympia.core import set_user
+from olympia.ratings.views import RatingViewSet
+from olympia.users.models import UserProfile
+
+from .cinder import CinderAddon, CinderAddonContentReview
+from .forms import AbuseAppealEmailForm, AbuseAppealForm
+from .models import AbuseReport, CinderJob, ContentDecision
+from .serializers import (
+    AddonAbuseReportSerializer,
+    CollectionAbuseReportSerializer,
+    RatingAbuseReportSerializer,
+    UserAbuseReportSerializer,
+)
+from .utils import (
+    filter_enforcement_actions,
+    get_instance_from_entity,
+    is_same_time,
+    split_enforcement_actions,
+)
 
 
-class AbuseThrottle(GranularUserRateThrottle):
+log = olympia.core.logger.getLogger('z.abuse')
+
+
+class AbuseUserThrottle(GranularUserRateThrottle):
     rate = '20/day'
     scope = 'user_abuse'
 
 
-class AddonAbuseViewSet(CreateModelMixin, GenericViewSet):
+class AbuseIPThrottle(GranularIPRateThrottle):
+    rate = '20/day'
+    scope = 'ip_abuse'
+
+
+class AbuseTargetMixin:
+    target_viewset_class = None  # Implement in child classes
+    target_viewset_action = None  # Implement in child classes or leave None
+    target_parameter_name = None  # Implement in child classes (must match serializer)
+
+    def get_target_viewset(self):
+        if hasattr(self, 'target_viewset'):
+            return self.target_viewset
+
+        if 'target_pk' not in self.kwargs:
+            self.kwargs['target_pk'] = self.request.data.get(
+                self.target_parameter_name
+            ) or self.request.GET.get(self.target_parameter_name)
+
+        self.target_viewset = self.target_viewset_class(
+            request=self.request,
+            permission_classes=[],
+            kwargs={'pk': str(self.kwargs['target_pk'])},
+            action=self.target_viewset_action,
+        )
+        return self.target_viewset
+
+    # This method is used by the serializer.
+    def get_target_object(self):
+        if hasattr(self, 'target_object'):
+            return self.target_object
+
+        self.target_object = self.get_target_viewset().get_object()
+        return self.target_object
+
+
+class AddonAbuseViewSet(AbuseTargetMixin, CreateModelMixin, GenericViewSet):
     permission_classes = []
     serializer_class = AddonAbuseReportSerializer
-    throttle_classes = (AbuseThrottle,)
+    throttle_classes = (AbuseUserThrottle, AbuseIPThrottle)
+    target_viewset_class = AddonViewSet
+    target_viewset_action = 'retrieve_from_related'
+    target_parameter_name = 'addon'
 
-    def get_addon_viewset(self):
-        if hasattr(self, 'addon_viewset'):
-            return self.addon_viewset
-
-        if 'addon_pk' not in self.kwargs:
-            self.kwargs['addon_pk'] = (
-                self.request.data.get('addon') or
-                self.request.GET.get('addon'))
-        self.addon_viewset = AddonViewSet(
-            request=self.request, permission_classes=[],
-            kwargs={'pk': self.kwargs['addon_pk']})
-        return self.addon_viewset
-
-    def get_addon_object(self):
-        if hasattr(self, 'addon_object'):
-            return self.addon_object
-
-        self.addon_object = self.get_addon_viewset().get_object()
-        return self.addon_object
+    def get_target_object(self):
+        super().get_target_object()
+        # It's possible to submit reports against non-public add-ons via guid,
+        # but we can't reveal their slug/pk and can't accept their slug/pk as
+        # input either. We raise a 404 if get_target_object() is called for a
+        # non-public add-on: the view avoids calling it when a guid is passed
+        # (see get_guid()) and the serializer will handle the Http404 when
+        # returning the internal value (see get_addon() in serializer).
+        if self.target_object and not self.target_object.is_public():
+            raise Http404
+        return self.target_object
 
     def get_guid(self):
-        # See if the addon input is guid-like, if so set guid.
-        if self.get_addon_viewset().get_lookup_field(
-                self.kwargs['addon_pk']) == 'guid':
-            guid = self.kwargs['addon_pk']
-            try:
-                # But see if it's also in our database.
-                self.get_addon_object()
-            except Http404:
-                # If it isn't, that's okay, we have a guid.  Setting
-                # addon_object=None here means get_addon_object won't raise 404
-                self.addon_object = None
-            return guid
-        return None
+        """
+        Return the guid corresponding to the add-on the report is being made
+        against.
 
-    def create(self, request, *args, **kwargs):
-        addon_id = self.request.data.get('addon')
-        if not addon_id:
-            raise ParseError('Need an addon parameter')
+        If `addon` in the POST/GET data looks like a guid, use that directly
+        without looking in the database, but if not, consider it's a slug or pk
+        belonging to a public add-on.
 
-        message = self.request.data.get('message')
-        if not message:
-            raise ParseError('Abuse reports need a message')
-
-        abuse_kwargs = {
-            'ip_address': request.META.get('REMOTE_ADDR'),
-            'message': message,
-            # get_guid() must be called first or addons not in our DB will 404.
-            'guid': self.get_guid(),
-            'addon': self.get_addon_object()}
-        if request.user.is_authenticated:
-            abuse_kwargs['reporter'] = request.user
-
-        report = AbuseReport.objects.create(**abuse_kwargs)
-        report.send()
-
-        serializer = self.get_serializer(report)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        Can raise Http404 if the `addon` parameter in POST/GET data doesn't
+        look like a guid and there is no public add-on with a matching slug or
+        pk.
+        """
+        if (
+            self.get_target_viewset().get_lookup_field(self.kwargs['target_pk'])
+            == 'guid'
+        ):
+            guid = self.kwargs['target_pk']
+        else:
+            # At this point the parameter is a slug or pk. For backwards-compatibility
+            # we accept that, but ultimately record only the guid.
+            self.get_target_object()
+            if self.target_object:
+                guid = self.target_object.guid
+        return guid
 
 
-class UserAbuseViewSet(CreateModelMixin, GenericViewSet):
+class UserAbuseViewSet(AbuseTargetMixin, CreateModelMixin, GenericViewSet):
     permission_classes = []
     serializer_class = UserAbuseReportSerializer
-    throttle_classes = (AbuseThrottle,)
+    throttle_classes = (AbuseUserThrottle, AbuseIPThrottle)
+    target_viewset_class = AccountViewSet
+    target_parameter_name = 'user'
 
-    def get_user_object(self, user_id):
-        if hasattr(self, 'user_object'):
-            return self.user_object
 
-        if 'user_pk' not in self.kwargs:
-            self.kwargs['user_pk'] = (
-                self.request.data.get('user') or
-                self.request.GET.get('user'))
+class RatingAbuseViewSet(AbuseTargetMixin, CreateModelMixin, GenericViewSet):
+    permission_classes = []
+    serializer_class = RatingAbuseReportSerializer
+    throttle_classes = (AbuseUserThrottle, AbuseIPThrottle)
+    target_viewset_class = RatingViewSet
+    target_parameter_name = 'rating'
 
-        return AccountViewSet(
-            request=self.request, permission_classes=[],
-            kwargs={'pk': self.kwargs['user_pk']}).get_object()
 
-    def create(self, request, *args, **kwargs):
-        user_id = self.request.data.get('user')
-        if not user_id:
-            raise ParseError('Need a user parameter')
+class CollectionAbuseViewSet(AbuseTargetMixin, CreateModelMixin, GenericViewSet):
+    permission_classes = []
+    serializer_class = CollectionAbuseReportSerializer
+    throttle_classes = (AbuseUserThrottle, AbuseIPThrottle)
+    target_viewset_class = CollectionViewSet
+    target_parameter_name = 'collection'
+    target_viewset_action = 'retrieve_from_pk'
 
-        message = self.request.data.get('message')
-        if not message:
-            raise ParseError('Abuse reports need a message')
 
-        abuse_kwargs = {
-            'ip_address': request.META.get('REMOTE_ADDR'),
-            'message': message,
-            'user': self.get_user_object(user_id)}
-        if request.user.is_authenticated:
-            abuse_kwargs['reporter'] = request.user
+class CinderInboundPermission:
+    """Permit if the payload hash matches."""
 
-        report = AbuseReport.objects.create(**abuse_kwargs)
-        report.send()
+    def has_permission(self, request, view):
+        header = request.headers.get('X-Cinder-Signature', '')
+        key = force_bytes(settings.CINDER_WEBHOOK_TOKEN)
+        digest = hmac.new(key, msg=request.body, digestmod=hashlib.sha256).hexdigest()
+        return hmac.compare_digest(header, digest)
 
-        serializer = self.get_serializer(report)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+class CinderWebhookError(ValidationError):
+    """Validation error from Cinder webhook payload."""
+
+    reportable = True  # True == should raise as 400 in response
+
+
+class CinderWebhookIgnoredError(CinderWebhookError):
+    """Not an error, we're just ignoring the decision because we already took action, or
+    its for an entity we don't need to track."""
+
+    reportable = False
+
+
+class CinderWebhookMissingIdError(CinderWebhookError):
+    """Potentially known error - for prod we want to fail as all ids should be known.
+    For other envs ignore because we reuse Cinder stage."""
+
+    @property
+    def reportable(self):
+        return settings.CINDER_UNIQUE_IDS
+
+
+def get_previous_decision_from_payload(payload):
+    if prev_decision_id := payload.get('previous_decision', {}).get('id'):
+        try:
+            prev_decision = ContentDecision.objects.get(cinder_id=prev_decision_id)
+        except ContentDecision.DoesNotExist as exc:
+            log.debug('ContentDecision instance not found for id %s', prev_decision_id)
+            raise CinderWebhookMissingIdError('No matching decision id found') from exc
+        return prev_decision
+    return None
+
+
+def get_job_from_payload(payload):
+    source = payload.get('source', {})
+    if job_id := source.get('job', {}).get('id'):
+        try:
+            return CinderJob.objects.get(job_id=job_id)
+        except CinderJob.DoesNotExist:
+            log.debug('CinderJob instance not found for job id %s', job_id)
+            return None
+
+    if previous_decision := get_previous_decision_from_payload(payload):
+        return previous_decision.cinder_job
+
+    if source.get('decision', {}).get('type') == 'manual':
+        log.debug('Cinder webhook decision is a manual decision, no job to link to.')
+        return None
+    else:
+        log.debug('Cinder webhook decision for unsupported scenario skipped.')
+        raise CinderWebhookError('Unsupported decision')
+
+
+def get_target_from_payload_entity(entity):
+    created = entity.get('attributes', {}).get('created')
+    target = get_instance_from_entity(
+        entity_schema=entity.get('entity_schema'),
+        entity_id=entity.get('attributes', {}).get('id'),
+    )
+    # We trust Cinder is reporting on the correct instance by double-checking the
+    # created time of the instance is the same as the one in the payload. In production
+    # a wrong instance shouldn't happen, but in staging it could be the job was created
+    # from an instance from a different env.
+    if not target or not is_same_time(target, created):
+        log.debug(
+            'Could not identify entity id %s with schema %s',
+            entity.get('attributes', {}).get('id'),
+            entity.get('entity_schema'),
+        )
+        raise CinderWebhookMissingIdError('Unknown entity id received')
+    return target
+
+
+def process_webhook_payload_decision(payload):
+    source = payload.get('source', {})
+    log.info('Valid Payload from AMO queue: %s', payload)
+    if source.get('decision', {}).get('type') == 'api_decision':
+        log.debug('Cinder webhook decision for api decision skipped.')
+        raise CinderWebhookIgnoredError('Decision already handled via reviewer tools')
+
+    # In cases where there was an abuse report, or an appeal, there should be an
+    # existing CinderJob instance as we created the job when the Cinder API returned
+    # the job uuid back to us.
+    #
+    # But if the job was created via a workflow event - either by us (e.g. content
+    # review), or otherwise - then we don't have a CinderJob instance. So identify the
+    # target from the id (pk) and entity schema.
+    cinder_job = get_job_from_payload(payload)
+    target = (
+        cinder_job.target
+        if cinder_job
+        else get_target_from_payload_entity(payload.get('entity', {}))
+    )
+    # create_and_execute_decision only uses this if there is no existing CinderJob,
+    # because otherwise there are edge case where the previous decision might not be
+    # what we want, for example:
+    # - an appeal, where there is a new job so the new decision doesn't directly
+    # override the old decision
+    # - we created an intermediate decision, e.g. a requeue decision, that cinder
+    # doesn't know about
+    overriden_decision = (
+        get_previous_decision_from_payload(payload) if not cinder_job else None
+    )
+
+    enforcement_actions = filter_enforcement_actions(
+        split_enforcement_actions(payload.get('enforcement_actions') or []),
+        target.__class__,
+    )
+    policy_ids = [policy['id'] for policy in payload.get('policies', [])]
+
+    if len(enforcement_actions.primary) != 1:
+        reason = (
+            'more than one supported enforcement_actions'
+            if enforcement_actions.primary
+            else 'no supported enforcement_actions'
+        )
+        log.exception(
+            f'Cinder webhook request failed: {reason} [%s]',
+            payload.get('enforcement_actions'),
+        )
+        raise CinderWebhookError(f'Payload invalid: {reason}')
+
+    queue_slug = source.get('job', {}).get('queue', {}).get('slug')
+    created = CinderJob.create_and_execute_decision(
+        cinder_job,
+        target=target,
+        decision_cinder_id=source.get('decision', {}).get('id'),
+        decision_actions=[
+            enforcement_actions.primary[0],
+            *enforcement_actions.followup,
+        ],
+        decision_notes=payload.get('notes') or '',
+        policy_ids=policy_ids,
+        job_queue=queue_slug,
+        override_of=overriden_decision,
+    )
+    if not created:
+        raise CinderWebhookIgnoredError('Decision already exists')
+
+
+def process_webhook_payload_job_actioned(payload):
+    job = payload.get('job', {})
+    entity_schema = job.get('entity', {}).get('entity_schema')
+    if entity_schema != CinderAddon.type:
+        log.debug('Cinder webhook entity_schema was not %s', CinderAddon.type)
+        raise CinderWebhookIgnoredError(
+            f'Unsupported entity_schema ({entity_schema}) for job.actioned'
+        )
+
+    job_id = job.get('id', '')
+    match action := payload.get('action'):
+        case 'escalated':
+            log.info('Valid Payload from AMO queue: %s', payload)
+            try:
+                cinder_job = CinderJob.objects.get(job_id=job_id)
+            except CinderJob.DoesNotExist as exc:
+                log.debug('CinderJob instance not found for job id %s', job_id)
+                raise CinderWebhookMissingIdError('No matching job id found') from exc
+
+            new_queue = payload.get('job', {}).get('queue', {}).get('slug')
+            notes = payload.get('notes', '')
+            cinder_job.process_queue_move(new_queue=new_queue, notes=notes)
+
+        case 'created':
+            log.info('Valid Payload from AMO queue: %s', payload)
+            if (source := payload.get('source')) != 'workflow':
+                log.debug(
+                    'Cinder webhook job.actioned was created, but source is "%s", '
+                    'not "workflow", so skipped.',
+                    source,
+                )
+                raise CinderWebhookIgnoredError(
+                    f'Unsupported source ({source}) for job.actioned:created'
+                )
+            elif (
+                workflow_name := payload.get('action_made_by', {})
+                .get('workflow', {})
+                .get('name')
+            ) != CinderAddonContentReview.workflow_pretty_name:
+                log.debug(
+                    'Cinder webhook job.actioned was created, but workflow is "%s", '
+                    'so skipped.',
+                    workflow_name,
+                )
+                raise CinderWebhookIgnoredError(
+                    f'Unsupported workflow ({workflow_name}) for job.actioned:created'
+                )
+            else:
+                payload.get('action_made_by', {}).get('workflow', {}).get('name')
+                target = get_target_from_payload_entity(job.get('entity', {}))
+                cinder_job, _ = CinderJob.objects.get_or_create(
+                    job_id=job_id,
+                    defaults={'target_addon': target, 'content_review': True},
+                )
+        case _:
+            log.debug('Cinder webhook action was invalid (was "%s")', action)
+            raise CinderWebhookIgnoredError(
+                f'Unsupported action ({action}) for job.actioned'
+            )
+
+
+@api_view(['POST'])
+@authentication_classes(())
+@permission_classes((CinderInboundPermission,))
+def cinder_webhook(request):
+    # Normally setting the user would be done in the authentication class but
+    # we don't have one here.
+    set_user(UserProfile.objects.get(pk=settings.TASK_USER_ID))
+    try:
+        if (
+            not (payload := request.data.get('payload', {}))
+            or not isinstance(payload, dict)
+            or not payload
+        ):
+            log.info('No payload dict received: %s', str(request.data)[:255])
+            raise CinderWebhookError('No payload dict')
+        match event := request.data.get('event'):
+            case 'decision.created':
+                process_webhook_payload_decision(payload)
+            case 'job.actioned':
+                process_webhook_payload_job_actioned(payload)
+            case _:
+                log.info('Unsupported payload received: %s', str(request.data)[:255])
+                raise CinderWebhookError(f'{event} is not a event we support')
+
+    except CinderWebhookError as exc:
+        return Response(
+            data={
+                'amo': {
+                    'received': True,
+                    'handled': False,
+                    'not_handled_reason': exc.message,
+                }
+            },
+            # We differentiate errors we want exposed in Cinder's logs, and known cases
+            # where we can safely ignore the error.
+            status=(
+                status.HTTP_400_BAD_REQUEST if exc.reportable else status.HTTP_200_OK
+            ),
+        )
+    return Response(
+        data={'amo': {'received': True, 'handled': True}},
+        status=status.HTTP_201_CREATED,
+    )
+
+
+def appeal(request, *, abuse_report_id, decision_cinder_id, **kwargs):
+    appealable_decisions = tuple(DECISION_ACTIONS.APPEALABLE_BY_AUTHOR.values) + tuple(
+        DECISION_ACTIONS.APPEALABLE_BY_REPORTER.values
+    )
+    cinder_decision = get_object_or_404(
+        ContentDecision.objects.filter(action__in=appealable_decisions),
+        cinder_id=decision_cinder_id,
+    )
+
+    if abuse_report_id:
+        abuse_report = get_object_or_404(
+            AbuseReport.objects.filter(cinder_job__isnull=False),
+            id=abuse_report_id,
+            cinder_job=cinder_decision.cinder_job,
+        )
+    else:
+        abuse_report = None
+    # Reporter appeal: we need an abuse report.
+    if (
+        abuse_report is None
+        and cinder_decision.action in DECISION_ACTIONS.APPEALABLE_BY_REPORTER
+    ):
+        raise Http404
+
+    target = cinder_decision.target
+    context_data = {
+        'decision_cinder_id': decision_cinder_id,
+    }
+    post_data = request.POST if request.method == 'POST' else None
+    valid_user_or_email_provided = False
+    appeal_email_form = None
+    if cinder_decision.action in DECISION_ACTIONS.APPEALABLE_BY_REPORTER or (
+        cinder_decision.action == DECISION_ACTIONS.AMO_BAN_USER
+    ):
+        # Only person would should be appealing an approval is the reporter.
+        if (
+            cinder_decision.action in DECISION_ACTIONS.APPEALABLE_BY_REPORTER
+            and abuse_report
+            and abuse_report.reporter
+        ):
+            # Authenticated reporter is the easy case, they should just be
+            # authenticated with the right account.
+            if not request.user.is_authenticated:
+                return redirect_for_login(request)
+            valid_user_or_email_provided = request.user == abuse_report.reporter
+        elif cinder_decision.action == DECISION_ACTIONS.AMO_BAN_USER or (
+            abuse_report and abuse_report.reporter_email
+        ):
+            # Anonymous reporter appealing or banned user appealing is tricky,
+            # we need the email to be submitted via POST to match. If there was
+            # no POST, then we show a form for it instead of showing the appeal
+            # form. We do the same for ban appeals, since the user would no
+            # longer be able to log in.
+            expected_email = (
+                target.email
+                if cinder_decision.action == DECISION_ACTIONS.AMO_BAN_USER
+                else abuse_report.reporter_email
+            )
+            appeal_email_form = AbuseAppealEmailForm(
+                post_data, expected_email=expected_email, request=request
+            )
+            if appeal_email_form.is_bound and appeal_email_form.is_valid():
+                valid_user_or_email_provided = True
+                # We'll be re-using the form, but the user shouldn't change
+                # the email (that would prevent submission, it would no
+                # longer be valid), so make the input hidden.
+                appeal_email_form.fields['email'].widget = forms.HiddenInput()
+            context_data['appeal_email_form'] = appeal_email_form
+    else:
+        # Only person would should be appealing anything else than an approval
+        # is the author of the content.
+        if not request.user.is_authenticated:
+            return redirect_for_login(request)
+
+        allowed_users = []
+        if hasattr(target, 'authors'):
+            allowed_users = target.authors.all()
+        elif hasattr(target, 'author'):
+            allowed_users = [target.author]
+        elif hasattr(target, 'user'):
+            allowed_users = [target.user]
+        valid_user_or_email_provided = request.user in allowed_users
+
+    if not valid_user_or_email_provided and not appeal_email_form:
+        # At this point we should either have a valid user/email provided, or
+        # we are just showing the email form. Anything else should result in a
+        # 403.
+        raise PermissionDenied
+
+    if valid_user_or_email_provided:
+        # After this point, the user is either authenticated or has entered the
+        # right email address, we can start testing whether or not they can
+        # actually appeal, and show the form if they indeed can.
+        is_reporter = cinder_decision.action in DECISION_ACTIONS.APPEALABLE_BY_REPORTER
+        # Listing content rejection can technically be appealed even if there
+        # is an ongoing review request, but we don't want that, it would lead
+        # to duplicated efforts.
+        is_content_review_with_already_requested_review = (
+            cinder_decision.action == DECISION_ACTIONS.AMO_REJECT_LISTING_CONTENT
+            and not is_reporter
+            and getattr(target, 'has_ongoing_content_review_request', False)
+        )
+        if (
+            cinder_decision.can_be_appealed(
+                is_reporter=is_reporter, abuse_report=abuse_report
+            )
+            and not is_content_review_with_already_requested_review
+        ):
+            appeal_form = AbuseAppealForm(post_data, request=request)
+            if appeal_form.is_bound and appeal_form.is_valid():
+                appeal_to_cinder.delay(
+                    decision_cinder_id=cinder_decision.cinder_id,
+                    abuse_report_id=abuse_report.id if abuse_report else None,
+                    appeal_text=appeal_form.cleaned_data['reason'],
+                    user_id=request.user.pk,
+                    is_reporter=is_reporter,
+                )
+                context_data['appeal_processed'] = True
+            context_data['appeal_form'] = appeal_form
+        else:
+            # We can't appeal this, remove email form if it was there (which at
+            # this point should only contain the hidden email input) if the
+            # report can't be appealed. No form should be left on the page.
+            context_data.pop('appeal_email_form', None)
+            if hasattr(cinder_decision, 'overridden_by'):
+                # The reason we can't appeal this is that the decision has already been
+                # overriden by a new decision. We want a specific error message in this
+                # case.
+                context_data['appealed_decision_overridden'] = True
+            elif (
+                is_reporter
+                and not hasattr(abuse_report, 'cinderappeal')
+                and cinder_decision.appealed_decision_already_made()
+            ):
+                # The reason we can't appeal this is that there was already an
+                # appeal made for which we have a decision. We want a specific
+                # error message in this case.
+                context_data['appealed_decision_already_made'] = True
+                context_data['appealed_decision_affirmed'] = (
+                    cinder_decision.appeal_job.final_decision.action
+                    == cinder_decision.action
+                )
+            elif is_content_review_with_already_requested_review:
+                context_data['appeal_redundant_for_content_review'] = True
+
+    return TemplateResponse(request, 'abuse/appeal.html', context=context_data)

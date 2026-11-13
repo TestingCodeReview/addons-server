@@ -1,487 +1,1003 @@
-import mock
 import os
-import pytest
+import shutil
 import tempfile
 from datetime import datetime
+from unittest import mock
 
 from django.conf import settings
-from django.core import mail
-from django.test.utils import override_settings
 
-from freezegun import freeze_time
+import pytest
+import time_machine
+from PIL import Image
+from waffle.testutils import override_switch
 
 from olympia import amo
 from olympia.activity.models import ActivityLog
-from olympia.addons import cron
-from olympia.addons.models import Addon, AddonCategory, MigratedLWT
-from olympia.addons.tasks import (
-    add_static_theme_from_lwt, create_persona_preview_images,
-    migrate_legacy_dictionary_to_webextension, migrate_lwts_to_static_themes,
-    migrate_webextensions_to_git_storage,
-    recreate_theme_previews, save_persona_image)
-from olympia.amo.storage_utils import copy_stored_file
-from olympia.amo.tests import (
-    addon_factory, collection_factory, TestCase, user_factory, version_factory)
+from olympia.addons.indexers import AddonIndexer
+from olympia.addons.models import DeletedPreviewFile, DisabledAddonContent
+from olympia.amo.tests import TestCase, addon_factory, user_factory
 from olympia.amo.tests.test_helpers import get_image_path
 from olympia.amo.utils import image_size
-from olympia.applications.models import AppVersion
-from olympia.constants import licenses
-from olympia.constants.categories import CATEGORIES
-from olympia.files.models import FileUpload
-from olympia.files.utils import id_to_path
-from olympia.ratings.models import Rating
-from olympia.stats.models import ThemeUpdateCount, UpdateCount
-from olympia.tags.models import Tag
+from olympia.files.models import File
+from olympia.reviewers.models import NeedsHumanReview, UsageTier
 from olympia.users.models import UserProfile
-from olympia.versions.models import License, VersionPreview
-from olympia.lib.git import AddonGitRepository
+from olympia.versions.models import Version, VersionPreview
+from olympia.zadmin.models import set_config
 
-
-class TestPersonaImageFunctions(TestCase):
-    @mock.patch('olympia.addons.tasks.pngcrush_image')
-    def test_create_persona_preview_image(self, pngcrush_image_mock):
-        addon = addon_factory()
-        addon.modified = self.days_ago(41)
-        # Given an image, a 680x100 and a 32x32 thumbnails need to be generated
-        # and processed with pngcrush.
-        expected_dst1 = tempfile.NamedTemporaryFile(
-            mode='wb', suffix=".png", delete=False, dir=settings.TMP_PATH)
-        expected_dst2 = tempfile.NamedTemporaryFile(
-            mode='wb', suffix=".png", delete=False, dir=settings.TMP_PATH)
-        create_persona_preview_images(
-            src=get_image_path('persona-header.jpg'),
-            full_dst=[expected_dst1.name, expected_dst2.name],
-            set_modified_on=addon.serializable_reference(),
-        )
-        # pngcrush_image should have been called twice, once for each
-        # destination thumbnail.
-        assert pngcrush_image_mock.call_count == 2
-        assert pngcrush_image_mock.call_args_list[0][0][0] == (
-            expected_dst1.name)
-        assert pngcrush_image_mock.call_args_list[1][0][0] == (
-            expected_dst2.name)
-
-        assert image_size(expected_dst1.name) == (680, 100)
-        assert image_size(expected_dst2.name) == (32, 32)
-
-        addon.reload()
-        self.assertCloseToNow(addon.modified)
-
-    @mock.patch('olympia.addons.tasks.pngcrush_image')
-    def test_save_persona_image(self, pngcrush_image_mock):
-        # save_persona_image() simply saves an image as a png to the
-        # destination file. The image should be processed with pngcrush.
-        expected_dst = tempfile.NamedTemporaryFile(
-            mode='wb', suffix=".png", delete=False, dir=settings.TMP_PATH)
-        save_persona_image(
-            get_image_path('persona-header.jpg'),
-            expected_dst.name
-        )
-        # pngcrush_image should have been called once.
-        assert pngcrush_image_mock.call_count == 1
-        assert pngcrush_image_mock.call_args_list[0][0][0] == expected_dst.name
-
-    @mock.patch('olympia.addons.tasks.pngcrush_image')
-    def test_save_persona_image_not_an_image(self, pngcrush_image_mock):
-        # If the source is not an image, save_persona_image() should just
-        # return early without writing the destination or calling pngcrush.
-        expected_dst = tempfile.NamedTemporaryFile(
-            mode='wb', suffix=".png", delete=False, dir=settings.TMP_PATH)
-        save_persona_image(
-            get_image_path('non-image.png'),
-            expected_dst.name
-        )
-        # pngcrush_image should not have been called.
-        assert pngcrush_image_mock.call_count == 0
-        # the destination file should not have been written to.
-        assert os.stat(expected_dst.name).st_size == 0
-
-
-@pytest.mark.django_db
-@mock.patch('olympia.addons.tasks.add_static_theme_from_lwt')
-def test_migrate_lwts_to_static_themes(add_static_theme_from_lwt_mock):
-    # Include two LWT that won't get migrated sandwiched between some good LWTs
-    persona_a = addon_factory(type=amo.ADDON_PERSONA, slug='theme_a')
-    persona_none = addon_factory(type=amo.ADDON_PERSONA, slug='theme_none')
-    persona_b = addon_factory(type=amo.ADDON_PERSONA, slug='theme_b')
-    persona_raise = addon_factory(type=amo.ADDON_PERSONA, slug='theme_raise')
-    persona_c = addon_factory(type=amo.ADDON_PERSONA, slug='theme_c')
-
-    addon_a = addon_factory(type=amo.ADDON_STATICTHEME)
-    addon_b = addon_factory(type=amo.ADDON_STATICTHEME)
-    addon_c = addon_factory(type=amo.ADDON_STATICTHEME)
-    add_static_theme_from_lwt_mock.side_effect = [
-        addon_a, False, addon_b, Exception('foo'), addon_c]
-
-    # call the migration task, as the command would:
-    migrate_lwts_to_static_themes(
-        [persona_a.id, persona_none.id, persona_b.id, persona_raise.id,
-         persona_c.id])
-
-    assert MigratedLWT.objects.all().count() == 3
-    assert Addon.objects.filter(type=amo.ADDON_PERSONA).count() == 2
-
-    persona_a.reload()
-    addon_a.reload()
-    assert persona_a.status == amo.STATUS_DELETED
-    assert MigratedLWT.objects.get(
-        lightweight_theme=persona_a).static_theme == addon_a
-    assert addon_a.slug == 'theme_a'
-
-    persona_b.reload()
-    addon_b.reload()
-    assert persona_b.status == amo.STATUS_DELETED
-    assert MigratedLWT.objects.get(
-        lightweight_theme=persona_b).static_theme == addon_b
-    assert addon_b.slug == 'theme_b'
-
-    persona_c.reload()
-    addon_c.reload()
-    assert persona_c.status == amo.STATUS_DELETED
-    assert MigratedLWT.objects.get(
-        lightweight_theme=persona_c).static_theme == addon_c
-    assert addon_c.slug == 'theme_c'
-    assert len(mail.outbox) == 0
-
-
-@override_settings(ENABLE_ADDON_SIGNING=True)
-class TestAddStaticThemeFromLwt(TestCase):
-    create_date = datetime(2000, 1, 1, 1, 1, 1)
-    modify_date = datetime(2008, 8, 8, 8, 8, 8)
-    update_date = datetime(2009, 9, 9, 9, 9, 9)
-
-    def setUp(self):
-        super(TestAddStaticThemeFromLwt, self).setUp()
-        self.call_signing_mock = self.patch(
-            'olympia.lib.crypto.signing.call_signing')
-        self.build_mock = self.patch(
-            'olympia.addons.tasks.build_static_theme_xpi_from_lwt')
-        self.build_mock.side_effect = self._mock_xpi_side_effect
-        self.call_signing_mock.return_value = 'abcdefg1234'
-        AppVersion.objects.get_or_create(
-            application=amo.FIREFOX.id, version='53.0')
-        AppVersion.objects.get_or_create(
-            application=amo.FIREFOX.id, version='*')
-        user_factory(id=settings.TASK_USER_ID, email='taskuser@mozilla.com')
-
-    def _mock_xpi_side_effect(self, lwt, upload_path):
-        xpi_path = os.path.join(
-            settings.ROOT,
-            'src/olympia/devhub/tests/addons/mozilla_static_theme.zip')
-        copy_stored_file(xpi_path, upload_path)
-        assert not os.path.isdir(upload_path)
-        return mock.DEFAULT
-
-    def _check_result(self, static_theme, authors, tags, categories, license_,
-                      ratings, collection):
-        # metadata is correct
-        assert list(static_theme.authors.all()) == authors
-        assert list(static_theme.tags.all()) == tags
-        assert len(categories) == 1
-        lwt_cat = categories[0]
-        static_theme_cats = [
-            (cat.name, cat.application) for cat in static_theme.all_categories]
-        assert static_theme_cats == [
-            (lwt_cat.name, amo.FIREFOX.id), (lwt_cat.name, amo.ANDROID.id)]
-        assert static_theme.current_version.license.builtin == license_
-        # status is good
-        assert static_theme.status == amo.STATUS_PUBLIC
-        current_file = static_theme.current_version.files.get()
-        assert current_file.status == amo.STATUS_PUBLIC
-        # Ratings were migrated
-        assert list(Rating.unfiltered.filter(addon=static_theme)) == ratings
-        log_entries = ActivityLog.objects.filter(
-            action=amo.LOG.ADD_RATING.id, addonlog__addon=static_theme)
-        assert log_entries.count() == len(ratings)
-        for rating, log_entry in zip(ratings, log_entries):
-            arguments = log_entry.arguments
-            assert rating in arguments
-            assert static_theme in arguments
-        # The collection has the new theme
-        if collection:
-            assert static_theme in list(collection.addons.all())
-            assert collection.addons.filter(
-                type=amo.ADDON_PERSONA).count() == 0
-            assert collection.addons.filter(
-                type=amo.ADDON_STATICTHEME).count() == 1
-            assert collection.addons.count() == 2
-        # UpdateCounts were copied.
-        assert UpdateCount.objects.filter(
-            addon_id=static_theme.id).count() == 2
-        # xpi was signed
-        self.call_signing_mock.assert_called_with(current_file)
-        assert current_file.cert_serial_num == 'abcdefg1234'
-        assert static_theme.created == self.create_date
-        assert static_theme.modified == self.modify_date
-        cron.addon_last_updated()  # Make sure the last_updated change stuck.
-        assert static_theme.reload().last_updated == self.update_date
-
-    def test_add_static_theme_from_lwt(self):
-        author = user_factory()
-        persona = addon_factory(
-            type=amo.ADDON_PERSONA, users=[author], name='Firefox Theme')
-        persona.update(
-            created=self.create_date, modified=self.modify_date,
-            last_updated=self.update_date)
-        persona.persona.license = licenses.LICENSE_CC_BY_ND.id
-        Tag.objects.create(tag_text='themey').save_tag(persona)
-        License.objects.create(builtin=licenses.LICENSE_CC_BY_ND.builtin)
-        rating_user = user_factory()
-        rating = Rating.objects.create(
-            addon=persona, version=persona.current_version, user=rating_user,
-            rating=2, body=u'fooooo', user_responsible=rating_user)
-        ThemeUpdateCount.objects.create(
-            addon_id=persona.id, date=datetime(2018, 1, 1), count=123)
-        ThemeUpdateCount.objects.create(
-            addon_id=persona.id, date=datetime(2018, 2, 1), count=456)
-        # Create a count for an addon that shouldn't be migrated too.
-        ThemeUpdateCount.objects.create(
-            addon_id=addon_factory().id, date=datetime(2018, 2, 1), count=45)
-        # And add it to a collection
-        collection = collection_factory()
-        collection.add_addon(persona)
-        collection.add_addon(addon_factory())
-
-        static_theme = add_static_theme_from_lwt(persona)
-
-        self._check_result(
-            static_theme, [author], list(persona.tags.all()),
-            persona.all_categories, licenses.LICENSE_CC_BY_ND.builtin,
-            [rating], collection)
-
-    def test_add_static_theme_broken_lwt(self):
-        """What if no author or license or category?"""
-        persona = addon_factory(type=amo.ADDON_PERSONA)
-        persona.update(
-            created=self.create_date, modified=self.modify_date,
-            last_updated=self.update_date)
-
-        assert list(persona.authors.all()) == []  # no author
-        persona.persona.license = None  # no license
-        AddonCategory.objects.filter(addon=persona).delete()
-        assert persona.all_categories == []  # no category
-        License.objects.create(builtin=licenses.LICENSE_COPYRIGHT_AR.builtin)
-        rating_user = user_factory()
-        rating = Rating.objects.create(
-            addon=persona, version=persona.current_version, user=rating_user,
-            rating=2, body=u'fooooo', user_responsible=rating_user)
-        rating.delete()  # delete the rating - should still be migrated.
-        # Add 2 more Ratings for different addons that shouldn't be copied.
-        Rating.objects.create(
-            addon=addon_factory(), user=rating_user,
-            rating=3, body=u'tgd', user_responsible=rating_user)
-        Rating.objects.create(
-            addon=addon_factory(), user=rating_user,
-            rating=4, body=u'tgffd', user_responsible=rating_user)
-        ThemeUpdateCount.objects.create(
-            addon_id=persona.id, date=datetime(2018, 1, 1), count=123)
-        ThemeUpdateCount.objects.create(
-            addon_id=persona.id, date=datetime(2018, 2, 1), count=456)
-        # Create a count for an addon that shouldn't be migrated too.
-        ThemeUpdateCount.objects.create(
-            addon_id=addon_factory().id, date=datetime(2018, 2, 1), count=45)
-
-        static_theme = add_static_theme_from_lwt(persona)
-
-        default_author = UserProfile.objects.get(
-            email=settings.MIGRATED_LWT_DEFAULT_OWNER_EMAIL)
-        desktop_default_category = (
-            CATEGORIES[amo.FIREFOX.id][amo.ADDON_STATICTHEME]['other'])
-        android_default_category = (
-            CATEGORIES[amo.ANDROID.id][amo.ADDON_STATICTHEME]['other'])
-        self._check_result(
-            static_theme, [default_author], [], [desktop_default_category],
-            licenses.LICENSE_COPYRIGHT_AR.builtin, [rating], None)
-        # Double check its the exact category we want.
-        assert static_theme.all_categories == [
-            desktop_default_category, android_default_category]
-
-
-@override_settings(ENABLE_ADDON_SIGNING=True)
-class TestMigrateLegacyDictionaryToWebextension(TestCase):
-    def setUp(self):
-        self.user = user_factory(
-            id=settings.TASK_USER_ID, username='taskuser',
-            email='taskuser@mozilla.com')
-        with freeze_time('2017-07-27 07:00'):
-            self.addon = addon_factory(
-                type=amo.ADDON_DICT,
-                guid='@my-dict',  # Same id used in dict-webext.xpi.
-                version_kw={'version': '6.3'})
-
-        AppVersion.objects.get_or_create(
-            application=amo.FIREFOX.id, version='61.0')
-        AppVersion.objects.get_or_create(
-            application=amo.FIREFOX.id, version='*')
-
-        self.call_signing_mock = self.patch(
-            'olympia.lib.crypto.signing.call_signing')
-        self.call_signing_mock.return_value = 'abcdefg1234'
-
-        self.build_mock = self.patch(
-            'olympia.addons.tasks.build_webext_dictionary_from_legacy')
-        self.build_mock.side_effect = self._mock_xpi_side_effect
-
-    def _mock_xpi_side_effect(self, addon, destination):
-        xpi_path = os.path.join(
-            settings.ROOT, 'src/olympia/files/fixtures/files/dict-webext.xpi')
-        copy_stored_file(xpi_path, destination)
-        assert not os.path.isdir(destination)
-        return mock.DEFAULT
-
-    def test_basic(self):
-        assert not FileUpload.objects.exists()
-        assert not ActivityLog.objects.filter(
-            action=amo.LOG.ADD_VERSION.id).exists()
-        old_version = self.addon.current_version
-
-        self.build_mock.return_value = 'fake-locale'
-
-        with freeze_time('2018-08-28 08:00'):
-            self.migration_date = datetime.now()
-            migrate_legacy_dictionary_to_webextension(self.addon)
-
-        self.build_mock.assert_called_once_with(self.addon, mock.ANY)
-        assert FileUpload.objects.exists()
-        self.addon.reload()
-        assert self.addon.target_locale == 'fake-locale'
-        assert self.addon.current_version != old_version
-        activity_log = ActivityLog.objects.filter(
-            action=amo.LOG.ADD_VERSION.id).get()
-        assert activity_log.arguments == [
-            self.addon.current_version, self.addon
-        ]
-
-        assert self.addon.last_updated == self.migration_date
-
-        current_file = self.addon.current_version.all_files[0]
-        assert current_file.datestatuschanged == self.migration_date
-        assert current_file.status == amo.STATUS_PUBLIC
-
-        self.call_signing_mock.assert_called_with(current_file)
-        assert current_file.cert_serial_num == 'abcdefg1234'
-
-
-class TestMigrateWebextensionsToGitStorage(TestCase):
-    def test_basic(self):
-        addon = addon_factory(file_kw={'filename': 'webextension_no_id.xpi'})
-
-        migrate_webextensions_to_git_storage([addon.pk])
-
-        repo = AddonGitRepository(addon.pk)
-
-        assert repo.git_repository_path == os.path.join(
-            settings.GIT_FILE_STORAGE_PATH, id_to_path(addon.id), 'package')
-        assert os.listdir(repo.git_repository_path) == ['.git']
-
-    @mock.patch('olympia.versions.tasks.extract_version_to_git')
-    def test_no_files(self, extract_mock):
-        addon = addon_factory()
-        addon.current_version.files.all().delete()
-
-        migrate_webextensions_to_git_storage([addon.pk])
-
-        extract_mock.assert_not_called()
-
-    @mock.patch('olympia.versions.tasks.extract_version_to_git')
-    def test_skip_already_migrated_versions(self, extract_mock):
-        addon = addon_factory(file_kw={'filename': 'webextension_no_id.xpi'})
-        version_to_migrate = addon.current_version
-        already_migrated_version = version_factory(
-            addon=addon, file_kw={'filename': 'webextension_no_id.xpi'})
-        already_migrated_version.update(git_hash='already migrated...')
-
-        migrate_webextensions_to_git_storage([addon.pk])
-
-        # Only once instead of twice
-        extract_mock.assert_called_once_with(version_to_migrate.pk)
-
-    @mock.patch('olympia.versions.tasks.extract_version_to_git')
-    def test_migrate_versions_from_old_to_new(self, extract_mock):
-        addon = addon_factory(file_kw={'filename': 'webextension_no_id.xpi'})
-        oldest_version = addon.current_version
-        oldest_version.update(created=self.days_ago(6))
-        older_version = version_factory(
-            created=self.days_ago(5),
-            addon=addon, file_kw={'filename': 'webextension_no_id.xpi'})
-        most_recent = version_factory(
-            created=self.days_ago(2),
-            addon=addon, file_kw={'filename': 'webextension_no_id.xpi'})
-
-        migrate_webextensions_to_git_storage([addon.pk])
-
-        # Only once instead of twice
-        assert extract_mock.call_count == 3
-        assert extract_mock.call_args_list[0][0][0] == oldest_version.pk
-        assert extract_mock.call_args_list[1][0][0] == older_version.pk
-        assert extract_mock.call_args_list[2][0][0] == most_recent.pk
+from ..tasks import (
+    delete_all_addon_media_with_backup,
+    disable_addons,
+    flag_high_hotness_according_to_review_tier,
+    index_addons,
+    recreate_theme_previews,
+    resize_icon,
+    restore_all_addon_media_from_backup,
+    update_addon_average_daily_users,
+    update_addon_hotness,
+    update_addon_weekly_downloads,
+)
 
 
 @pytest.mark.django_db
 def test_recreate_theme_previews():
     xpi_path = os.path.join(
-        settings.ROOT,
-        'src/olympia/devhub/tests/addons/mozilla_static_theme.zip')
-
-    addon_without_previews = addon_factory(type=amo.ADDON_STATICTHEME)
-    copy_stored_file(
-        xpi_path,
-        addon_without_previews.current_version.all_files[0].file_path)
-    addon_with_previews = addon_factory(type=amo.ADDON_STATICTHEME)
-    copy_stored_file(
-        xpi_path,
-        addon_with_previews.current_version.all_files[0].file_path)
+        settings.ROOT, 'src/olympia/devhub/tests/addons/mozilla_static_theme.zip'
+    )
+    addon_without_previews = addon_factory(
+        type=amo.ADDON_STATICTHEME, file_kw={'filename': xpi_path}
+    )
+    addon_with_previews = addon_factory(
+        type=amo.ADDON_STATICTHEME, file_kw={'filename': xpi_path}
+    )
     VersionPreview.objects.create(
         version=addon_with_previews.current_version,
-        sizes={'image': [123, 456], 'thumbnail': [34, 45]})
+        sizes={'image': [123, 456], 'thumbnail': [34, 45]},
+    )
 
-    assert addon_without_previews.current_previews.count() == 0
-    assert addon_with_previews.current_previews.count() == 1
-    recreate_theme_previews(
-        [addon_without_previews.id, addon_with_previews.id])
-    assert addon_without_previews.reload().current_previews.count() == 3
-    assert addon_with_previews.reload().current_previews.count() == 3
-    sizes = addon_without_previews.current_previews.values_list(
-        'sizes', flat=True)
+    assert len(addon_without_previews.current_previews) == 0
+    assert len(addon_with_previews.current_previews) == 1
+    recreate_theme_previews([addon_without_previews.id, addon_with_previews.id])
+    del addon_without_previews.reload().current_previews
+    del addon_with_previews.reload().current_previews
+    assert len(addon_without_previews.current_previews) == 2
+    assert len(addon_with_previews.current_previews) == 2
+    sizes = addon_without_previews.current_version.previews.values_list(
+        'sizes', flat=True
+    )
+    renderings = amo.THEME_PREVIEW_RENDERINGS
     assert list(sizes) == [
-        {'image': list(amo.THEME_PREVIEW_SIZES['header']['full']),
-         'thumbnail': list(amo.THEME_PREVIEW_SIZES['header']['thumbnail'])},
-        {'image': list(amo.THEME_PREVIEW_SIZES['list']['full']),
-         'thumbnail': list(amo.THEME_PREVIEW_SIZES['list']['thumbnail'])},
-        {'image': list(amo.THEME_PREVIEW_SIZES['single']['full']),
-         'thumbnail': list(amo.THEME_PREVIEW_SIZES['single']['thumbnail'])}]
+        {
+            'image': list(renderings['firefox']['full']),
+            'thumbnail': list(renderings['firefox']['thumbnail']),
+            'image_format': renderings['firefox']['image_format'],
+            'thumbnail_format': renderings['firefox']['thumbnail_format'],
+        },
+        {
+            'image': list(renderings['amo']['full']),
+            'thumbnail': list(renderings['amo']['thumbnail']),
+            'image_format': renderings['amo']['image_format'],
+            'thumbnail_format': renderings['amo']['thumbnail_format'],
+        },
+    ]
+
+
+PATCH_PATH = 'olympia.addons.tasks'
 
 
 @pytest.mark.django_db
-@mock.patch('olympia.addons.tasks.parse_addon')
+@mock.patch(f'{PATCH_PATH}.parse_addon')
 def test_create_missing_theme_previews(parse_addon_mock):
     parse_addon_mock.return_value = {}
     theme = addon_factory(type=amo.ADDON_STATICTHEME)
-    preview = VersionPreview.objects.create(
+    amo_preview = VersionPreview.objects.create(
         version=theme.current_version,
-        sizes={'image': [123, 456], 'thumbnail': [34, 45]})
-    VersionPreview.objects.create(
+        sizes={
+            'image': amo.THEME_PREVIEW_RENDERINGS['amo']['full'],
+            'thumbnail': amo.THEME_PREVIEW_RENDERINGS['amo']['thumbnail'],
+            'thumbnail_format': amo.THEME_PREVIEW_RENDERINGS['amo']['thumbnail_format'],
+            'image_format': amo.THEME_PREVIEW_RENDERINGS['amo']['image_format'],
+        },
+    )
+    firefox_preview = VersionPreview.objects.create(
         version=theme.current_version,
-        sizes={'image': [123, 456], 'thumbnail': [34, 45]})
-    VersionPreview.objects.create(
+        sizes={
+            'image': amo.THEME_PREVIEW_RENDERINGS['firefox']['full'],
+            'thumbnail': amo.THEME_PREVIEW_RENDERINGS['firefox']['thumbnail'],
+        },
+    )
+    # add another extra preview size that should be ignored
+    extra_preview = VersionPreview.objects.create(
         version=theme.current_version,
-        sizes={'image': [123, 456], 'thumbnail': [34, 45]})
+        sizes={'image': [123, 456], 'thumbnail': [34, 45]},
+    )
 
-    # addon has 3 complete previews already so skip when only_missing=True
-    with mock.patch('olympia.addons.tasks.generate_static_theme_preview') as p:
+    # addon has all the complete previews already so skip when only_missing=True
+    assert VersionPreview.objects.count() == 3
+    with (
+        mock.patch(
+            f'{PATCH_PATH}.generate_static_theme_preview.apply_async'
+        ) as gen_preview,
+        mock.patch(f'{PATCH_PATH}.resize_image') as resize,
+    ):
         recreate_theme_previews([theme.id], only_missing=True)
-        assert p.call_count == 0
+        assert gen_preview.call_count == 0
+        assert resize.call_count == 0
         recreate_theme_previews([theme.id], only_missing=False)
-        assert p.call_count == 1
+        assert gen_preview.call_count == 1
+        assert resize.call_count == 0
 
-    # break one of the previews
-    preview.update(sizes={})
-    with mock.patch('olympia.addons.tasks.generate_static_theme_preview') as p:
+    # If the add-on is missing a preview, we call generate_static_theme_preview
+    VersionPreview.objects.get(id=amo_preview.id).delete()
+    firefox_preview.save()
+    extra_preview.save()
+    assert VersionPreview.objects.count() == 2
+    with (
+        mock.patch(
+            f'{PATCH_PATH}.generate_static_theme_preview.apply_async'
+        ) as gen_preview,
+        mock.patch(f'{PATCH_PATH}.resize_image') as resize,
+    ):
         recreate_theme_previews([theme.id], only_missing=True)
-        assert p.call_count == 1
+        assert gen_preview.call_count == 1
+        assert resize.call_count == 0
 
-    # And delete it so the addon only has 2 previews
-    preview.delete()
-    with mock.patch('olympia.addons.tasks.generate_static_theme_preview') as p:
+    # Preview is correct dimensions but wrong format, call generate_static_theme_preview
+    amo_preview.sizes['image_format'] = 'foo'
+    amo_preview.save()
+    firefox_preview.save()
+    extra_preview.save()
+    assert VersionPreview.objects.count() == 3
+    with (
+        mock.patch(
+            f'{PATCH_PATH}.generate_static_theme_preview.apply_async'
+        ) as gen_preview,
+        mock.patch(f'{PATCH_PATH}.resize_image') as resize,
+    ):
         recreate_theme_previews([theme.id], only_missing=True)
-        assert p.call_count == 1
+        assert gen_preview.call_count == 1
+        assert resize.call_count == 0
+
+    # But we don't do the full regeneration to just get new thumbnail sizes or formats
+    amo_preview.sizes['thumbnail'] = [666, 444]
+    amo_preview.sizes['image_format'] = 'svg'
+    amo_preview.save()
+    assert amo_preview.thumbnail_dimensions == [666, 444]
+    firefox_preview.sizes['thumbnail_format'] = 'gif'
+    firefox_preview.save()
+    assert firefox_preview.get_format('thumbnail') == 'gif'
+    extra_preview.save()
+    assert VersionPreview.objects.count() == 3
+    with (
+        mock.patch(
+            f'{PATCH_PATH}.generate_static_theme_preview.apply_async'
+        ) as gen_preview,
+        mock.patch(f'{PATCH_PATH}.resize_image') as resize,
+    ):
+        recreate_theme_previews([theme.id], only_missing=True)
+        assert gen_preview.call_count == 0  # not called
+        assert resize.call_count == 2
+        amo_preview.reload()
+        assert amo_preview.thumbnail_dimensions == [720, 92]
+        firefox_preview.reload()
+        assert firefox_preview.get_format('thumbnail') == 'png'
+
+        assert VersionPreview.objects.count() == 3
+
+
+@pytest.mark.django_db
+def test_update_addon_average_daily_users():
+    addon = addon_factory(average_daily_users=0)
+    count = 123
+    data = [(addon.guid, count)]
+    assert addon.average_daily_users == 0
+
+    update_addon_average_daily_users(data)
+    addon.refresh_from_db()
+
+    assert addon.average_daily_users == count
+
+
+@pytest.mark.django_db
+def test_update_addon_average_daily_users_case_sensitive():
+    addon = addon_factory(average_daily_users=0)
+    data = [(addon.guid.upper(), 123)]
+    assert addon.average_daily_users == 0
+
+    update_addon_average_daily_users(data)
+    addon.refresh_from_db()
+
+    assert addon.average_daily_users == 0
+
+
+@pytest.mark.django_db
+@override_switch('local-statistics-processing', active=True)
+def test_update_deleted_addon_average_daily_users():
+    addon = addon_factory(average_daily_users=0)
+    addon.delete()
+    count = 123
+    data = [(addon.guid, count)]
+    assert addon.average_daily_users == 0
+
+    update_addon_average_daily_users(data)
+    addon.refresh_from_db()
+
+    assert addon.average_daily_users == count
+
+
+@pytest.mark.django_db
+def test_update_addon_hotness():
+    addon1 = addon_factory(hotness=0, status=amo.STATUS_APPROVED)
+    addon2 = addon_factory(hotness=123, status=amo.STATUS_APPROVED)
+    addon3 = addon_factory(hotness=123, status=amo.STATUS_AWAITING_REVIEW)
+    addon4 = addon_factory(hotness=123)
+    addon4.delete()
+    averages = {
+        addon1.guid: {'avg_this_week': 213467, 'avg_previous_week': 123467},
+        addon2.guid: {
+            'avg_this_week': 1,
+            'avg_previous_week': 1,
+        },
+        addon3.guid: {'avg_this_week': 213467, 'avg_previous_week': 123467},
+        addon4.guid: {'avg_this_week': 213467, 'avg_previous_week': 123467},
+    }
+
+    update_addon_hotness(averages=averages.items())
+    addon1.refresh_from_db()
+    addon2.refresh_from_db()
+    addon3.refresh_from_db()
+
+    assert addon1.hotness > 0
+    assert addon3.hotness > 0
+    assert addon4.hotness > 0
+    # Too low averages so we set the hotness to 0.
+    assert addon2.hotness == 0
+
+
+@time_machine.travel('2023-05-15 11:00', tick=False)
+@pytest.mark.django_db
+def test_flag_high_hotness_according_to_review_tier():
+    user_factory(pk=settings.TASK_USER_ID)
+    set_config(amo.config_keys.EXTRA_REVIEW_TARGET_PER_DAY, '1')
+    # Create some usage tiers and add add-ons in them for the task to do
+    # something. The ones missing a lower, upper, or growth threshold don't
+    # do anything. Also, tiers need to have a lower adu threshold above
+    # MINIMUM_ADU_FOR_HOTNESS_NONTHEME (100) to do anything.
+    UsageTier.objects.create(name='Not a tier with usage values')
+    UsageTier.objects.create(
+        name='D tier (below minimum usage for hotness)',
+        lower_adu_threshold=0,
+        upper_adu_threshold=100,
+        growth_threshold_before_flagging=1,
+    )
+    UsageTier.objects.create(
+        name='C tier (no growth threshold)',
+        lower_adu_threshold=100,
+        upper_adu_threshold=200,
+    )
+    UsageTier.objects.create(
+        name='B tier',
+        lower_adu_threshold=200,
+        upper_adu_threshold=250,
+        growth_threshold_before_flagging=11,
+    )
+    UsageTier.objects.create(
+        name='A tier',
+        lower_adu_threshold=250,
+        upper_adu_threshold=1000,
+        growth_threshold_before_flagging=7,
+    )
+    UsageTier.objects.create(
+        name='S tier (no upper threshold)',
+        lower_adu_threshold=1000,
+        upper_adu_threshold=None,
+        growth_threshold_before_flagging=30,
+    )
+
+    not_flagged = [
+        # Usage below MINIMUM_ADU_FOR_HOTNESS_NONTHEME so tier is inactive
+        addon_factory(name='Low usage addon', average_daily_users=99, hotness=0.3),
+        # Belongs to C tier, which doesn't have a growth threshold set.
+        addon_factory(name='C tier addon', average_daily_users=100, hotness=0.3),
+        # Belongs to B tier but not an extension.
+        addon_factory(
+            name='B tier language pack',
+            type=amo.ADDON_LPAPP,
+            average_daily_users=200,
+            hotness=0.3,
+        ),
+        addon_factory(
+            name='B tier theme',
+            type=amo.ADDON_STATICTHEME,
+            average_daily_users=200,
+            hotness=0.3,
+        ),
+        # Belongs to A tier but hotness below the average + threshold.
+        addon_factory(
+            name='A tier below threshold', average_daily_users=250, hotness=0.3
+        ),
+        # Belongs to S tier, which doesn't have an upper threshold. (like
+        # notable, subject to human review anyway)
+        addon_factory(name='S tier addon', average_daily_users=1000, hotness=0.3),
+        # Belongs to A tier but already human reviewed.
+        addon_factory(
+            name='A tier already reviewed',
+            average_daily_users=250,
+            hotness=0.3,
+            version_kw={'human_review_date': datetime.now()},
+        ),
+        # Belongs to B tier but already disabled.
+        addon_factory(
+            name='B tier already disabled',
+            average_daily_users=200,
+            hotness=0.3,
+            status=amo.STATUS_DISABLED,
+        ),
+        # Belongs to B tier but already flagged for human review for growth
+        # (see below).
+        addon_factory(
+            name='B tier already flagged', average_daily_users=200, hotness=0.2
+        ),
+    ]
+    NeedsHumanReview.objects.create(
+        version=not_flagged[-1].current_version, is_active=True
+    )
+
+    flagged = [
+        # B tier average hotness should be 0.32, with a threshold of 11, so
+        # Add-ons with a hotness over 0.43 should be flagged.
+        addon_factory(name='B tier', average_daily_users=200, hotness=0.44),
+        # A tier average hotness should be 0.3755, with a threshold of 7, so
+        # Add-ons with a hotness over 0.4455 should be flagged.
+        addon_factory(name='A tier', average_daily_users=250, hotness=0.451),
+        addon_factory(
+            name='A tier with inactive flags', average_daily_users=250, hotness=0.451
+        ),
+    ]
+
+    # Add an inactive flag on the last one, shouldn't do anything.
+    NeedsHumanReview.objects.create(
+        version=flagged[-1].current_version, is_active=False
+    )
+
+    # Pretend all files were signed otherwise they would not get flagged.
+    File.objects.update(is_signed=True)
+    flag_high_hotness_according_to_review_tier()
+
+    for addon in not_flagged:
+        assert (
+            addon.versions.latest('pk')
+            .needshumanreview_set.filter(
+                reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD, is_active=True
+            )
+            .count()
+            == 0
+        )
+
+    for addon in flagged:
+        version = addon.versions.latest('pk')
+        assert (
+            version.needshumanreview_set.filter(
+                reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD, is_active=True
+            ).count()
+            == 1
+        )
+
+    # We've set amo.config_keys.EXTRA_REVIEW_TARGET_PER_DAY so that there would be
+    # one review per day after . Since we've frozen time on a Wednesday,
+    # we should get: Friday, Monday (skipping week-end), Tuesday.
+    due_dates = (
+        Version.objects.filter(addon__in=flagged)
+        .values_list('due_date', flat=True)
+        .order_by('due_date')
+    )
+    assert list(due_dates) == [
+        datetime(2023, 5, 18, 11, 0),
+        datetime(2023, 5, 19, 11, 0),
+        datetime(2023, 5, 22, 11, 0),
+    ]
+
+
+@time_machine.travel('2023-05-15 11:00', tick=False)
+@pytest.mark.django_db
+def test_flag_high_hotness_according_to_review_tier_threshold_check(
+    django_assert_num_queries,
+):
+    # Simplified version of the test above with fewer extra non-flagged add-ons
+    # ensuring that we flag add-ons above the threshold, and don't flag add-ons
+    # under.
+    user_factory(pk=settings.TASK_USER_ID)
+    UsageTier.objects.create(
+        name='B tier',
+        lower_adu_threshold=1000,
+        upper_adu_threshold=100000,
+        growth_threshold_before_flagging=0,
+    )
+    UsageTier.objects.create(
+        name='A tier',
+        lower_adu_threshold=250,
+        upper_adu_threshold=1000,
+        growth_threshold_before_flagging=10,
+    )
+    # Average hotness should be 0.5666666666666667,
+    # growth_threshold_before_flagging for that tier is 10 so we should flag
+    # add-ons with hotness above 0.6666666666666667, meaning no add-ons should
+    # be flagged.
+    addon_factory(average_daily_users=251, hotness=0.55)
+    addon_factory(average_daily_users=251, hotness=0.55)
+    addon = addon_factory(average_daily_users=251, hotness=0.6)
+    File.objects.update(is_signed=True)
+
+    with django_assert_num_queries(4):
+        # 4 queries:
+        # - get all tiers
+        # - get average hotness for tier A
+        # - get average hotness for tier B
+        # - find all add-ons to flag
+        flag_high_hotness_according_to_review_tier()
+
+    assert NeedsHumanReview.objects.count() == 0
+
+    # Average hotness should now be 0.65, growth_threshold_before_flagging for
+    # that tier is 10 so we should flag add-ons with hotness above 0.75,
+    # meaning that this add-on should be flagged.
+    addon.update(hotness=0.85)
+    flag_high_hotness_according_to_review_tier()
+
+    assert NeedsHumanReview.objects.count() == 1
+    assert (
+        addon.current_version.needshumanreview_set.filter(
+            reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD, is_active=True
+        ).count()
+        == 1
+    )
+
+
+@time_machine.travel('2023-05-15 11:00', tick=False)
+@pytest.mark.django_db
+def test_flag_high_hotness_according_to_review_tier_threshold_check_negative():
+    user_factory(pk=settings.TASK_USER_ID)
+    UsageTier.objects.create(
+        name='A tier',
+        lower_adu_threshold=250,
+        upper_adu_threshold=1000,
+        growth_threshold_before_flagging=10,
+    )
+    # Average hotness should be negative, -0.2.
+    # growth_threshold_before_flagging for that tier is 10 so we should flag
+    # add-ons with hotness above -0.1, but we explicitly only flag positive
+    # growth add-ons, so only the last one should be flagged.
+
+    addon_factory(average_daily_users=251, hotness=-0.05)
+    addon_factory(average_daily_users=251, hotness=-0.85)
+    addon_factory(average_daily_users=251, hotness=0.0)
+    addon = addon_factory(average_daily_users=251, hotness=0.1)
+    File.objects.update(is_signed=True)
+
+    flag_high_hotness_according_to_review_tier()
+
+    assert NeedsHumanReview.objects.count() == 1
+    assert (
+        addon.current_version.needshumanreview_set.filter(
+            reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD, is_active=True
+        ).count()
+        == 1
+    )
+
+
+@pytest.mark.django_db
+def test_flag_high_hotness_according_to_review_tier_no_tiers_defined():
+    user_factory(pk=settings.TASK_USER_ID)
+    addon = addon_factory(average_daily_users=1001, file_kw={'is_signed': True})
+    flag_high_hotness_according_to_review_tier()
+    assert not addon.current_version.needshumanreview_set.exists()
+
+
+@pytest.mark.django_db
+def test_update_addon_weekly_downloads():
+    addon = addon_factory(weekly_downloads=0)
+    count = 123
+    data = [(addon.addonguid.hashed_guid, count)]
+    assert addon.weekly_downloads == 0
+
+    update_addon_weekly_downloads(data)
+    addon.refresh_from_db()
+
+    assert addon.weekly_downloads == count
+
+
+@pytest.mark.django_db
+def test_update_addon_weekly_downloads_ignores_deleted_addons():
+    guid = 'some@guid'
+    deleted_addon = addon_factory(guid=guid)
+    deleted_addon.delete()
+    deleted_addon.update(guid=None)
+    addon = addon_factory(guid=guid, weekly_downloads=0)
+    count = 123
+    data = [(addon.addonguid.hashed_guid, count)]
+    assert addon.weekly_downloads == 0
+
+    update_addon_weekly_downloads(data)
+    addon.refresh_from_db()
+
+    assert addon.weekly_downloads == count
+
+
+@pytest.mark.django_db
+def test_update_addon_weekly_downloads_skips_non_existent_addons():
+    addon = addon_factory(weekly_downloads=0)
+    count = 123
+    invalid_hashed_guid = 'does.not@exist'
+    data = [(invalid_hashed_guid, 0), (addon.addonguid.hashed_guid, count)]
+    assert addon.weekly_downloads == 0
+
+    update_addon_weekly_downloads(data)
+    addon.refresh_from_db()
+
+    assert addon.weekly_downloads == count
+
+
+class TestResizeIcon(TestCase):
+    def _uploader(self, resize_size, final_size):
+        img = get_image_path('mozilla.png')
+        original_size = (339, 128)
+
+        src = tempfile.NamedTemporaryFile(  # noqa: SIM115 (temp file used across the test (delete=False))
+            mode='r+b', suffix='.png', delete=False, dir=settings.TMP_PATH
+        )
+
+        if not isinstance(final_size, list):
+            final_size = [final_size]
+            resize_size = [resize_size]
+        uploadto = os.path.join(settings.MEDIA_ROOT, 'addon_icons')
+        try:
+            os.makedirs(uploadto)
+        except OSError:
+            pass
+        fake_addon_id = 1234
+        for rsize, expected_size in zip(resize_size, final_size, strict=True):
+            # resize_icon moves the original
+            shutil.copyfile(img, src.name)
+            src_image = Image.open(src.name)
+            assert src_image.size == original_size
+            dest_name = os.path.join(
+                uploadto, str(fake_addon_id // 1000), str(fake_addon_id)
+            )
+
+            with mock.patch('olympia.amo.utils.pngcrush_image') as pngcrush_mock:
+                return_value = resize_icon(src.name, fake_addon_id, [rsize])
+            dest_image = f'{dest_name}-{rsize}.png'
+            assert pngcrush_mock.call_count == 1
+            assert pngcrush_mock.call_args_list[0][0][0] == dest_image
+            assert image_size(dest_image) == expected_size
+            # original should have been moved to -original
+            orig_image = '%s-original.png' % dest_name
+            assert os.path.exists(orig_image)
+
+            # Return value of the task should be a dict with an icon_hash key
+            # containing the 8 first chars of the md5 hash of the source file,
+            # which is bb362450b00f0461c6bddc6b97b3c30b.
+            assert return_value == {'icon_hash': 'bb362450'}
+
+            os.remove(dest_image)
+            assert not os.path.exists(dest_image)
+            os.remove(orig_image)
+            assert not os.path.exists(orig_image)
+        shutil.rmtree(uploadto)
+
+        assert not os.path.exists(src.name)
+
+    def test_resize_icon_shrink(self):
+        """Image should be shrunk so that the longest side is 32px."""
+
+        resize_size = 32
+        final_size = (32, 12)
+
+        self._uploader(resize_size, final_size)
+
+    def test_resize_icon_enlarge(self):
+        """Image stays the same, since the new size is bigger than both sides."""
+
+        resize_size = 350
+        final_size = (339, 128)
+
+        self._uploader(resize_size, final_size)
+
+    def test_resize_icon_same(self):
+        """Image stays the same, since the new size is the same."""
+
+        resize_size = 339
+        final_size = (339, 128)
+
+        self._uploader(resize_size, final_size)
+
+    def test_resize_icon_list(self):
+        """Resize multiple images at once."""
+
+        resize_size = [32, 339, 350]
+        final_size = [(32, 12), (339, 128), (339, 128)]
+
+        self._uploader(resize_size, final_size)
+
+
+@pytest.mark.django_db
+@mock.patch('olympia.addons.tasks.index_addons.delay')
+def test_disable_addons(index_addons_mock):
+    UserProfile.objects.create(pk=settings.TASK_USER_ID)
+    addon = addon_factory()
+    disable_addons([addon.id])
+
+    addon.reload()
+    assert addon.status == amo.STATUS_DISABLED
+    assert addon.current_version is None
+    assert addon.versions.all()[0].file.status == amo.STATUS_DISABLED
+    assert (
+        addon.versions.all()[0].file.status_disabled_reason
+        == File.STATUS_DISABLED_REASONS.ADDON_DISABLE
+    )
+
+    assert ActivityLog.objects.filter(
+        action=amo.LOG.FORCE_DISABLE.id, addonlog__addon=addon
+    ).exists()
+    index_addons_mock.assert_called_with([addon.id])
+
+
+@pytest.mark.django_db
+@mock.patch('olympia.addons.tasks.unindex_objects')
+@mock.patch('olympia.addons.tasks.index_objects')
+def test_index_addons(index_objects_mock, unindex_objects_mock):
+    public_addon = addon_factory()
+    incomplete_addon = addon_factory(status=amo.STATUS_NULL)
+    disabled_addon = addon_factory(disabled_by_user=True)
+
+    index_addons((public_addon.id, incomplete_addon.id, disabled_addon.id))
+
+    index_objects_mock.assert_called_once()
+    call = index_objects_mock.mock_calls[0]
+    assert list(call.kwargs.keys()) == ['queryset', 'indexer_class', 'index']
+    assert list(call.kwargs['queryset']) == [public_addon]
+    assert call.kwargs['indexer_class'] == AddonIndexer
+    assert call.kwargs['index'] is None
+    unindex_objects_mock.assert_called_with(
+        [incomplete_addon.id, disabled_addon.id], indexer_class=AddonIndexer
+    )
+
+    # Confirm that we don't make unnessecary calls to index_objects/unindex_objects when
+    # there are no addons to index/unindex
+    index_objects_mock.reset_mock()
+    unindex_objects_mock.reset_mock()
+    index_addons((public_addon.id,))
+    index_objects_mock.assert_called_once()
+    unindex_objects_mock.assert_not_called()
+
+    index_objects_mock.reset_mock()
+    unindex_objects_mock.reset_mock()
+    index_addons((incomplete_addon.id,))
+    index_objects_mock.assert_not_called()
+    unindex_objects_mock.assert_called_once()
+
+
+class TestDeleteAndRestoreAllAddonMediaWithFromBackup(TestCase):
+    def setUp(self):
+        patcher1 = mock.patch('olympia.addons.tasks.copy_file_to_backup_storage')
+        self.addCleanup(patcher1.stop)
+        self.copy_file_to_backup_storage_mock = patcher1.start()
+        self.copy_file_to_backup_storage_mock.side_effect = lambda fpath, type_: (
+            f'mock-backup-{os.path.basename(fpath)}'
+        )
+        patcher2 = mock.patch(
+            'olympia.addons.tasks.download_file_contents_from_backup_storage'
+        )
+        self.addCleanup(patcher2.stop)
+        self.download_file_contents_from_backup_storage_mock = patcher2.start()
+        self.download_file_contents_from_backup_storage_mock.side_effect = lambda nme: (
+            f'Content for {nme}'.encode()
+        )
+        patcher3 = mock.patch('olympia.addons.tasks.backup_storage_enabled')
+        self.addCleanup(patcher3.stop)
+        self.backup_storage_enabled_mock = patcher3.start()
+        self.backup_storage_enabled_mock.return_value = True
+
+        self.addon = addon_factory()
+
+    def test_delete_all_addon_media_with_backup(self):
+        self.addon.update(icon_type='image/jpeg')
+        for size in amo.ADDON_ICON_SIZES + ('original',):
+            self.root_storage.copy_stored_file(
+                get_image_path('sunbird-small.png'), self.addon.get_icon_path(size)
+            )
+        for position in range(1, 3):
+            preview = self.addon.previews.create(position=position)
+            self.root_storage.copy_stored_file(
+                get_image_path('preview_landscape.jpg'), preview.original_path
+            )
+            self.root_storage.copy_stored_file(
+                get_image_path('preview_landscape.jpg'), preview.image_path
+            )
+            self.root_storage.copy_stored_file(
+                get_image_path('preview_landscape.jpg'), preview.thumbnail_path
+            )
+
+        delete_all_addon_media_with_backup(self.addon.pk)
+
+        assert DisabledAddonContent.objects.filter(addon=self.addon).exists()
+        dac = DisabledAddonContent.objects.get(addon=self.addon)
+
+        for size in amo.ADDON_ICON_SIZES + ('original',):
+            assert not self.root_storage.exists(self.addon.get_icon_path(size))
+        assert (
+            dac.icon_backup_name
+            == self.copy_file_to_backup_storage_mock.side_effect(
+                self.addon.get_icon_path('original'), self.addon.icon_type
+            )
+        )
+
+        assert DeletedPreviewFile.objects.count() == self.addon.previews.count() == 2
+        for preview in self.addon.previews.all():
+            assert not self.root_storage.exists(preview.original_path)
+            assert not self.root_storage.exists(preview.image_path)
+            assert not self.root_storage.exists(preview.thumbnail_path)
+            assert DeletedPreviewFile.objects.get(preview=preview).backup_name == (
+                self.copy_file_to_backup_storage_mock.side_effect(
+                    preview.original_path, 'image/png'
+                )
+            )
+
+        assert self.copy_file_to_backup_storage_mock.call_count == 3
+        assert self.copy_file_to_backup_storage_mock.call_args_list[0][0] == (
+            self.addon.get_icon_path('original'),
+            'image/jpeg',
+        )
+        assert self.copy_file_to_backup_storage_mock.call_args_list[1][0] == (
+            self.addon.previews.all()[0].original_path,
+            'image/png',
+        )
+        assert self.copy_file_to_backup_storage_mock.call_args_list[2][0] == (
+            self.addon.previews.all()[1].original_path,
+            'image/png',
+        )
+
+    def test_delete_all_addon_media_with_backup_but_backup_storage_not_enabled(self):
+        self.backup_storage_enabled_mock.return_value = False
+        self.addon.update(icon_type='image/jpeg')
+        for size in amo.ADDON_ICON_SIZES + ('original',):
+            self.root_storage.copy_stored_file(
+                get_image_path('sunbird-small.png'), self.addon.get_icon_path(size)
+            )
+        for position in range(1, 3):
+            preview = self.addon.previews.create(position=position)
+            self.root_storage.copy_stored_file(
+                get_image_path('preview_landscape.jpg'), preview.original_path
+            )
+            self.root_storage.copy_stored_file(
+                get_image_path('preview_landscape.jpg'), preview.image_path
+            )
+            self.root_storage.copy_stored_file(
+                get_image_path('preview_landscape.jpg'), preview.thumbnail_path
+            )
+
+        delete_all_addon_media_with_backup(self.addon.pk)
+        assert self.copy_file_to_backup_storage_mock.call_count == 0
+
+    def test_delete_icon_and_preview_does_not_exist_on_filesystem(self):
+        for position in range(1, 3):
+            self.addon.previews.create(addon=self.addon, position=position)
+        delete_all_addon_media_with_backup(self.addon.pk)
+
+        assert DisabledAddonContent.objects.filter(addon=self.addon).exists()
+        dac = DisabledAddonContent.objects.get(addon=self.addon)
+        assert dac.icon_backup_name is None
+        assert DeletedPreviewFile.objects.count() == 0
+
+    def test_delete_addon_disabled_content_instance_exists(self):
+        DisabledAddonContent.objects.create(addon=self.addon, icon_backup_name='lol')
+        self.test_delete_all_addon_media_with_backup()
+
+    def test_delete_icon_original_does_not_exist(self):
+        self.addon.update(icon_type='image/png')
+        # No original icon.
+        self.root_storage.copy_stored_file(
+            get_image_path('sunbird-small.png'), self.addon.get_icon_path(128)
+        )
+        delete_all_addon_media_with_backup(self.addon.pk)
+        assert self.copy_file_to_backup_storage_mock.call_count == 1
+        assert self.copy_file_to_backup_storage_mock.call_args_list[0][0] == (
+            self.addon.get_icon_path(128),
+            'image/png',
+        )
+
+    def test_delete_icon_pick_largest_size_that_exists(self):
+        self.addon.update(icon_type='image/png')
+        # No original icon, no 128 either.
+        self.root_storage.copy_stored_file(
+            get_image_path('sunbird-small.png'), self.addon.get_icon_path(64)
+        )
+        delete_all_addon_media_with_backup(self.addon.pk)
+        assert self.copy_file_to_backup_storage_mock.call_count == 1
+        assert self.copy_file_to_backup_storage_mock.call_args_list[0][0] == (
+            self.addon.get_icon_path(64),
+            'image/png',
+        )
+
+    def test_delete_theme(self):
+        self.addon.update(type=amo.ADDON_STATICTHEME)
+        for position in range(1, 3):
+            preview = self.addon.current_version.previews.create(position=position)
+            self.root_storage.copy_stored_file(
+                get_image_path('preview_landscape.jpg'), preview.original_path
+            )
+            self.root_storage.copy_stored_file(
+                get_image_path('preview_landscape.jpg'), preview.image_path
+            )
+            self.root_storage.copy_stored_file(
+                get_image_path('preview_landscape.jpg'), preview.thumbnail_path
+            )
+
+        delete_all_addon_media_with_backup(self.addon.pk)
+
+        # Pointless here, but useful indicator that we went through the task.
+        assert DisabledAddonContent.objects.filter(addon=self.addon).exists()
+
+        # Themes previews are automatically generated, so they shouldn't have
+        # been backuped, but should no longer exist on disk.
+        assert DeletedPreviewFile.objects.count() == 0
+        assert self.addon.current_version.previews.count() == 2
+        for preview in self.addon.current_version.previews.all():
+            assert not self.root_storage.exists(preview.original_path)
+            assert not self.root_storage.exists(preview.image_path)
+            assert not self.root_storage.exists(preview.thumbnail_path)
+
+        assert self.copy_file_to_backup_storage_mock.call_count == 0
+
+    @mock.patch('olympia.addons.tasks.resize_preview')
+    @mock.patch('olympia.addons.tasks.resize_icon')
+    def test_restore_all_addon_media_from_backup(
+        self, resize_icon_mock, resize_preview_mock
+    ):
+        dac = DisabledAddonContent.objects.create(
+            addon=self.addon, icon_backup_name='icon-backup.jpg'
+        )
+        for position in range(1, 3):
+            preview = self.addon.previews.create(position=position)
+            dac.deletedpreviewfile_set.create(
+                preview=preview,
+                backup_name=f'preview-backup-{position}.png',
+            )
+        self.addon.update(icon_type='image/jpeg')
+
+        restore_all_addon_media_from_backup(self.addon.pk)
+
+        assert self.download_file_contents_from_backup_storage_mock.call_count == 3
+        assert self.download_file_contents_from_backup_storage_mock.call_args_list[0][
+            0
+        ] == ('icon-backup.jpg',)
+        assert self.download_file_contents_from_backup_storage_mock.call_args_list[1][
+            0
+        ] == ('preview-backup-1.png',)
+        assert self.download_file_contents_from_backup_storage_mock.call_args_list[2][
+            0
+        ] == ('preview-backup-2.png',)
+
+        assert resize_icon_mock.delay.call_count == 1
+        assert resize_icon_mock.delay.call_args_list[0][0] == (
+            self.addon.get_icon_path('original'),
+            self.addon.pk,
+            amo.ADDON_ICON_SIZES,
+        )
+        assert resize_icon_mock.delay.call_args_list[0][1] == {
+            'set_modified_on': self.addon.serializable_reference()
+        }
+        assert resize_preview_mock.delay.call_count == 2
+        assert resize_preview_mock.delay.call_args_list[0][0] == (
+            self.addon.previews.all()[0].original_path,
+            self.addon.previews.all()[0].pk,
+        )
+        assert resize_preview_mock.delay.call_args_list[0][1] == {
+            'set_modified_on': self.addon.serializable_reference()
+        }
+        assert resize_preview_mock.delay.call_args_list[1][0] == (
+            self.addon.previews.all()[1].original_path,
+            self.addon.previews.all()[1].pk,
+        )
+        assert resize_preview_mock.delay.call_args_list[1][1] == {
+            'set_modified_on': self.addon.serializable_reference()
+        }
+
+        assert not DisabledAddonContent.objects.filter(pk=dac.pk).exists()
+
+    @mock.patch('olympia.addons.tasks.resize_preview')
+    @mock.patch('olympia.addons.tasks.resize_icon')
+    def test_restore_all_addon_media_from_backup_but_backup_storage_not_enabled(
+        self, resize_icon_mock, resize_preview_mock
+    ):
+        self.backup_storage_enabled_mock.return_value = False
+        dac = DisabledAddonContent.objects.create(
+            addon=self.addon, icon_backup_name='icon-backup.jpg'
+        )
+        for position in range(1, 3):
+            preview = self.addon.previews.create(position=position)
+            dac.deletedpreviewfile_set.create(
+                preview=preview,
+                backup_name=f'preview-backup-{position}.png',
+            )
+        self.addon.update(icon_type='image/jpeg')
+
+        restore_all_addon_media_from_backup(self.addon.pk)
+
+        assert self.download_file_contents_from_backup_storage_mock.call_count == 0
+        assert resize_icon_mock.delay.call_count == 0
+        assert resize_preview_mock.delay.call_count == 0
+
+        # We deleted the DisabledAddonContent instance anyway.
+        assert not DisabledAddonContent.objects.exists()
+
+    @mock.patch('olympia.addons.tasks.resize_preview')
+    @mock.patch('olympia.addons.tasks.resize_icon')
+    def test_restore_all_addon_media_from_backup_no_disabled_addon_content_instance(
+        self, resize_icon_mock, resize_preview_mock
+    ):
+        for position in range(1, 3):
+            self.addon.previews.create(position=position)
+        self.addon.update(icon_type='image/jpeg')
+
+        restore_all_addon_media_from_backup(self.addon.pk)
+
+        assert self.download_file_contents_from_backup_storage_mock.call_count == 0
+        assert resize_icon_mock.delay.call_count == 0
+        assert resize_preview_mock.delay.call_count == 0
+
+        assert not DisabledAddonContent.objects.exists()
+
+    @mock.patch('olympia.addons.tasks.resize_preview')
+    @mock.patch('olympia.addons.tasks.resize_icon')
+    def test_restore_icon_and_preview_does_not_exist_in_backup(
+        self, resize_icon_mock, resize_preview_mock
+    ):
+        self.download_file_contents_from_backup_storage_mock.side_effect = lambda _: (
+            None
+        )
+        dac = DisabledAddonContent.objects.create(
+            addon=self.addon, icon_backup_name='does-not-exist.jpg'
+        )
+        for position in range(1, 3):
+            preview = self.addon.previews.create(position=position)
+            dac.deletedpreviewfile_set.create(
+                preview=preview,
+                backup_name=f'does-not-exist-either-{position}.png',
+            )
+        self.addon.update(icon_type='image/jpeg')
+
+        restore_all_addon_media_from_backup(self.addon.pk)
+
+        assert self.download_file_contents_from_backup_storage_mock.call_count == 3
+        assert self.download_file_contents_from_backup_storage_mock.call_args_list[0][
+            0
+        ] == ('does-not-exist.jpg',)
+        assert self.download_file_contents_from_backup_storage_mock.call_args_list[1][
+            0
+        ] == ('does-not-exist-either-1.png',)
+        assert self.download_file_contents_from_backup_storage_mock.call_args_list[2][
+            0
+        ] == ('does-not-exist-either-2.png',)
+
+        assert resize_icon_mock.delay.call_count == 0
+        assert resize_preview_mock.delay.call_count == 0
+
+        assert not DisabledAddonContent.objects.filter(pk=dac.pk).exists()
+
+    @mock.patch('olympia.addons.tasks.recreate_theme_previews')
+    def test_restore_theme(self, recreate_theme_previews_mock):
+        self.addon.update(type=amo.ADDON_STATICTHEME)
+        for position in range(1, 3):
+            self.addon.current_version.previews.create(position=position)
+
+        restore_all_addon_media_from_backup(self.addon.pk)
+
+        # Nothing to download for themes.
+        assert self.download_file_contents_from_backup_storage_mock.call_count == 0
+
+        assert not DisabledAddonContent.objects.exists()
+
+        assert recreate_theme_previews_mock.delay.call_count == 1
+        assert recreate_theme_previews_mock.delay.call_args_list[0][0] == (
+            [self.addon.pk],
+        )

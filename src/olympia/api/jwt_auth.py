@@ -12,19 +12,17 @@ AMO uses JWT tokens in a different way. Notes:
 
 See https://github.com/GetBlimp/django-rest-framework-jwt/ for more info.
 """
+
 from calendar import timegm
-from datetime import datetime
+from datetime import UTC, datetime
 
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
 
 import jwt
-
 from rest_framework import exceptions
-from rest_framework_jwt.settings import api_settings
 
 import olympia.core.logger
-
 from olympia.api.models import APIKey
 
 
@@ -37,78 +35,97 @@ def jwt_decode_handler(token, get_api_key=APIKey.get_jwt_key):
     # be displayed to the client. Be careful not to reveal anything
     # sensitive. When you raise other exceptions, the user will see
     # a generic failure message.
-    token_data = jwt.decode(token, options={
-        'verify_signature': False,
-        'verify_exp': False,
-        'verify_nbf': False,
-        'verify_iat': False,
-        'verify_aud': False,
-    })
+
+    # First decode the JWT to raise nicer errors when the user did something
+    # wrong.
+    token_data = jwt.decode(
+        token,
+        options={
+            # We need to decode the token without verifying here, because we
+            # want to raise a nicer error if the user misconfigured something.
+            # The actual jwt.decode() with proper verification options set is
+            # a few lines below.
+            'verify_signature': False,  # nosemgrep
+            'verify_exp': False,
+            'verify_nbf': False,
+            'verify_iat': False,
+            'verify_aud': False,
+        },
+        algorithms=[settings.JWT_AUTH['JWT_ALGORITHM']],
+    )
 
     if 'iss' not in token_data:
-        log.info('No issuer in JWT auth token: {}'.format(token_data))
+        log.info(f'No issuer in JWT auth token: {token_data}')
         raise exceptions.AuthenticationFailed(
-            detail='JWT iss (issuer) claim is missing.')
+            detail='JWT iss (issuer) claim is missing.'
+        )
 
     try:
         api_key = get_api_key(key=token_data['iss'])
-    except ObjectDoesNotExist:
+    except ObjectDoesNotExist as exc:
         log.info('No API key for JWT issuer: {}'.format(token_data['iss']))
         raise exceptions.AuthenticationFailed(
-            detail='Unknown JWT iss (issuer).')
+            detail='Unknown JWT iss (issuer).'
+        ) from exc
 
-    # TODO: add nonce checking to prevent replays. bug 1213354.
-
+    # Actual verification options.
     options = {
         'verify_signature': True,
         'verify_exp': True,
         'verify_nbf': False,
         'verify_iat': True,
         'verify_aud': False,
-        'require_exp': True,
-        'require_iat': True,
-        'require_nbf': False,
+        'require': ['exp', 'iat'],
     }
 
     try:
-        now = timegm(datetime.utcnow().utctimetuple())
+        now = timegm(datetime.now(UTC).utctimetuple())
 
         payload = jwt.decode(
             token,
             api_key.secret,
             options=options,
-            leeway=api_settings.JWT_LEEWAY,
-            algorithms=[api_settings.JWT_ALGORITHM]
+            leeway=settings.JWT_AUTH['JWT_LEEWAY'],
+            algorithms=[settings.JWT_AUTH['JWT_ALGORITHM']],
         )
 
         # Verify clock skew for future iat-values pyjwt removed that check in
         # https://github.com/jpadilla/pyjwt/pull/252/
         # `verify_iat` is still in options because pyjwt still validates
         # that `iat` is a proper number.
-        if int(payload['iat']) > (now + api_settings.JWT_LEEWAY):
+        if int(payload['iat']) > (now + settings.JWT_AUTH['JWT_LEEWAY']):
             raise jwt.InvalidIssuedAtError(
-                'Issued At claim (iat) cannot be in the future.')
+                'Issued At claim (iat) cannot be in the future.'
+            )
     except jwt.MissingRequiredClaimError as exc:
-        log.info(u'Missing required claim during JWT authentication: '
-                 u'{e.__class__.__name__}: {e}'.format(e=exc))
-        raise exceptions.AuthenticationFailed(
-            detail=u'Invalid JWT: {}.'.format(exc))
-    except jwt.InvalidIssuedAtError as exc:
-        log.info(u'Invalid iat during JWT authentication: '
-                 u'{e.__class__.__name__}: {e}'.format(e=exc))
+        log.info(
+            'Missing required claim during JWT authentication: '
+            f'{exc.__class__.__name__}: {exc}'
+        )
+        raise exceptions.AuthenticationFailed(detail=f'Invalid JWT: {exc}.') from exc
+    except (jwt.exceptions.ImmatureSignatureError, jwt.InvalidIssuedAtError) as exc:
+        log.info(
+            f'Invalid iat during JWT authentication: {exc.__class__.__name__}: {exc}'
+        )
         raise exceptions.AuthenticationFailed(
             detail='JWT iat (issued at time) is invalid. Make sure your '
-                   'system clock is synchronized with something like TLSdate.')
+            'system clock is synchronized with something like TLSdate.'
+        ) from exc
     except Exception as exc:
-        log.warning(u'Unhandled exception during JWT authentication: '
-                    u'{e.__class__.__name__}: {e}'.format(e=exc))
+        log.warning(
+            'Unhandled exception during JWT authentication: '
+            f'{exc.__class__.__name__}: {exc}'
+        )
         raise
 
-    max_jwt_auth_token_lifetime = settings.MAX_APIKEY_JWT_AUTH_TOKEN_LIFETIME
-    if payload['exp'] - payload['iat'] > max_jwt_auth_token_lifetime:
-        log.info('JWT auth: expiration is too long; '
-                 'iss={iss}, iat={iat}, exp={exp}'.format(**payload))
+    if payload['exp'] - payload['iat'] > settings.MAX_APIKEY_JWT_AUTH_TOKEN_LIFETIME:
+        log.info(
+            'JWT auth: expiration is too long; iss={iss}, iat={iat}, exp={exp}'.format(
+                **payload
+            )
+        )
         raise exceptions.AuthenticationFailed(
-            detail='JWT exp (expiration) is too long.')
+            detail='JWT exp (expiration) is too long.'
+        )
 
     return payload

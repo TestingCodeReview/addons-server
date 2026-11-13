@@ -1,66 +1,124 @@
-# -*- coding: utf-8 -*-
+import copy
+from contextlib import ExitStack
+from datetime import datetime, timedelta
+from unittest import mock
+
+from django.conf import settings
+from django.core.exceptions import FieldDoesNotExist
 from django.test.utils import override_settings
+from django.urls import reverse
 from django.utils.translation import override
 
-import six
-
+import pytest
 from rest_framework.test import APIRequestFactory
 
 from olympia import amo
-from olympia.accounts.tests.test_serializers import TestBaseUserSerializer
+from olympia.accounts.tests.test_serializers import BaseTestUserMixin
 from olympia.addons.models import (
-    Addon, AddonCategory, AddonUser, Category, CompatOverride,
-    CompatOverrideRange, Persona, Preview, ReplacementAddon)
+    Addon,
+    AddonCategory,
+    AddonListingInfo,
+    AddonUser,
+    Preview,
+    ReplacementAddon,
+)
 from olympia.addons.serializers import (
-    AddonDeveloperSerializer, AddonSerializer, AddonSerializerWithUnlistedData,
-    CompatOverrideSerializer, ESAddonAutoCompleteSerializer, ESAddonSerializer,
-    LanguageToolsSerializer, LicenseSerializer, ReplacementAddonSerializer,
-    SimpleVersionSerializer, VersionSerializer)
+    AddonAuthorSerializer,
+    AddonSerializer,
+    DeveloperAddonSerializer,
+    DeveloperListVersionSerializer,
+    DeveloperVersionSerializer,
+    ESAddonAutoCompleteSerializer,
+    ESAddonSerializer,
+    LanguageToolsSerializer,
+    LicenseSerializer,
+    ListVersionSerializer,
+    MinimalFileSerializer,
+    ReplacementAddonSerializer,
+    SimpleVersionSerializer,
+    UserSerializerWithPictureUrl,
+    VersionSerializer,
+)
 from olympia.addons.utils import generate_addon_guid
 from olympia.addons.views import (
-    AddonAutoCompleteSearchView, AddonSearchView, AddonViewSet)
+    AddonAutoCompleteSearchView,
+    AddonSearchView,
+    AddonViewSet,
+)
 from olympia.amo.templatetags.jinja_helpers import absolutify
 from olympia.amo.tests import (
-    ESTestCase, TestCase, addon_factory, collection_factory, file_factory,
-    user_factory, version_factory)
-from olympia.amo.urlresolvers import get_outgoing_url, reverse
-from olympia.bandwagon.models import FeaturedCollection
+    ESTestCase,
+    TestCase,
+    addon_factory,
+    collection_factory,
+    user_factory,
+    version_factory,
+)
+from olympia.amo.urlresolvers import get_outgoing_url
+from olympia.bandwagon.models import Collection
 from olympia.constants.categories import CATEGORIES
-from olympia.constants.licenses import LICENSES_BY_BUILTIN
+from olympia.constants.licenses import (
+    LICENSE_COPYRIGHT_AR,
+    LICENSE_GPL3,
+    LICENSES_BY_BUILTIN,
+)
+from olympia.constants.promoted import (
+    RECOMMENDED_API_NAME,
+)
 from olympia.files.models import WebextPermission
+from olympia.promoted.models import (
+    PromotedAddon,
+    PromotedApproval,
+    PromotedGroup,
+)
+from olympia.ratings.models import Rating
+from olympia.users.models import UserProfile
 from olympia.versions.models import (
-    ApplicationsVersions, AppVersion, License, VersionPreview)
+    ApplicationsVersions,
+    AppVersion,
+    License,
+    Version,
+    VersionPreview,
+)
+from olympia.zadmin.models import set_config
 
 
-class AddonSerializerOutputTestMixin(object):
+class AddonSerializerOutputTestMixin:
     """Mixin containing tests to execute on both the regular and the ES Addon
     serializer."""
+
     def setUp(self):
-        super(AddonSerializerOutputTestMixin, self).setUp()
-        self.request = APIRequestFactory().get('/')
+        super().setUp()
+        self.request = self.get_request('/')
+
+    def get_request(self, path, data=None, **extra):
+        request = APIRequestFactory().get(path, data, **extra)
+        request.version = 'v5'
+        return request
 
     def _test_author(self, author, data):
         assert data == {
             'id': author.pk,
             'name': author.name,
             'picture_url': None,
-            'url': absolutify(author.get_url_path()),
+            'url': author.get_absolute_url(),
             'username': author.username,
         }
 
     def _test_version_license_and_release_notes(self, version, data):
         assert data['release_notes'] == {
-            'en-US': u'Release notes in english',
-            'fr': u'Notes de version en français',
+            'en-US': 'Release notes in english',
+            'fr': 'Notes de version en français',
         }
         assert data['license']
         assert dict(data['license']) == {
             'id': version.license.pk,
             'is_custom': True,
-            'name': {'en-US': u'My License', 'fr': u'Mä Licence'},
+            'name': {'en-US': 'My License', 'fr': 'Mä Licence'},
             # License text is not present in version serializer used from
             # AddonSerializer.
-            'url': 'http://license.example.com/',
+            'url': absolutify(reverse('addons.license', args=[version.addon.slug])),
+            'slug': None,
         }
 
     def _test_version(self, version, data):
@@ -71,162 +129,156 @@ class AddonSerializerOutputTestMixin(object):
         for app, compat in version.compatible_apps.items():
             assert data['compatibility'][app.short] == {
                 'min': compat.min.version,
-                'max': compat.max.version
+                'max': compat.max.version,
             }
         assert data['is_strict_compatibility_enabled'] is False
-        assert data['files']
-        assert len(data['files']) == 1
 
-        result_file = data['files'][0]
-        file_ = version.files.latest('pk')
+        result_file = data['file']
+        file_ = version.file
         assert result_file['id'] == file_.pk
         assert result_file['created'] == (
-            file_.created.replace(microsecond=0).isoformat() + 'Z')
+            file_.created.replace(microsecond=0).isoformat() + 'Z'
+        )
         assert result_file['hash'] == file_.hash
-        assert result_file['is_restart_required'] == file_.is_restart_required
-        assert result_file['is_webextension'] == file_.is_webextension
         assert (
-            result_file['is_mozilla_signed_extension'] ==
-            file_.is_mozilla_signed_extension)
-        assert result_file['platform'] == (
-            amo.PLATFORM_CHOICES_API[file_.platform])
+            result_file['is_mozilla_signed_extension']
+            == file_.is_mozilla_signed_extension
+        )
         assert result_file['size'] == file_.size
         assert result_file['status'] == amo.STATUS_CHOICES_API[file_.status]
-        assert result_file['url'] == file_.get_url_path(src='')
-        assert result_file['permissions'] == file_.webext_permissions_list
+        assert result_file['url'] == file_.get_absolute_url()
+        assert result_file['url'].endswith('.xpi')
+        assert result_file['permissions'] == file_.permissions
+        assert result_file['optional_permissions'] == file_.optional_permissions
+        assert result_file['host_permissions'] == file_.host_permissions
+        assert (
+            result_file['data_collection_permissions']
+            == file_.data_collection_permissions
+        )
+        assert (
+            result_file['optional_data_collection_permissions']
+            == file_.optional_data_collection_permissions
+        )
 
         assert data['edit_url'] == absolutify(
-            self.addon.get_dev_url(
-                'versions.edit', args=[version.pk], prefix_only=True))
-        assert data['reviewed'] == version.reviewed
+            self.addon.get_dev_url('versions.edit', args=[version.pk], prefix_only=True)
+        )
+        assert data['reviewed'] == version.human_review_date
         assert data['version'] == version.version
-        assert data['url'] == absolutify(version.get_url_path())
 
     def test_basic(self):
-        cat1 = Category.from_static_category(
-            CATEGORIES[amo.FIREFOX.id][amo.ADDON_EXTENSION]['bookmarks'])
-        cat1.save()
+        cat1 = CATEGORIES[amo.ADDON_EXTENSION]['bookmarks']
         license = License.objects.create(
             name={
-                'en-US': u'My License',
-                'fr': u'Mä Licence',
+                'en-US': 'My License',
+                'fr': 'Mä Licence',
             },
             text={
-                'en-US': u'Lorem ipsum dolor sit amet, has nemore patrioqué',
+                'en-US': 'Lorem ipsum dolor sit amet, has nemore patrioqué',
             },
-            url='http://license.example.com/'
-
         )
         self.addon = addon_factory(
             average_daily_users=4242,
             average_rating=4.21,
             bayesian_rating=4.22,
             category=cat1,
-            contributions=u'https://paypal.me/foobar/',
-            description=u'My Addôn description',
-            developer_comments=u'Dévelopers Addôn comments',
+            contributions='https://paypal.me/foobar/',
+            description='My Addôn description',
+            developer_comments='Dévelopers Addôn comments',
             file_kw={
+                'filename': 'webextension.xpi',
                 'hash': 'fakehash',
-                'is_restart_required': False,
-                'is_webextension': True,
-                'platform': amo.PLATFORM_WIN.id,
                 'size': 42,
+                'is_signed': True,
             },
             guid=generate_addon_guid(),
-            homepage=u'https://www.example.org/',
+            homepage='https://www.example.org/',
             icon_hash='fakehash',
             icon_type='image/png',
-            name=u'My Addôn',
-            public_stats=True,
+            name='My Addôn',
             slug='my-addon',
-            summary=u'My Addôn summary',
-            support_email=u'support@example.org',
-            support_url=u'https://support.example.org/support/my-addon/',
+            summary='My Addôn summary',
+            support_email='support@example.org',
+            support_url='https://support.example.org/support/my-addon/',
             tags=['some_tag', 'some_other_tag'],
             total_ratings=666,
             text_ratings_count=555,
             version_kw={
                 'license': license,
                 'release_notes': {
-                    'en-US': u'Release notes in english',
-                    'fr': u'Notes de version en français',
+                    'en-US': 'Release notes in english',
+                    'fr': 'Notes de version en français',
                 },
             },
             weekly_downloads=2147483647,
         )
-        AddonUser.objects.create(user=user_factory(username='hidden_author'),
-                                 addon=self.addon, listed=False)
+        AddonUser.objects.create(
+            user=user_factory(username='hidden_author'), addon=self.addon, listed=False
+        )
         second_author = user_factory(
-            username='second_author', display_name=u'Secönd Author')
+            username='second_author', display_name='Secönd Author'
+        )
         first_author = user_factory(
-            username='first_author', display_name=u'First Authôr')
-        AddonUser.objects.create(
-            user=second_author, addon=self.addon, position=2)
-        AddonUser.objects.create(
-            user=first_author, addon=self.addon, position=1)
-        second_preview = Preview.objects.create(
-            addon=self.addon, position=2,
-            caption={'en-US': u'My câption', 'fr': u'Mön tîtré'},
-            sizes={'thumbnail': [199, 99], 'image': [567, 780]})
-        first_preview = Preview.objects.create(addon=self.addon, position=1)
+            username='first_author', display_name='First Authôr'
+        )
+        AddonUser.objects.create(user=second_author, addon=self.addon, position=2)
+        AddonUser.objects.create(user=first_author, addon=self.addon, position=1)
 
         av_min = AppVersion.objects.get_or_create(
-            application=amo.ANDROID.id, version='2.0.99')[0]
+            application=amo.ANDROID.id, version='121.0'
+        )[0]
         av_max = AppVersion.objects.get_or_create(
-            application=amo.ANDROID.id, version='3.0.99')[0]
+            application=amo.ANDROID.id, version='*'
+        )[0]
         ApplicationsVersions.objects.get_or_create(
-            application=amo.ANDROID.id, version=self.addon.current_version,
-            min=av_min, max=av_max)
-        # Reset current_version.compatible_apps now that we've added an app.
-        del self.addon.current_version._compatible_apps
-
-        cat2 = Category.from_static_category(
-            CATEGORIES[amo.FIREFOX.id][amo.ADDON_EXTENSION]['alerts-updates'])
-        cat2.save()
+            application=amo.ANDROID.id,
+            version=self.addon.current_version,
+            min=av_min,
+            max=av_max,
+        )
+        cat2 = CATEGORIES[amo.ADDON_EXTENSION]['alerts-updates']
         AddonCategory.objects.create(addon=self.addon, category=cat2)
-        cat3 = Category.from_static_category(
-            CATEGORIES[amo.ANDROID.id][amo.ADDON_EXTENSION]['sports-games'])
-        cat3.save()
-        AddonCategory.objects.create(addon=self.addon, category=cat3)
 
         result = self.serialize()
 
         assert result['id'] == self.addon.pk
 
         assert result['average_daily_users'] == self.addon.average_daily_users
-        assert result['categories'] == {
-            'firefox': ['alerts-updates', 'bookmarks'],
-            'android': ['sports-games']}
+        assert result['categories'] == ['bookmarks', 'alerts-updates']
 
         # In this serializer latest_unlisted_version is omitted.
         assert 'latest_unlisted_version' not in result
 
         assert result['current_version']
-        self._test_version(
-            self.addon.current_version, result['current_version'])
-        assert result['current_version']['url'] == absolutify(
-            reverse('addons.versions',
-                    args=[self.addon.slug, self.addon.current_version.version])
-        )
+        self._test_version(self.addon.current_version, result['current_version'])
         self._test_version_license_and_release_notes(
-            self.addon.current_version, result['current_version'])
+            self.addon.current_version, result['current_version']
+        )
 
         assert result['authors']
         assert len(result['authors']) == 2
         self._test_author(first_author, result['authors'][0])
         self._test_author(second_author, result['authors'][1])
 
-        assert result['contributions_url'] == self.addon.contributions
+        utm_string = '&'.join(
+            f'{key}={value}' for key, value in amo.CONTRIBUTE_UTM_PARAMS.items()
+        )
+        assert result['contributions_url']['url'] == (
+            self.addon.contributions + '?' + utm_string
+        )
+        assert result['contributions_url']['outgoing'] == (
+            get_outgoing_url(self.addon.contributions + '?' + utm_string)
+        )
         assert result['edit_url'] == absolutify(self.addon.get_dev_url())
         assert result['default_locale'] == self.addon.default_locale
         assert result['description'] == {'en-US': self.addon.description}
-        assert result['developer_comments'] == {
-            'en-US': self.addon.developer_comments}
+        assert result['developer_comments'] == {'en-US': self.addon.developer_comments}
         assert result['guid'] == self.addon.guid
         assert result['has_eula'] is False
         assert result['has_privacy_policy'] is False
-        assert result['homepage'] == {
-            'en-US': six.text_type(self.addon.homepage),
+        assert result['homepage']['url'] == {'en-US': str(self.addon.homepage)}
+        assert result['homepage']['outgoing'] == {
+            'en-US': get_outgoing_url(str(self.addon.homepage))
         }
         assert result['icon_url'] == absolutify(self.addon.get_icon_url(64))
         assert result['icons'] == {
@@ -236,39 +288,10 @@ class AddonSerializerOutputTestMixin(object):
         }
         assert result['is_disabled'] == self.addon.is_disabled
         assert result['is_experimental'] == self.addon.is_experimental is False
-        assert result['is_featured'] == self.addon.is_featured() is False
-        assert result['is_source_public'] == self.addon.view_source
         assert result['last_updated'] == (
-            self.addon.last_updated.replace(microsecond=0).isoformat() + 'Z')
+            self.addon.last_updated.replace(microsecond=0).isoformat() + 'Z'
+        )
         assert result['name'] == {'en-US': self.addon.name}
-        assert result['previews']
-        assert len(result['previews']) == 2
-
-        result_preview = result['previews'][0]
-        assert result_preview['id'] == first_preview.pk
-        assert result_preview['caption'] is None
-        assert result_preview['image_url'] == absolutify(
-            first_preview.image_url)
-        assert result_preview['thumbnail_url'] == absolutify(
-            first_preview.thumbnail_url)
-        assert result_preview['image_size'] == first_preview.image_size
-        assert result_preview['thumbnail_size'] == first_preview.thumbnail_size
-
-        result_preview = result['previews'][1]
-        assert result_preview['id'] == second_preview.pk
-        assert result_preview['caption'] == {
-            'en-US': u'My câption',
-            'fr': u'Mön tîtré'
-        }
-        assert result_preview['image_url'] == absolutify(
-            second_preview.image_url)
-        assert result_preview['thumbnail_url'] == absolutify(
-            second_preview.thumbnail_url)
-        assert (result_preview['image_size'] == second_preview.image_size ==
-                [567, 780])
-        assert (result_preview['thumbnail_size'] ==
-                second_preview.thumbnail_size == [199, 99])
-
         assert result['ratings'] == {
             'average': self.addon.average_rating,
             'bayesian_average': self.addon.bayesian_rating,
@@ -276,67 +299,146 @@ class AddonSerializerOutputTestMixin(object):
             'text_count': self.addon.text_ratings_count,
         }
         assert (
-            result['ratings_url'] == absolutify(self.addon.ratings_url) ==
-            absolutify(reverse('addons.ratings.list', args=[self.addon.slug])))
-        assert result['public_stats'] == self.addon.public_stats
+            result['ratings_url']
+            == absolutify(self.addon.ratings_url)
+            == absolutify(reverse('addons.ratings.list', args=[self.addon.slug]))
+        )
         assert result['requires_payment'] == self.addon.requires_payment
         assert result['review_url'] == absolutify(
-            reverse('reviewers.review', args=[self.addon.pk]))
+            reverse('reviewers.review', args=[self.addon.pk])
+        )
         assert result['slug'] == self.addon.slug
         assert result['status'] == 'public'
         assert result['summary'] == {'en-US': self.addon.summary}
         assert result['support_email'] == {'en-US': self.addon.support_email}
-        assert result['support_url'] == {
-            'en-US': six.text_type(self.addon.support_url),
+        assert result['support_url']['url'] == {'en-US': str(self.addon.support_url)}
+        assert result['support_url']['outgoing'] == {
+            'en-US': get_outgoing_url(str(self.addon.support_url))
         }
-        assert 'theme_data' not in result
         assert set(result['tags']) == {'some_tag', 'some_other_tag'}
         assert result['type'] == 'extension'
-        assert result['url'] == absolutify(self.addon.get_url_path())
+        assert result['url'] == self.addon.get_absolute_url()
         assert result['weekly_downloads'] == self.addon.weekly_downloads
+        assert not result['promoted']
+        assert (
+            result['versions_url']
+            == absolutify(self.addon.versions_url)
+            == absolutify(reverse('addons.versions', args=[self.addon.slug]))
+        )
 
         return result
 
-    def test_wrap_outgoing_links(self):
-        self.addon = addon_factory(
-            contributions=u'https://paypal.me/fôobar',
-            homepage='http://support.example.com/',
-            support_url=u'https://support.example.org/support/my-âddon/')
-        self.request = APIRequestFactory().get('/', {'wrap_outgoing_links': 1})
+    def test_previews(self):
+        self.addon = addon_factory()
+        second_preview = Preview.objects.create(
+            addon=self.addon,
+            position=2,
+            caption={'en-US': 'My câption', 'fr': 'Mön tîtré'},
+            sizes={'thumbnail': [199, 99], 'image': [567, 780]},
+        )
+        first_preview = Preview.objects.create(addon=self.addon, position=1)
+
         result = self.serialize()
+
+        assert result['previews']
+        assert len(result['previews']) == 2
+
+        result_preview = result['previews'][0]
+        assert result_preview['id'] == first_preview.pk
+        assert result_preview['caption'] is None
+        assert result_preview['image_url'] == absolutify(first_preview.image_url)
+        assert result_preview['thumbnail_url'] == absolutify(
+            first_preview.thumbnail_url
+        )
+        assert result_preview['image_size'] == first_preview.image_dimensions
+        assert result_preview['thumbnail_size'] == first_preview.thumbnail_dimensions
+        assert result_preview['position'] == first_preview.position
+
+        result_preview = result['previews'][1]
+        assert result_preview['id'] == second_preview.pk
+        assert result_preview['caption'] == {'en-US': 'My câption', 'fr': 'Mön tîtré'}
+        assert result_preview['image_url'] == absolutify(second_preview.image_url)
+        assert result_preview['thumbnail_url'] == absolutify(
+            second_preview.thumbnail_url
+        )
+        assert (
+            result_preview['image_size']
+            == second_preview.image_dimensions
+            == [567, 780]
+        )
+        assert (
+            result_preview['thumbnail_size']
+            == second_preview.thumbnail_dimensions
+            == [199, 99]
+        )
+        assert result_preview['position'] == second_preview.position
+
+        with override_settings(DRF_API_GATES={'v5': ('del-preview-position',)}):
+            result = self.serialize()
+
+            assert 'postion' not in result
+
+    @override_settings(DRF_API_GATES={'v5': ('wrap-outgoing-parameter',)})
+    def test_outgoing_links_in_v3_v4(self):
+        self.addon = addon_factory(
+            contributions='https://paypal.me/fôobar',
+            homepage='http://support.example.com/',
+            support_url='https://support.example.org/support/my-âddon/',
+        )
+        utm_string = '&'.join(
+            f'{key}={value}' for key, value in amo.CONTRIBUTE_UTM_PARAMS.items()
+        )
+
+        # with no wrap_outgoing_links param first
+        self.request = self.get_request('/')
+        result = self.serialize()
+        assert result['homepage'] == {'en-US': str(self.addon.homepage)}
+        assert result['support_url'] == {'en-US': str(self.addon.support_url)}
         assert result['contributions_url'] == (
-            get_outgoing_url(six.text_type(self.addon.contributions)))
+            self.addon.contributions + '?' + utm_string
+        )
+
+        # then with wrap_outgoing_links param:
+        self.request = self.get_request('/', {'wrap_outgoing_links': 1})
+        result = self.serialize()
+        assert result['contributions_url'] == get_outgoing_url(
+            str(self.addon.contributions) + '?' + utm_string
+        )
         assert result['homepage'] == {
-            'en-US': get_outgoing_url(six.text_type(self.addon.homepage)),
+            'en-US': get_outgoing_url(str(self.addon.homepage)),
         }
         assert result['support_url'] == {
-            'en-US': get_outgoing_url(six.text_type(self.addon.support_url)),
+            'en-US': get_outgoing_url(str(self.addon.support_url)),
         }
 
         # Try a single translation.
-        self.request = APIRequestFactory().get('/', {
-            'lang': 'en-US', 'wrap_outgoing_links': 1})
+        self.request = self.get_request(
+            '/', {'lang': 'en-US', 'wrap_outgoing_links': 1}
+        )
         result = self.serialize()
-        assert result['contributions_url'] == (
-            get_outgoing_url(six.text_type(self.addon.contributions)))
+        assert result['contributions_url'] == get_outgoing_url(
+            str(self.addon.contributions) + '?' + utm_string
+        )
         assert result['homepage'] == {
-            'en-US': get_outgoing_url(six.text_type(self.addon.homepage)),
+            'en-US': get_outgoing_url(str(self.addon.homepage)),
         }
         assert result['support_url'] == {
-            'en-US': get_outgoing_url(six.text_type(self.addon.support_url)),
+            'en-US': get_outgoing_url(str(self.addon.support_url)),
         }
         # And again, but with v3 style flat strings
-        gates = {None: ('l10n_flat_input_output',)}
+        gates = {
+            self.request.version: (
+                'wrap-outgoing-parameter',
+                'l10n_flat_input_output',
+            )
+        }
         with override_settings(DRF_API_GATES=gates):
             result = self.serialize()
-        assert result['contributions_url'] == (
-            get_outgoing_url(six.text_type(self.addon.contributions)))
-        assert result['homepage'] == (
-            get_outgoing_url(six.text_type(self.addon.homepage))
+        assert result['contributions_url'] == get_outgoing_url(
+            str(self.addon.contributions) + '?' + utm_string
         )
-        assert result['support_url'] == (
-            get_outgoing_url(six.text_type(self.addon.support_url))
-        )
+        assert result['homepage'] == (get_outgoing_url(str(self.addon.homepage)))
+        assert result['support_url'] == (get_outgoing_url(str(self.addon.support_url)))
 
         # Try with empty strings/None. Annoyingly, contribution model field
         # does not let us set it to None, so use a translated field for that
@@ -346,11 +448,17 @@ class AddonSerializerOutputTestMixin(object):
         assert result['contributions_url'] == ''
         assert result['homepage'] is None
 
+        # Check the contribute utm parameters are added correctly when the url
+        # already has query parameters.
+        self.addon.update(contributions='https://paypal.me/has?query=params')
+        result = self.serialize()
+        assert result['contributions_url'] == get_outgoing_url(
+            str(self.addon.contributions) + '&' + utm_string
+        )
+
     def test_latest_unlisted_version(self):
         self.addon = addon_factory()
-        version_factory(
-            addon=self.addon, channel=amo.RELEASE_CHANNEL_UNLISTED,
-            version='1.1')
+        version_factory(addon=self.addon, channel=amo.CHANNEL_UNLISTED, version='1.1')
         assert self.addon.latest_unlisted_version
 
         result = self.serialize()
@@ -365,10 +473,16 @@ class AddonSerializerOutputTestMixin(object):
         assert result['is_disabled'] is True
 
     def test_is_source_public(self):
-        self.addon = addon_factory(view_source=True)
+        self.addon = addon_factory()
         result = self.serialize()
 
-        assert result['is_source_public'] is True
+        assert 'is_source_public' not in result
+
+        # It's only present in v3
+        gates = {self.request.version: ('is-source-public-shim',)}
+        with override_settings(DRF_API_GATES=gates):
+            result = self.serialize()
+            assert result['is_source_public'] is False
 
     def test_is_experimental(self):
         self.addon = addon_factory(is_experimental=True)
@@ -402,27 +516,8 @@ class AddonSerializerOutputTestMixin(object):
         assert result['id'] == self.addon.pk
         assert result['current_version'] is None
 
-    def test_no_current_version_files(self):
-        self.addon = addon_factory(name='lol')
-        # Just removing the last file deletes the version, so we have to be
-        # creative and replace the version manually with one that has no files.
-        self.addon.current_version.delete()
-        version = self.addon.versions.create(version='0.42')
-        self.addon._current_version = version
-        self.addon.save()
-        result = self.serialize()
-
-        assert result['id'] == self.addon.pk
-        assert result['current_version']
-        result_version = result['current_version']
-        assert result_version['reviewed'] == version.reviewed
-        assert result_version['version'] == version.version
-        assert result_version['files'] == []
-        assert result_version['is_strict_compatibility_enabled'] is False
-        assert result_version['compatibility'] == {}
-
     def test_deleted(self):
-        self.addon = addon_factory(name=u'My Deleted Addôn')
+        self.addon = addon_factory(name='My Deleted Addôn')
         self.addon.delete()
         result = self.serialize()
 
@@ -432,8 +527,8 @@ class AddonSerializerOutputTestMixin(object):
     def test_has_policies(self):
         self.addon = addon_factory()
         self.addon.eula = {
-            'en-US': u'My Addôn EULA in english',
-            'fr': u'Houlalà',
+            'en-US': 'My Addôn EULA in english',
+            'fr': 'Houlalà',
         }
         self.addon.privacy_policy = 'lol'
         self.addon.save()
@@ -443,24 +538,133 @@ class AddonSerializerOutputTestMixin(object):
         assert result['has_privacy_policy'] is True
 
     def test_is_featured(self):
-        self.addon = addon_factory()
-        collection = collection_factory()
-        FeaturedCollection.objects.create(collection=collection,
-                                          application=collection.application)
-        collection.add_addon(self.addon)
-        assert self.addon.is_featured()
+        # As we've dropped featuring, we're faking it with recommended status
+        self.addon = addon_factory(
+            promoted_kwargs={
+                'api_name': RECOMMENDED_API_NAME,
+                'listed_pre_review': True,
+            }
+        )
+        result = self.serialize()
+
+        assert 'is_featured' not in result
+
+        # It's only present in v3
+        gates = {self.request.version: ('is-featured-addon-shim',)}
+        with override_settings(DRF_API_GATES=gates):
+            result = self.serialize()
+            assert result['is_featured'] is True
+            self.addon.current_version.promoted_versions.all().delete()
+            result = self.serialize()
+            assert result['is_featured'] is False
+
+    def test_promoted(self):
+        # With a promoted extension.
+        self.addon = addon_factory(
+            promoted_kwargs={
+                'api_name': RECOMMENDED_API_NAME,
+                'listed_pre_review': True,
+            }
+        )
 
         result = self.serialize()
-        assert result['is_featured'] is True
+        promoted = result['promoted'][0]
+        assert promoted['category'] == RECOMMENDED_API_NAME
+        assert promoted['apps'] == [app.short for app in amo.APP_USAGE]
+
+        # With a specific application approved.
+        self.addon.current_version.promoted_versions.filter(
+            application_id=amo.ANDROID.id
+        ).delete()
+        result = self.serialize()
+        assert result['promoted'][0]['apps'] == [amo.FIREFOX.short]
+
+        # Test multiple promotions.
+        line_group, _ = PromotedGroup.objects.get_or_create(
+            api_name='line', name='By Firefox', listed_pre_review=True
+        )
+        PromotedAddon.objects.create(
+            addon=self.addon,
+            promoted_group=line_group,
+            application_id=amo.FIREFOX.id,
+        )
+        self.addon.approve_for_version(self.addon.current_version)
+        result = self.serialize()
+        assert len(result['promoted']) == 2
+        assert result['promoted'][0]['category'] == RECOMMENDED_API_NAME
+        assert result['promoted'][1]['category'] == 'line'
+
+        # Directly returns first promotion in v3, v4
+        gates = {self.request.version: ('promoted-groups-shim',)}
+        with override_settings(DRF_API_GATES=gates):
+            result = self.serialize()
+            assert result['promoted']['category'] == RECOMMENDED_API_NAME
+
+        # With a recommended theme.
+        PromotedAddon.objects.filter(addon=self.addon).delete()
+        self.addon.update(type=amo.ADDON_STATICTHEME)
+        featured_collection, _ = Collection.objects.get_or_create(
+            id=settings.COLLECTION_FEATURED_THEMES_ID
+        )
+        featured_collection.add_addon(self.addon)
+
+        result = self.serialize()
+        promoted = result['promoted'][0]
+        assert promoted['category'] == RECOMMENDED_API_NAME
+        assert promoted['apps'] == [app.short for app in amo.APP_USAGE]
+
+    def test_promoted_shim(self):
+        group, _ = PromotedGroup.objects.get_or_create(
+            api_name='promoted',
+            name='Promoted',
+            listed_pre_review=True,
+        )
+        self.addon = addon_factory()
+
+        PromotedAddon.objects.create(
+            addon=self.addon,
+            application_id=amo.FIREFOX.id,
+            promoted_group=group,
+        )
+        PromotedApproval.objects.create(
+            version=self.addon.current_version,
+            application_id=amo.FIREFOX.id,
+            promoted_group=group,
+        )
+
+        assert self.addon.promoted_groups()
+
+        # v3 and v4 expect the promoted addon directly.
+        gates = {self.request.version: ('promoted-groups-shim',)}
+        with override_settings(DRF_API_GATES=gates):
+            result = self.serialize()
+            promoted = result['promoted']
+            assert promoted['category'] == 'promoted'
+            assert promoted['apps'] == [amo.FIREFOX.short]
+
+    def test_private_promoted_api_hidden(self):
+        self.addon = addon_factory(
+            promoted_kwargs={
+                'api_name': 'private-group',
+                'name': 'Private group',
+                'listed_pre_review': True,
+                'is_public': False,
+            }
+        )
+        result = self.serialize()
+        assert not result['promoted']
+        # But still promoted
+        assert 'private-group' in self.addon.promoted_groups().api_name
 
     def test_translations(self):
         translated_descriptions = {
-            'en-US': u'My Addôn description in english',
-            'fr': u'Description de mon Addôn',
+            'en-US': 'My Addôn description in english',
+            'fr': 'Description de mon Addôn',
         }
+
         translated_homepages = {
-            'en-US': u'http://www.google.com/',
-            'fr': u'http://www.googlé.fr/',
+            'en-US': 'http://www.google.com/',
+            'fr': 'http://www.googlé.fr/',
         }
         self.addon = addon_factory()
         self.addon.description = translated_descriptions
@@ -469,147 +673,146 @@ class AddonSerializerOutputTestMixin(object):
 
         result = self.serialize()
         assert result['description'] == translated_descriptions
-        assert result['homepage'] == translated_homepages
+        assert result['homepage']['url'] == translated_homepages
+        assert result['homepage']['outgoing'] == {
+            locale: get_outgoing_url(url)
+            for locale, url in translated_homepages.items()
+        }
 
         # Try a single translation. The locale activation is normally done by
         # LocaleAndAppURLMiddleware, but since we're directly calling the
         # serializer we need to do it ourselves.
-        self.request = APIRequestFactory().get('/', {'lang': 'fr'})
+        self.request = self.get_request('/', {'lang': 'fr'})
         with override('fr'):
             result = self.serialize()
         assert result['description'] == {'fr': translated_descriptions['fr']}
-        assert result['homepage'] == {'fr': translated_homepages['fr']}
+        assert result['homepage']['url'] == {'fr': translated_homepages['fr']}
+        assert result['homepage']['outgoing'] == {
+            'fr': get_outgoing_url(translated_homepages['fr'])
+        }
+        # Check when it's a missing locale we don't mangle the `_default` value
+        self.request = self.get_request('/', {'lang': 'de'})
+        with override('de'):
+            result = self.serialize()
+        assert result['homepage']['url'] == {
+            'en-US': translated_homepages['en-US'],
+            'de': None,
+            '_default': 'en-US',
+        }
+        assert result['homepage']['outgoing'] == {
+            'en-US': get_outgoing_url(translated_homepages['en-US']),
+            'de': None,
+            '_default': 'en-US',
+        }
 
         # And again, but with v3 style flat strings
+        self.request = self.get_request('/', {'lang': 'fr'})
         with override('fr'):
-            gates = {None: ('l10n_flat_input_output',)}
+            gates = {self.request.version: ('l10n_flat_input_output',)}
             with override_settings(DRF_API_GATES=gates):
                 result = self.serialize()
         assert result['description'] == translated_descriptions['fr']
-        assert result['homepage'] == translated_homepages['fr']
-
-    def test_persona_with_persona_id(self):
-        self.addon = addon_factory(type=amo.ADDON_PERSONA)
-        persona = self.addon.persona
-        persona.persona_id = 42
-        persona.header = u'myheader.jpg'
-        persona.footer = u'myfooter.jpg'
-        persona.accentcolor = u'336699'
-        persona.textcolor = u'f0f0f0'
-        persona.author = u'Me-me-me-Myself'
-        persona.display_username = u'my-username'
-        persona.save()
-        assert not persona.is_new()
-
-        result = self.serialize()
-        assert result['theme_data'] == persona.theme_data
-
-    def test_persona(self):
-        self.addon = addon_factory(
-            name=u'My Personâ',
-            description=u'<script>alert(42)</script>My Personä description',
-            type=amo.ADDON_PERSONA)
-        persona = self.addon.persona
-        persona.persona_id = 0  # For "new" style Personas this is always 0.
-        persona.header = u'myheader.png'
-        persona.footer = u'myfooter.png'
-        persona.accentcolor = u'336699'
-        persona.textcolor = u'f0f0f0'
-        persona.author = u'Me-me-me-Myself'
-        persona.display_username = u'my-username'
-        persona.popularity = 123456
-        persona.save()
-        assert persona.is_new()
-
-        result = self.serialize()
-        assert result['theme_data'] == persona.theme_data
-        assert '<script>' not in result['theme_data']['description']
-        assert '&lt;script&gt;' in result['theme_data']['description']
-
-        assert result['average_daily_users'] == persona.popularity
-
-        assert 'weekly_downloads' not in result
-
-    def test_handle_persona_without_persona_data_in_db(self):
-        self.addon = addon_factory(type=amo.ADDON_PERSONA)
-        Persona.objects.get(addon=self.addon).delete()
-        # .reload() does not clear self.addon.persona, so do it manually.
-        self.addon = Addon.objects.get(pk=self.addon.pk)
-        result = self.serialize()
-
-        assert result['id'] == self.addon.pk
-        assert result['type'] == 'persona'
-        # theme_data should be missing, which sucks, but is better than a 500.
-        assert 'theme_data' not in result
-        # icon url should just be a default icon instead of the Persona icon.
-        assert result['icon_url'] == (
-            'http://testserver/static/img/addon-icons/default-64.png')
-        assert result['icons'] == {
-            '32': 'http://testserver/static/img/addon-icons/default-32.png',
-            '64': 'http://testserver/static/img/addon-icons/default-64.png',
-            '128': 'http://testserver/static/img/addon-icons/default-128.png',
-        }
+        assert result['homepage']['url'] == translated_homepages['fr']
+        assert result['homepage']['outgoing'] == (
+            get_outgoing_url(translated_homepages['fr'])
+        )
 
     def test_webextension(self):
-        self.addon = addon_factory(file_kw={'is_webextension': True})
+        self.addon = addon_factory(
+            file_kw={'filename': 'webextension.xpi', 'is_signed': True}
+        )
+        permissions = ['bookmarks', 'random permission']
+        optional_permissions = ['cookies', 'optional permission']
+        host_permissions = ['*://example.com/*', '*://mozilla.com/*']
+        data_collection_permissions = ['none']
+        optional_data_collection_permissions = [
+            'technicalAndInteraction',
+            'personallyIdentifyingInfo',
+        ]
+
         # Give one of the versions some webext permissions to test that.
         WebextPermission.objects.create(
-            file=self.addon.current_version.all_files[0],
-            permissions=['bookmarks', 'random permission']
+            file=self.addon.current_version.file,
+            permissions=permissions,
+            optional_permissions=optional_permissions,
+            host_permissions=host_permissions,
+            data_collection_permissions=data_collection_permissions,
+            optional_data_collection_permissions=optional_data_collection_permissions,
         )
 
         result = self.serialize()
 
-        self._test_version(
-            self.addon.current_version, result['current_version'])
+        self._test_version(self.addon.current_version, result['current_version'])
         # Double check the permissions got correctly set.
-        assert result['current_version']['files'][0]['permissions'] == ([
-            'bookmarks', 'random permission'])
+        assert result['current_version']['file']['permissions'] == permissions
+        assert (
+            result['current_version']['file']['optional_permissions']
+            == optional_permissions
+        )
+        assert result['current_version']['file']['host_permissions'] == host_permissions
+        assert (
+            result['current_version']['file']['data_collection_permissions']
+            == data_collection_permissions
+        )
+        assert (
+            result['current_version']['file']['optional_data_collection_permissions']
+            == optional_data_collection_permissions
+        )
 
     def test_is_restart_required(self):
-        self.addon = addon_factory(file_kw={'is_restart_required': True})
+        self.addon = addon_factory()
         result = self.serialize()
+        file_data = result['current_version']['file']
+        assert 'is_restart_required' not in file_data
 
-        self._test_version(
-            self.addon.current_version, result['current_version'])
+        # Test with shim
+        gates = {self.request.version: ('is-restart-required-shim',)}
+        with override_settings(DRF_API_GATES=gates):
+            result = self.serialize()
+        file_data = result['current_version']['file']
+        assert file_data['is_restart_required'] is False
+
+    def test_is_webextension(self):
+        self.addon = addon_factory()
+        result = self.serialize()
+        file_data = result['current_version']['file']
+        assert 'is_webextension' not in file_data
+
+        # Test with shim
+        gates = {self.request.version: ('is-webextension-shim',)}
+        with override_settings(DRF_API_GATES=gates):
+            result = self.serialize()
+        file_data = result['current_version']['file']
+        assert file_data['is_webextension'] is True
 
     def test_special_compatibility_cases(self):
         # Test an add-on with strict compatibility enabled.
         self.addon = addon_factory(file_kw={'strict_compatibility': True})
         result_version = self.serialize()['current_version']
         assert result_version['compatibility'] == {
-            'firefox': {'max': u'5.0.99', 'min': u'4.0.99'}
+            'firefox': {'max': '5.0.99', 'min': '4.0.99'}
         }
         assert result_version['is_strict_compatibility_enabled'] is True
 
         # Test with no compatibility info.
-        file_ = self.addon.current_version.all_files[0]
+        file_ = self.addon.current_version.file
         file_.update(strict_compatibility=False)
-        ApplicationsVersions.objects.filter(
-            version=self.addon.current_version).delete()
+        ApplicationsVersions.objects.filter(version=self.addon.current_version).delete()
 
         result_version = self.serialize()['current_version']
         assert result_version['is_strict_compatibility_enabled'] is False
         assert result_version['compatibility'] == {}
-
-        # Test with some compatibility info but that should be ignored because
-        # its type is in NO_COMPAT.
-        self.addon.update(type=amo.ADDON_SEARCH)
-        result_version = self.serialize()['current_version']
-        assert result_version['compatibility'] == {
-            'android': {'max': '9999', 'min': '11.0'},
-            'firefox': {'max': '9999', 'min': '4.0'},
-        }
-        assert result_version['is_strict_compatibility_enabled'] is False
 
     def test_static_theme_preview(self):
         self.addon = addon_factory(type=amo.ADDON_STATICTHEME)
         # Attach some Preview instances do the add-on, they should be ignored
         # since it's a static theme.
         Preview.objects.create(
-            addon=self.addon, position=1,
-            caption={'en-US': u'My câption', 'fr': u'Mön tîtré'},
-            sizes={'thumbnail': [123, 45], 'image': [678, 910]})
+            addon=self.addon,
+            position=1,
+            caption={'en-US': 'My câption', 'fr': 'Mön tîtré'},
+            sizes={'thumbnail': [123, 45], 'image': [678, 910]},
+        )
         result = self.serialize()
         assert result['previews'] == []
 
@@ -617,28 +820,38 @@ class AddonSerializerOutputTestMixin(object):
         # take the right one.
         first_version = self.addon.current_version
         VersionPreview.objects.create(
-            version=first_version,
-            sizes={'thumbnail': [12, 34], 'image': [56, 78]})
+            version=first_version, sizes={'thumbnail': [12, 34], 'image': [56, 78]}
+        )
         second_version = version_factory(addon=self.addon)
         current_preview = VersionPreview.objects.create(
-            version=second_version,
-            sizes={'thumbnail': [56, 78], 'image': [91, 234]})
+            version=second_version, sizes={'thumbnail': [56, 78], 'image': [91, 234]}
+        )
         assert self.addon.reload().current_version == second_version
         result = self.serialize()
         assert len(result['previews']) == 1
         assert result['previews'][0]['id'] == current_preview.pk
         assert result['previews'][0]['caption'] is None
         assert result['previews'][0]['image_url'] == absolutify(
-            current_preview.image_url)
+            current_preview.image_url
+        )
         assert result['previews'][0]['thumbnail_url'] == absolutify(
-            current_preview.thumbnail_url)
-        assert result['previews'][0]['image_size'] == (
-            current_preview.image_size)
+            current_preview.thumbnail_url
+        )
+        assert result['previews'][0]['image_size'] == current_preview.image_dimensions
         assert result['previews'][0]['thumbnail_size'] == (
-            current_preview.thumbnail_size)
+            current_preview.thumbnail_dimensions
+        )
 
+    def test_static_theme_preview_no_current_version(self):
+        self.addon = addon_factory(type=amo.ADDON_STATICTHEME)
         # Make sure we don't fail if somehow there is no current version.
         self.addon.update(_current_version=None)
+        Preview.objects.create(
+            addon=self.addon,
+            position=1,
+            caption={'en-US': 'My câption', 'fr': 'Mön tîtré'},
+            sizes={'thumbnail': [123, 45], 'image': [678, 910]},
+        )
         result = self.serialize()
         assert result['current_version'] is None
         assert result['previews'] == []
@@ -648,27 +861,68 @@ class AddonSerializerOutputTestMixin(object):
         result = self.serialize()
 
         assert result['created'] == (
-            self.addon.created.replace(microsecond=0).isoformat() + 'Z')
+            self.addon.created.replace(microsecond=0).isoformat() + 'Z'
+        )
 
         # And to make sure it's not present in v3
-        gates = {None: ('del-addons-created-field',)}
+        gates = {self.request.version: ('del-addons-created-field',)}
         with override_settings(DRF_API_GATES=gates):
             result = self.serialize()
             assert 'created' not in result
+
+    def test_grouped_ratings(self):
+        self.addon = addon_factory()
+        self.request = self.get_request('/', {'show_grouped_ratings': 1})
+        result = self.serialize()
+        assert result['ratings']['grouped_counts'] == {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+        Rating.objects.create(addon=self.addon, rating=2, user=user_factory())
+        Rating.objects.create(addon=self.addon, rating=2, user=user_factory())
+        Rating.objects.create(addon=self.addon, rating=5, user=user_factory())
+        result = self.serialize()
+        assert result['ratings']['grouped_counts'] == {1: 0, 2: 2, 3: 0, 4: 0, 5: 1}
+
+    def test_current_version_license_builtin(self):
+        self.addon = addon_factory(
+            version_kw={
+                'license_kw': {
+                    'builtin': LICENSE_GPL3.builtin,
+                }
+            }
+        )
+        result = self.serialize()
+
+        assert result['current_version']['license'] == {
+            'id': self.addon.current_version.license.pk,
+            'is_custom': False,
+            'name': {'en-US': 'GNU General Public License v3.0 only'},
+            'slug': 'GPL-3.0-only',
+            'url': 'https://spdx.org/licenses/GPL-3.0-only.html',
+        }
+
+    def test_categories_as_object(self):
+        self.addon = addon_factory(
+            category=CATEGORIES[amo.ADDON_EXTENSION]['bookmarks']
+        )
+        result = self.serialize()
+        assert result['categories'] == ['bookmarks']
+
+        gates = {self.request.version: ('categories-application',)}
+        with override_settings(DRF_API_GATES=gates):
+            result = self.serialize()
+            assert result['categories'] == {'firefox': ['bookmarks']}
 
 
 class TestAddonSerializerOutput(AddonSerializerOutputTestMixin, TestCase):
     serializer_class = AddonSerializer
 
     def setUp(self):
-        super(TestAddonSerializerOutput, self).setUp()
+        super().setUp()
         self.action = 'retrieve'
 
     def serialize(self):
-        self.serializer = self.serializer_class(context={
-            'request': self.request,
-            'view': AddonViewSet(action=self.action)
-        })
+        self.serializer = self.serializer_class(
+            context={'request': self.request, 'view': AddonViewSet(action=self.action)}
+        )
         # Manually reload the add-on first to clear any cached properties.
         self.addon = Addon.unfiltered.get(pk=self.addon.pk)
         return self.serializer.to_representation(self.addon)
@@ -679,42 +933,51 @@ class TestAddonSerializerOutput(AddonSerializerOutputTestMixin, TestCase):
         available through the add-on detail API.
         """
         self.addon = addon_factory(
-            type=amo.ADDON_LPAPP, target_locale='es',
+            type=amo.ADDON_LPAPP,
+            target_locale='es',
             file_kw={'strict_compatibility': True},
-            version_kw={'min_app_version': '57.0', 'max_app_version': '57.*'})
+            version_kw={'min_app_version': '57.0', 'max_app_version': '57.*'},
+        )
         self.addon.current_version.update(created=self.days_ago(3))
         version_for_58 = version_factory(
             addon=self.addon,
             file_kw={'strict_compatibility': True},
-            min_app_version='58.0', max_app_version='58.*')
+            min_app_version='58.0',
+            max_app_version='58.*',
+        )
         version_for_58.update(created=self.days_ago(2))
         # Extra version for 59, should not be returned.
         version_factory(
             addon=self.addon,
             file_kw={'strict_compatibility': True},
-            min_app_version='59.0', max_app_version='59.*')
+            min_app_version='59.0',
+            max_app_version='59.*',
+        )
         # Extra version that would be compatible and more recent, but belongs
         # to a different add-on and should be ignored.
         addon_factory(
-            type=amo.ADDON_LPAPP, target_locale='fr',
+            type=amo.ADDON_LPAPP,
+            target_locale='fr',
             file_kw={'strict_compatibility': True},
-            version_kw={'min_app_version': '58.0', 'max_app_version': '58.*'})
+            version_kw={'min_app_version': '58.0', 'max_app_version': '58.*'},
+        )
         # Extra version that would be compatible and more recent, but is not
         # public.
         not_public_version_for_58 = version_factory(
             addon=self.addon,
-            file_kw={'strict_compatibility': True,
-                     'status': amo.STATUS_DISABLED},
-            min_app_version='58.0', max_app_version='58.*')
+            file_kw={'strict_compatibility': True, 'status': amo.STATUS_DISABLED},
+            min_app_version='58.0',
+            max_app_version='58.*',
+        )
         not_public_version_for_58.update(created=self.days_ago(1))
 
-        self.request = APIRequestFactory().get('/?app=firefox&appversion=58.0')
+        self.request = self.get_request('/?app=firefox&appversion=58.0')
         self.action = 'retrieve'
 
         result = self.serialize()
         assert result['current_version']['id'] == version_for_58.pk
         assert result['current_version']['compatibility'] == {
-            'firefox': {'max': u'58.*', 'min': u'58.0'}
+            'firefox': {'max': '58.*', 'min': '58.0'}
         }
         assert result['current_version']['is_strict_compatibility_enabled']
 
@@ -723,39 +986,49 @@ class TestAddonSerializerOutput(AddonSerializerOutputTestMixin, TestCase):
         falling back to the current_version because no compatible version was
         found."""
         self.addon = addon_factory(
-            type=amo.ADDON_LPAPP, target_locale='es',
+            type=amo.ADDON_LPAPP,
+            target_locale='es',
             file_kw={'strict_compatibility': True},
-            version_kw={'min_app_version': '57.0', 'max_app_version': '57.*'})
+            version_kw={'min_app_version': '57.0', 'max_app_version': '57.*'},
+        )
         self.addon.current_version.update(created=self.days_ago(2))
         version_factory(
             addon=self.addon,
             file_kw={'strict_compatibility': True},
-            min_app_version='59.0', max_app_version='59.*')
-        self.request = APIRequestFactory().get('/?app=firefox&appversion=58.0')
+            min_app_version='59.0',
+            max_app_version='59.*',
+        )
+        self.request = self.get_request('/?app=firefox&appversion=58.0')
         self.action = 'retrieve'
 
         result = self.serialize()
         assert result['current_version']['id'] == self.addon.current_version.pk
         assert result['current_version']['compatibility'] == {
-            'firefox': {'max': u'59.*', 'min': u'59.0'}
+            'firefox': {'max': '59.*', 'min': '59.0'}
         }
         assert result['current_version']['is_strict_compatibility_enabled']
 
     def test_langpack_current_version_without_parameters(self):
         self.addon = addon_factory(
-            type=amo.ADDON_LPAPP, target_locale='es',
+            type=amo.ADDON_LPAPP,
+            target_locale='es',
             file_kw={'strict_compatibility': True},
-            version_kw={'min_app_version': '57.0', 'max_app_version': '57.*'})
+            version_kw={'min_app_version': '57.0', 'max_app_version': '57.*'},
+        )
         self.addon.current_version.update(created=self.days_ago(2))
         version_for_58 = version_factory(
             addon=self.addon,
             file_kw={'strict_compatibility': True},
-            min_app_version='58.0', max_app_version='58.*')
+            min_app_version='58.0',
+            max_app_version='58.*',
+        )
         version_for_58.update(created=self.days_ago(1))
         version_factory(
             addon=self.addon,
             file_kw={'strict_compatibility': True},
-            min_app_version='59.0', max_app_version='59.*')
+            min_app_version='59.0',
+            max_app_version='59.*',
+        )
         # Regular detail action with no special parameters, we'll just return
         # the current_version.
         self.action = 'retrieve'
@@ -763,86 +1036,152 @@ class TestAddonSerializerOutput(AddonSerializerOutputTestMixin, TestCase):
         result = self.serialize()
         assert result['current_version']['id'] == self.addon.current_version.pk
         assert result['current_version']['compatibility'] == {
-            'firefox': {'max': u'59.*', 'min': u'59.0'}
+            'firefox': {'max': '59.*', 'min': '59.0'}
         }
         assert result['current_version']['is_strict_compatibility_enabled']
 
     def test_langpack_current_version_with_non_detail_action(self):
         self.addon = addon_factory(
-            type=amo.ADDON_LPAPP, target_locale='es',
+            type=amo.ADDON_LPAPP,
+            target_locale='es',
             file_kw={'strict_compatibility': True},
-            version_kw={'min_app_version': '57.0', 'max_app_version': '57.*'})
+            version_kw={'min_app_version': '57.0', 'max_app_version': '57.*'},
+        )
         self.addon.current_version.update(created=self.days_ago(2))
         version_for_58 = version_factory(
             addon=self.addon,
             file_kw={'strict_compatibility': True},
-            min_app_version='58.0', max_app_version='58.*')
+            min_app_version='58.0',
+            max_app_version='58.*',
+        )
         version_for_58.update(created=self.days_ago(1))
         version_factory(
             addon=self.addon,
             file_kw={'strict_compatibility': True},
-            min_app_version='59.0', max_app_version='59.*')
+            min_app_version='59.0',
+            max_app_version='59.*',
+        )
         # The parameters are going to be ignored, since we're not dealing with
         # the detail API.
-        self.request = APIRequestFactory().get('/?app=firefox&appversion=58.0')
+        self.request = self.get_request('/?app=firefox&appversion=58.0')
         self.action = 'list'
 
         result = self.serialize()
         assert result['current_version']['id'] == self.addon.current_version.pk
         assert result['current_version']['compatibility'] == {
-            'firefox': {'max': u'59.*', 'min': u'59.0'}
+            'firefox': {'max': '59.*', 'min': '59.0'}
         }
         assert result['current_version']['is_strict_compatibility_enabled']
 
     def test_app_and_appversion_parameters_on_non_langpack(self):
         self.addon = addon_factory(
             file_kw={'strict_compatibility': True},
-            version_kw={'min_app_version': '57.0', 'max_app_version': '57.*'})
+            version_kw={'min_app_version': '57.0', 'max_app_version': '57.*'},
+        )
         self.addon.current_version.update(created=self.days_ago(2))
         version_for_58 = version_factory(
             addon=self.addon,
             file_kw={'strict_compatibility': True},
-            min_app_version='58.0', max_app_version='58.*')
+            min_app_version='58.0',
+            max_app_version='58.*',
+        )
         version_for_58.update(created=self.days_ago(1))
         # Extra version for 59, should not be returned.
         version_factory(
             addon=self.addon,
             file_kw={'strict_compatibility': True},
-            min_app_version='59.0', max_app_version='59.*')
+            min_app_version='59.0',
+            max_app_version='59.*',
+        )
         # The parameters are going to be ignored since it's not a langpack.
-        self.request = APIRequestFactory().get('/?app=firefox&appversion=58.0')
+        self.request = self.get_request('/?app=firefox&appversion=58.0')
         self.action = 'retrieve'
 
         result = self.serialize()
         assert result['current_version']['id'] == self.addon.current_version.pk
         assert result['current_version']['compatibility'] == {
-            'firefox': {'max': u'59.*', 'min': u'59.0'}
+            'firefox': {'max': '59.*', 'min': '59.0'}
         }
         assert result['current_version']['is_strict_compatibility_enabled']
 
     def test_latest_unlisted_version_with_right_serializer(self):
-        self.serializer_class = AddonSerializerWithUnlistedData
+        self.serializer_class = DeveloperAddonSerializer
 
         self.addon = addon_factory()
         version_factory(
-            addon=self.addon, channel=amo.RELEASE_CHANNEL_UNLISTED,
-            version='1.1')
+            addon=self.addon,
+            channel=amo.CHANNEL_UNLISTED,
+            version='1.1',
+            file_kw={'filename': 'webextension.xpi', 'is_signed': True},
+        )
         assert self.addon.latest_unlisted_version
 
         result = self.serialize()
         # In this serializer latest_unlisted_version is present.
         assert result['latest_unlisted_version']
         self._test_version(
-            self.addon.latest_unlisted_version,
-            result['latest_unlisted_version'])
-        assert result['latest_unlisted_version']['url'] == absolutify('')
+            self.addon.latest_unlisted_version, result['latest_unlisted_version']
+        )
+
+    def test_is_noindexed(self):
+        self.addon = addon_factory()
+        result = self.serialize()
+
+        assert 'is_noindexed' in result
+        assert result['is_noindexed'] is False
+
+        AddonListingInfo.objects.create(
+            addon=self.addon,
+            noindex_until=datetime.now() + timedelta(days=1),
+        )
+        result = self.serialize()
+        assert result['is_noindexed'] is True
+
+    def test_channels(self):
+        self.addon = addon_factory()
+        assert self.addon.current_version.channel == amo.CHANNEL_LISTED
+        version_factory(addon=self.addon, channel=amo.CHANNEL_UNLISTED)
+        result = self.serialize()
+        # Channels are not exposed by default.
+        assert 'channels' not in result
+        # ...Unless its the developer
+        self.serializer_class = DeveloperAddonSerializer
+        result = self.serialize()
+        assert sorted(result['channels']) == ['listed', 'unlisted']
+
+    def test_submit_notification_warning(self):
+        set_config(
+            amo.config_keys.SUBMIT_NOTIFICATION_WARNING_PRE_REVIEW, 'Test message'
+        )
+        self.addon = addon_factory()
+        result = self.serialize()
+        # submit_notification_warning is not exposed by default.
+        assert 'submit_notification_warning' not in result
+        # ...Unless its the developer
+        self.serializer_class = DeveloperAddonSerializer
+        result = self.serialize()
+        assert result['submit_notification_warning'] == {
+            'listed': None,
+            'unlisted': None,
+            'enterprise': None,
+        }
+
+        self.make_addon_promoted(
+            self.addon, api_name='pre_review', unlisted_pre_review=True
+        )
+        result = self.serialize()
+        assert result['submit_notification_warning'] == {
+            'listed': None,
+            'unlisted': 'Test message',
+            'enterprise': None,
+        }
 
 
 class TestESAddonSerializerOutput(AddonSerializerOutputTestMixin, ESTestCase):
     serializer_class = ESAddonSerializer
 
     def tearDown(self):
-        super(TestESAddonSerializerOutput, self).tearDown()
+        super().tearDown()
         self.empty_index('default')
         self.refresh()
 
@@ -859,28 +1198,63 @@ class TestESAddonSerializerOutput(AddonSerializerOutputTestMixin, ESTestCase):
         return qs.execute()[0]
 
     def serialize(self):
-        self.serializer = self.serializer_class(context={
-            'request': self.request,
-            'view': AddonSearchView(action='list')
-        })
+        self.serializer = self.serializer_class(
+            context={
+                'request': self.request,
+                'view': AddonSearchView(action='list'),
+            }
+        )
 
         obj = self.search()
 
         with self.assertNumQueries(0):
-            result = self.serializer.to_representation(obj)
-        return result
+            return self.serializer.to_representation(obj)
+
+    def test_no_expensive_defaults(self):
+        auth_id_field = UserProfile._meta.get_field('auth_id')
+        # Ensure mocking default is working before proceeding with this test.
+        with mock.patch.object(auth_id_field, 'get_default') as default_auth_id:
+            UserProfile()
+        assert default_auth_id.call_count == 1
+
+        self.addon = addon_factory(users=[user_factory()])
+
+        fields_with_default_to_mock = ('auth_id', 'created')
+        models_with_defaults_to_mock = (
+            Addon,
+            AppVersion,
+            License,
+            Preview,
+            UserProfile,
+            Version,
+        )
+        mocks = {}
+        with ExitStack() as stack:
+            for model in models_with_defaults_to_mock:
+                for field in fields_with_default_to_mock:
+                    try:
+                        field = model._meta.get_field(field)
+                        mocks[field] = stack.enter_context(
+                            mock.patch.object(field, 'get_default')
+                        )
+                    except FieldDoesNotExist:
+                        pass
+            self.serialize()
+        assert len(mocks) == 7  # created on all models + auth_id.
+        for mocked_default in mocks.values():
+            assert mocked_default.call_count == 0
 
     def _test_author(self, author, data):
         """Override because the ES serializer doesn't include picture_url."""
         assert data == {
             'id': author.pk,
             'name': author.name,
-            'url': absolutify(author.get_url_path()),
+            'url': author.get_absolute_url(),
             'username': author.username,
         }
 
     def test_score(self):
-        self.request.version = 'v4'
+        self.request.version = 'v5'
         self.addon = addon_factory()
         result = self.serialize()
         assert result['_score'] == 1.0  # No query, we get ConstantScoring(1.0)
@@ -891,118 +1265,184 @@ class TestESAddonSerializerOutput(AddonSerializerOutputTestMixin, ESTestCase):
         result = self.serialize()
         assert '_score' not in result
 
+    def test_grouped_ratings(self):
+        # as grouped ratings aren't stored in ES, we don't support this
+        self.addon = addon_factory()
+        self.request = self.get_request('/', {'show_grouped_ratings': 1})
+        result = self.serialize()
+        assert 'grouped_counts' not in result['ratings']
+
+    def test_is_disabled(self):
+        # disabled add-ons aren't in the ES index, so won't ever be serialized
+        pass
+
+    def test_deleted(self):
+        # deleted add-ons aren't in the ES index, so won't ever be serialized
+        pass
+
+    def test_no_current_version(self):
+        # add-ons with no current version aren't in the ES index, so won't be serialized
+        pass
+
+    def test_static_theme_preview_no_current_version(self):
+        # add-ons with no current version aren't in the ES index, so won't be serialized
+        pass
+
+    @mock.patch('olympia.addons.models.Addon.attach_static_categories')
+    def test_category_not_in_constants(self, attach_static_categories_mock):
+        def side_effect(addons, addon_dict: None):
+            addons[0].all_categories = [category, old_category]
+
+        category_name = 'music'
+        category = CATEGORIES[amo.ADDON_STATICTHEME][category_name]
+        old_category = copy.copy(category)
+        object.__setattr__(old_category, 'id', 666666)
+        object.__setattr__(old_category, 'application', amo.ANDROID.id)
+        attach_static_categories_mock.side_effect = side_effect
+
+        self.addon = addon_factory(type=amo.ADDON_STATICTHEME, category=category)
+        result = self.serialize()
+        assert result['categories'] == [category_name]
+
+    def test_is_noindexed(self):
+        self.addon = addon_factory()
+        result = self.serialize()
+
+        assert 'is_noindexed' in result
+        assert result['is_noindexed'] is None
+
+        AddonListingInfo.objects.create(
+            addon=self.addon,
+            noindex_until=datetime.now() + timedelta(days=1),
+        )
+        result = self.serialize()
+        # ES result should always be None.
+        assert result['is_noindexed'] is None
+
+
+class TestMinimalFileSerializer(TestCase):
+    def test_serialize(self):
+        addon = addon_factory(
+            file_kw={
+                'hash': 'fakehash',
+                'size': 42,
+            }
+        )
+        file = addon.current_version.file
+        data = MinimalFileSerializer(file).data
+        assert data == {
+            'id': file.id,
+            'created': file.created.replace(microsecond=0).isoformat() + 'Z',
+            'hash': file.hash,
+            'size': file.size,
+            'status': amo.STATUS_CHOICES_API[file.status],
+            'url': file.get_absolute_url(),
+        }
+
 
 class TestVersionSerializerOutput(TestCase):
+    serializer_class = VersionSerializer
+
     def setUp(self):
-        super(TestVersionSerializerOutput, self).setUp()
+        super().setUp()
         self.request = APIRequestFactory().get('/')
+        self.request.version = 'v5'
 
     def serialize(self):
-        serializer = VersionSerializer(context={'request': self.request})
+        serializer = self.serializer_class(context={'request': self.request})
         return serializer.to_representation(self.version)
 
     def test_basic(self):
         now = self.days_ago(0)
         license = License.objects.create(
             name={
-                'en-US': u'My License',
-                'fr': u'Mä Licence',
+                'en-US': 'My License',
+                'fr': 'Mä Licence',
             },
             text={
-                'en-US': u'Lorem ipsum dolor sit amet, has nemore patrioqué',
+                'en-US': 'Lorem ipsum dolor sit amet, has nemore patrioqué',
             },
-            url='http://license.example.com/'
-
         )
         addon = addon_factory(
             file_kw={
+                'filename': 'webextension.xpi',
                 'hash': 'fakehash',
-                'is_webextension': True,
                 'is_mozilla_signed_extension': True,
-                'platform': amo.PLATFORM_WIN.id,
                 'size': 42,
+                'is_signed': True,
             },
             version_kw={
                 'license': license,
                 'min_app_version': '50.0',
                 'max_app_version': '*',
                 'release_notes': {
-                    'en-US': u'Release notes in english',
-                    'fr': u'Notes de version en français',
+                    'en-US': 'Release notes in english',
+                    'fr': 'Notes de version en français',
                 },
-                'reviewed': now,
-            }
+                'human_review_date': now,
+            },
         )
 
         self.version = addon.current_version
-        first_file = self.version.files.latest('pk')
-        file_factory(
-            version=self.version, platform=amo.PLATFORM_MAC.id)
-        second_file = self.version.files.latest('pk')
-        # Force reload of all_files cached property.
-        del self.version.all_files
+        current_file = self.version.file
 
         result = self.serialize()
         assert result['id'] == self.version.pk
 
-        assert result['compatibility'] == {
-            'firefox': {'max': u'*', 'min': u'50.0'}
-        }
+        assert result['compatibility'] == {'firefox': {'max': '*', 'min': '50.0'}}
 
-        assert result['files']
-        assert len(result['files']) == 2
-
-        assert result['files'][0]['id'] == first_file.pk
-        assert result['files'][0]['created'] == (
-            first_file.created.replace(microsecond=0).isoformat() + 'Z')
-        assert result['files'][0]['hash'] == first_file.hash
-        assert result['files'][0]['is_webextension'] == (
-            first_file.is_webextension)
-        assert result['files'][0]['is_mozilla_signed_extension'] == (
-            first_file.is_mozilla_signed_extension)
-        assert result['files'][0]['platform'] == 'windows'
-        assert result['files'][0]['size'] == first_file.size
-        assert result['files'][0]['status'] == 'public'
-        assert result['files'][0]['url'] == first_file.get_url_path(src='')
-
-        assert result['files'][1]['id'] == second_file.pk
-        assert result['files'][1]['created'] == (
-            second_file.created.replace(microsecond=0).isoformat() + 'Z')
-        assert result['files'][1]['hash'] == second_file.hash
-        assert result['files'][1]['is_webextension'] == (
-            second_file.is_webextension)
-        assert result['files'][1]['is_mozilla_signed_extension'] == (
-            second_file.is_mozilla_signed_extension)
-        assert result['files'][1]['platform'] == 'mac'
-        assert result['files'][1]['size'] == second_file.size
-        assert result['files'][1]['status'] == 'public'
-        assert result['files'][1]['url'] == second_file.get_url_path(src='')
+        assert result['file']['id'] == current_file.pk
+        assert result['file']['created'] == (
+            current_file.created.replace(microsecond=0).isoformat() + 'Z'
+        )
+        assert result['file']['hash'] == current_file.hash
+        assert result['file']['is_mozilla_signed_extension'] == (
+            current_file.is_mozilla_signed_extension
+        )
+        assert result['file']['size'] == current_file.size
+        assert result['file']['status'] == 'public'
+        assert result['file']['url'] == current_file.get_absolute_url()
+        assert result['file']['url'].endswith('.xpi')
 
         assert result['channel'] == 'listed'
-        assert result['edit_url'] == absolutify(addon.get_dev_url(
-            'versions.edit', args=[self.version.pk], prefix_only=True))
+        assert result['edit_url'] == absolutify(
+            addon.get_dev_url('versions.edit', args=[self.version.pk], prefix_only=True)
+        )
         assert result['release_notes'] == {
-            'en-US': u'Release notes in english',
-            'fr': u'Notes de version en français',
+            'en-US': 'Release notes in english',
+            'fr': 'Notes de version en français',
         }
         assert result['license']
         assert dict(result['license']) == {
             'id': license.pk,
             'is_custom': True,
-            'name': {'en-US': u'My License', 'fr': u'Mä Licence'},
+            'name': {'en-US': 'My License', 'fr': 'Mä Licence'},
             'text': {
-                'en-US': u'Lorem ipsum dolor sit amet, has nemore patrioqué',
+                'en-US': 'Lorem ipsum dolor sit amet, has nemore patrioqué',
             },
-            'url': 'http://license.example.com/',
+            'url': absolutify(
+                reverse('addons.license', args=[self.version.addon.slug])
+            ),
+            'slug': None,
         }
-        assert result['reviewed'] == (
-            now.replace(microsecond=0).isoformat() + 'Z')
-        assert result['url'] == absolutify(self.version.get_url_path())
+        assert result['reviewed'] == (now.replace(microsecond=0).isoformat() + 'Z')
+
+    def test_platform(self):
+        self.version = addon_factory().current_version
+        result = self.serialize()
+        file_data = result['file']
+        assert 'platform' not in file_data
+
+        # Test with shim
+        gates = {self.request.version: ('platform-shim',)}
+        with override_settings(DRF_API_GATES=gates):
+            result = self.serialize()
+        file_data = result['file']
+        assert file_data['platform'] == 'all'
 
     def test_unlisted(self):
         addon = addon_factory()
-        self.version = version_factory(
-            addon=addon, channel=amo.RELEASE_CHANNEL_UNLISTED)
+        self.version = version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
         result = self.serialize()
         assert result['channel'] == 'unlisted'
 
@@ -1018,29 +1458,30 @@ class TestVersionSerializerOutput(TestCase):
         addon = addon_factory()
         self.version = addon.current_version
         license = self.version.license
-        license.update(url=None, builtin=license.OTHER)
+        license.update(builtin=license.OTHER)
         result = self.serialize()
         assert result['id'] == self.version.pk
         assert result['license']
         assert result['license']['id'] == license.pk
         assert result['license']['is_custom'] is True
         assert result['license']['url'] == absolutify(
-            self.version.license_url())
+            reverse('addons.license', args=[self.version.addon.slug])
+        )
 
         # And make sure it's not present in v3
-        gates = {None: ('del-version-license-is-custom',)}
+        gates = {self.request.version: ('del-version-license-is-custom',)}
         with override_settings(DRF_API_GATES=gates):
             result = self.serialize()
             assert 'is_custom' not in result['license']
 
-        license.update(builtin=1)
+        license.update(builtin=12)
         result = self.serialize()
         # Builtin licenses with no url shouldn't get the version license url.
         assert result['license']['url'] is None
         assert result['license']['is_custom'] is False
 
         # Again, make sure it's not present in v3
-        gates = {None: ('del-version-license-is-custom',)}
+        gates = {self.request.version: ('del-version-license-is-custom',)}
         with override_settings(DRF_API_GATES=gates):
             result = self.serialize()
             assert 'is_custom' not in result['license']
@@ -1052,57 +1493,213 @@ class TestVersionSerializerOutput(TestCase):
         addon = addon_factory()
         self.version = addon.current_version
         license = self.version.license
-        license.update(url=None)
-        result = LicenseSerializer(
-            context={'request': self.request}).to_representation(license)
+        result = LicenseSerializer(context={'request': self.request}).to_representation(
+            license
+        )
         assert result['id'] == license.pk
         # LicenseSerializer is unable to find the Version, so it falls back to
         # None.
         assert result['url'] is None
 
+    # This test needs compiled locales to get the german and french
+    # translations of a builtin license name. GetTextTranslationSerializerField
+    # skips duplicate translations so without compiled locales the test behaves
+    # differently.
+    @pytest.mark.needs_locales_compilation
     def test_builtin_license(self):
         addon = addon_factory()
         self.version = addon.current_version
         license = self.version.license
-        license.update(builtin=18)
-        assert license._constant == LICENSES_BY_BUILTIN[18]
+        license.update(builtin=LICENSE_COPYRIGHT_AR.builtin)
+        assert license._constant == LICENSES_BY_BUILTIN[LICENSE_COPYRIGHT_AR.builtin]
+        assert license._constant == LICENSE_COPYRIGHT_AR
 
-        result = LicenseSerializer(
-            context={'request': self.request}).to_representation(license)
+        builtin_license_name_english = str(LICENSE_COPYRIGHT_AR.name)
+
+        result = LicenseSerializer(context={'request': self.request}).to_representation(
+            license
+        )
         assert result['id'] == license.pk
         assert result['is_custom'] is False
+        assert result['slug']
+        assert result['slug'] == license.slug
         # A request with no ?lang gets you the site default l10n in a dict to
         # match how non-constant values are returned.
-        assert result['name'] == {
-            'en-US': six.text_type(LICENSES_BY_BUILTIN[18].name)}
+        assert result['name'] == {'en-US': builtin_license_name_english}
+        assert result['url'] == LICENSE_COPYRIGHT_AR.url
 
-        accept_request = APIRequestFactory().get('/')
-        accept_request.LANG = 'de'
-        result = LicenseSerializer(
-            context={'request': accept_request}).to_representation(license)
-        # An Accept-Language should result in a different default though.
-        assert result['name'] == {
-            'de': six.text_type(LICENSES_BY_BUILTIN[18].name)}
+        with self.activate('de'):
+            builtin_license_name_german = str(LICENSE_COPYRIGHT_AR.name)
 
-        # But a requested lang returns a flat string
+            result = LicenseSerializer(
+                context={'request': self.request}
+            ).to_representation(license)
+            # A request with a specific language activated but still no ?lang
+            # gets you a bit more languages. Note that this is independant of
+            # which translations are in the database for the license name, it
+            # uses gettext and just a few languages that depend on the context
+            assert result['name'] == {
+                'de': builtin_license_name_german,
+                'en-US': builtin_license_name_english,
+            }
+            assert result['url'] == LICENSE_COPYRIGHT_AR.url
+
+        with self.activate('fr'):
+            builtin_license_name_french = str(LICENSE_COPYRIGHT_AR.name)
+
+        # But a requested lang returns an object with the requested translation
         lang_request = APIRequestFactory().get('/?lang=fr')
-        result = LicenseSerializer(
-            context={'request': lang_request}).to_representation(license)
-        assert result['name'] == six.text_type(LICENSES_BY_BUILTIN[18].name)
+        result = LicenseSerializer(context={'request': lang_request}).to_representation(
+            license
+        )
+        assert result['name'] == {'fr': builtin_license_name_french}
+        assert result['url'] == LICENSE_COPYRIGHT_AR.url
+
+        # Make sure the license slug is not present in v3/v4
+        gates = {self.request.version: ('del-version-license-slug',)}
+        with override_settings(DRF_API_GATES=gates):
+            result = LicenseSerializer(
+                context={'request': self.request}
+            ).to_representation(license)
+            assert 'slug' not in result
 
     def test_file_webext_permissions(self):
         self.version = addon_factory().current_version
         result = self.serialize()
         # No permissions.
-        assert result['files'][0]['permissions'] == []
+        assert result['file']['permissions'] == []
 
-        self.version = addon_factory(
-            file_kw={'is_webextension': True}).current_version
+        self.version = addon_factory().current_version
         permissions = ['dangerdanger', 'high', 'voltage']
-        WebextPermission.objects.create(
-            permissions=permissions, file=self.version.all_files[0])
+        WebextPermission.objects.create(permissions=permissions, file=self.version.file)
         result = self.serialize()
-        assert result['files'][0]['permissions'] == permissions
+        assert result['file']['permissions'] == permissions
+
+    def test_file_optional_permissions(self):
+        self.version = addon_factory().current_version
+        result = self.serialize()
+        # No permissions.
+        assert result['file']['optional_permissions'] == []
+
+        self.version = addon_factory().current_version
+        optional_permissions = ['dangerdanger', 'high', 'voltage']
+        WebextPermission.objects.create(
+            optional_permissions=optional_permissions, file=self.version.file
+        )
+        result = self.serialize()
+        assert result['file']['optional_permissions'] == optional_permissions
+
+    def test_file_host_permissions(self):
+        self.version = addon_factory().current_version
+        result = self.serialize()
+        # No permissions.
+        assert result['file']['host_permissions'] == []
+
+        self.version = addon_factory().current_version
+        host_permissions = ['*://example.com/*', '*://mozilla.com/*']
+        WebextPermission.objects.create(
+            host_permissions=host_permissions, file=self.version.file
+        )
+        result = self.serialize()
+        assert result['file']['host_permissions'] == host_permissions
+
+    def test_file_data_collection_permissions(self):
+        self.version = addon_factory().current_version
+        result = self.serialize()
+        # No permissions.
+        assert result['file']['data_collection_permissions'] == []
+        assert result['file']['optional_data_collection_permissions'] == []
+
+        self.version = addon_factory().current_version
+        data_collection_permissions = ['foo']
+        optional_data_collection_permissions = ['bar']
+        WebextPermission.objects.create(
+            data_collection_permissions=data_collection_permissions,
+            optional_data_collection_permissions=optional_data_collection_permissions,
+            file=self.version.file,
+        )
+        result = self.serialize()
+        assert (
+            result['file']['data_collection_permissions'] == data_collection_permissions
+        )
+        assert (
+            result['file']['optional_data_collection_permissions']
+            == optional_data_collection_permissions
+        )
+
+    def test_version_files_or_file(self):
+        self.version = addon_factory().current_version
+        result = self.serialize()
+        # default case, file
+        assert 'file' in result
+        assert 'files' not in result
+        default_file_result = result['file']
+
+        with override_settings(DRF_API_GATES={self.request.version: ['version-files']}):
+            result = self.serialize()
+            assert 'file' not in result
+            assert 'files' in result
+            assert result['files'] == [default_file_result]
+
+
+class TestDeveloperVersionSerializerOutput(TestVersionSerializerOutput):
+    serializer_class = DeveloperVersionSerializer
+
+    def test_readonly_fields(self):
+        serializer = self.serializer_class()
+        fields_read_only = {
+            name for name, field in serializer.get_fields().items() if field.read_only
+        }
+        assert fields_read_only == set(serializer.Meta.read_only_fields)
+
+    def test_source(self):
+        self.version = addon_factory().current_version
+        result = self.serialize()
+        assert result['source'] is None
+
+        self.version.update(source='whatever.zip')
+        result = self.serialize()
+        assert result['source'] == absolutify(
+            reverse('downloads.source', args=(self.version.id,))
+        )
+
+    def test_approval_notes(self):
+        self.version = addon_factory().current_version
+        result = self.serialize()
+        assert result['approval_notes'] == ''
+
+        self.version.update(approval_notes='Plz approve!')
+        result = self.serialize()
+        assert result['approval_notes'] == 'Plz approve!'
+
+    def test_is_disabled(self):
+        self.version = addon_factory().current_version
+        result = self.serialize()
+        assert result['is_disabled'] is False
+
+        self.version.is_user_disabled = True
+        result = self.serialize()
+        assert result['is_disabled'] is True
+
+
+class TestListVersionSerializerOutput(TestCase):
+    serializer_class = ListVersionSerializer
+
+    def setUp(self):
+        self.request = APIRequestFactory().get('/')
+
+    def serialize(self):
+        serializer = self.serializer_class(context={'request': self.request})
+        return serializer.to_representation(self.version)
+
+    def test_basic(self):
+        self.version = addon_factory().current_version
+        result = self.serialize()
+        assert 'text' not in result['license']
+
+
+class TestDeveloperListVersionSerializerOutput(TestListVersionSerializerOutput):
+    serializer_class = DeveloperListVersionSerializer
 
 
 class TestSimpleVersionSerializerOutput(TestCase):
@@ -1117,19 +1714,17 @@ class TestSimpleVersionSerializerOutput(TestCase):
         now = self.days_ago(0)
         license = License.objects.create(
             name={
-                'en-US': u'My License',
-                'fr': u'Mä Licence',
+                'en-US': 'My License',
+                'fr': 'Mä Licence',
             },
             text={
-                'en-US': u'Lorem ipsum dolor sit amet, has nemore patrioqué',
+                'en-US': 'Lorem ipsum dolor sit amet, has nemore patrioqué',
             },
-            url='http://license.example.com/'
-
         )
         addon = addon_factory(
             version_kw={
                 'license': license,
-                'reviewed': now,
+                'human_review_date': now,
             }
         )
 
@@ -1140,8 +1735,10 @@ class TestSimpleVersionSerializerOutput(TestCase):
         assert result['license'] is not None
         assert result['license']['id'] == license.pk
         assert result['license']['name']['en-US'] == 'My License'
-        assert result['license']['name']['fr'] == u'Mä Licence'
-        assert result['license']['url'] == 'http://license.example.com/'
+        assert result['license']['name']['fr'] == 'Mä Licence'
+        assert result['license']['url'] == absolutify(
+            reverse('addons.license', args=[self.version.addon.slug])
+        )
         assert 'text' not in result['license']
 
 
@@ -1154,8 +1751,7 @@ class TestLanguageToolsSerializerOutput(TestCase):
         return serializer.to_representation(self.addon)
 
     def test_basic(self):
-        self.addon = addon_factory(
-            type=amo.ADDON_LPAPP, target_locale='fr')
+        self.addon = addon_factory(type=amo.ADDON_LPAPP, target_locale='fr')
         result = self.serialize()
         assert result['id'] == self.addon.pk
         assert result['default_locale'] == self.addon.default_locale
@@ -1164,15 +1760,13 @@ class TestLanguageToolsSerializerOutput(TestCase):
         assert result['slug'] == self.addon.slug
         assert result['target_locale'] == self.addon.target_locale
         assert result['type'] == 'language'
-        assert result['url'] == absolutify(self.addon.get_url_path())
+        assert result['url'] == self.addon.get_absolute_url()
         assert 'current_compatible_version' not in result
         assert 'locale_disambiguation' not in result
 
-    @override_settings(
-        DRF_API_GATES={None: ('addons-locale_disambiguation-shim',)})
+    @override_settings(DRF_API_GATES={None: ('addons-locale_disambiguation-shim',)})
     def test_locale_disambiguation_in_v3(self):
-        self.addon = addon_factory(
-            type=amo.ADDON_LPAPP, target_locale='fr')
+        self.addon = addon_factory(type=amo.ADDON_LPAPP, target_locale='fr')
         result = self.serialize()
         assert result['locale_disambiguation'] is None
 
@@ -1183,12 +1777,7 @@ class TestLanguageToolsSerializerOutput(TestCase):
         assert 'current_compatible_version' not in result
 
     def test_current_compatible_version(self):
-        # Set a filename to make sure the file actually exists.
-        # file_factory (used via addon_factory) copies files that exists
-        # as fixtures in src/olympia/files/fixtures/files to their rightful
-        # place. We need that to test the localepicker properly.
-        file_kw = {'filename': 'langpack-localepicker.xpi'}
-        self.addon = addon_factory(type=amo.ADDON_LPAPP, file_kw=file_kw)
+        self.addon = addon_factory(type=amo.ADDON_LPAPP)
 
         # compatible_versions is set by the view through prefetch, it
         # looks like a list.
@@ -1196,19 +1785,30 @@ class TestLanguageToolsSerializerOutput(TestCase):
         self.addon.compatible_versions[0].update(created=self.days_ago(1))
         # Create a new current version, just to prove that
         # current_compatible_version does not use that.
-        version_factory(addon=self.addon, file_kw=file_kw)
-        self.addon.reload
-        assert (
-            self.addon.compatible_versions[0] !=
-            self.addon.current_version)
+        version_factory(addon=self.addon)
+        self.addon.reload()
+        assert self.addon.compatible_versions[0] != self.addon.current_version
         self.request = APIRequestFactory().get('/?app=firefox&appversion=57.0')
         result = self.serialize()
         assert 'current_compatible_version' in result
         assert result['current_compatible_version'] is not None
-        assert (
-            set(result['current_compatible_version'].keys()) ==
-            {'id', 'files', 'reviewed', 'version'}
-        )
+        assert set(result['current_compatible_version'].keys()) == {
+            'id',
+            'file',
+            'reviewed',
+            'version',
+        }
+        version_file = result['current_compatible_version']['file']
+
+        with override_settings(DRF_API_GATES={None: ('version-files',)}):
+            result = self.serialize()
+            assert set(result['current_compatible_version'].keys()) == {
+                'id',
+                'files',
+                'reviewed',
+                'version',
+            }
+            assert result['current_compatible_version']['files'] == [version_file]
 
         self.addon.compatible_versions = None
         result = self.serialize()
@@ -1223,11 +1823,11 @@ class TestLanguageToolsSerializerOutput(TestCase):
 
 class TestESAddonAutoCompleteSerializer(ESTestCase):
     def setUp(self):
-        super(TestESAddonAutoCompleteSerializer, self).setUp()
+        super().setUp()
         self.request = APIRequestFactory().get('/')
 
     def tearDown(self):
-        super(TestESAddonAutoCompleteSerializer, self).tearDown()
+        super().tearDown()
         self.empty_index('default')
         self.refresh()
 
@@ -1241,7 +1841,8 @@ class TestESAddonAutoCompleteSerializer(ESTestCase):
 
     def serialize(self):
         self.serializer = ESAddonAutoCompleteSerializer(
-            context={'request': self.request})
+            context={'request': self.request}
+        )
 
         obj = self.search()
 
@@ -1253,20 +1854,31 @@ class TestESAddonAutoCompleteSerializer(ESTestCase):
         self.addon = addon_factory()
 
         result = self.serialize()
-        assert (
-            set(result.keys()) ==
-            {'id', 'name', 'icon_url', 'type', 'url'}
-        )
+        assert set(result.keys()) == {
+            'id',
+            'name',
+            'icon_url',
+            'icons',
+            'type',
+            'url',
+            'promoted',
+        }
         assert result['id'] == self.addon.pk
-        assert result['name'] == {'en-US': six.text_type(self.addon.name)}
+        assert result['name'] == {'en-US': str(self.addon.name)}
         assert result['icon_url'] == absolutify(self.addon.get_icon_url(64))
+        assert result['icons'] == {
+            '32': absolutify(self.addon.get_icon_url(32)),
+            '64': absolutify(self.addon.get_icon_url(64)),
+            '128': absolutify(self.addon.get_icon_url(128)),
+        }
         assert result['type'] == 'extension'
-        assert result['url'] == absolutify(self.addon.get_url_path())
+        assert result['url'] == self.addon.get_absolute_url()
+        assert result['promoted'] == self.addon.publicly_promoted_groups == []
 
     def test_translations(self):
         translated_name = {
-            'en-US': u'My Addôn name in english',
-            'fr': u'Nom de mon Addôn',
+            'en-US': 'My Addôn name in english',
+            'fr': 'Nom de mon Addôn',
         }
         self.addon = addon_factory()
         self.addon.name = translated_name
@@ -1290,54 +1902,13 @@ class TestESAddonAutoCompleteSerializer(ESTestCase):
                 result = self.serialize()
         assert result['name'] == translated_name['fr']
 
-    def test_icon_url_with_persona_id(self):
-        self.addon = addon_factory(type=amo.ADDON_PERSONA)
-        persona = self.addon.persona
-        persona.persona_id = 42
-        persona.header = u'myheader.jpg'
-        persona.footer = u'myfooter.jpg'
-        persona.accentcolor = u'336699'
-        persona.textcolor = u'f0f0f0'
-        persona.author = u'Me-me-me-Myself'
-        persona.display_username = u'my-username'
-        persona.save()
-        assert not persona.is_new()
 
-        result = self.serialize()
-        assert (
-            set(result.keys()) ==
-            {'id', 'name', 'icon_url', 'type', 'url'}
-        )
-        assert result['type'] == 'persona'
-        assert result['icon_url'] == absolutify(self.addon.get_icon_url(64))
+class TestUserSerializerWithPictureUrl(TestCase, BaseTestUserMixin):
+    serializer_class = UserSerializerWithPictureUrl
 
-    def test_icon_url_persona_with_no_persona_id(self):
-        self.addon = addon_factory(
-            name=u'My Personâ',
-            description=u'<script>alert(42)</script>My Personä description',
-            type=amo.ADDON_PERSONA)
-        persona = self.addon.persona
-        persona.persona_id = 0  # For "new" style Personas this is always 0.
-        persona.header = u'myheader.png'
-        persona.footer = u'myfooter.png'
-        persona.accentcolor = u'336699'
-        persona.textcolor = u'f0f0f0'
-        persona.author = u'Me-me-me-Myself'
-        persona.display_username = u'my-username'
-        persona.save()
-        assert persona.is_new()
-
-        result = self.serialize()
-        assert (
-            set(result.keys()) ==
-            {'id', 'name', 'icon_url', 'type', 'url'}
-        )
-        assert result['type'] == 'persona'
-        assert result['icon_url'] == absolutify(self.addon.get_icon_url(64))
-
-
-class TestAddonDeveloperSerializer(TestBaseUserSerializer):
-    serializer_class = AddonDeveloperSerializer
+    def setUp(self):
+        self.request = APIRequestFactory().get('/')
+        self.user = user_factory()
 
     def test_picture(self):
         serialized = self.serialize()
@@ -1350,238 +1921,118 @@ class TestAddonDeveloperSerializer(TestBaseUserSerializer):
 
 
 class TestReplacementAddonSerializer(TestCase):
-
     def serialize(self, replacement):
         serializer = ReplacementAddonSerializer()
         return serializer.to_representation(replacement)
 
     def test_valid_addon_path(self):
-        addon = addon_factory(slug=u'stuff', guid=u'newstuff@mozilla')
+        addon = addon_factory(slug='stuff', guid='newstuff@mozilla')
 
         rep = ReplacementAddon.objects.create(
-            guid='legacy@mozilla', path=u'/addon/stuff/')
+            guid='legacy@mozilla', path='/addon/stuff/'
+        )
         result = self.serialize(rep)
-        assert result['guid'] == u'legacy@mozilla'
-        assert result['replacement'] == [u'newstuff@mozilla']
+        assert result['guid'] == 'legacy@mozilla'
+        assert result['replacement'] == ['newstuff@mozilla']
 
         # Edge case, but should accept numeric IDs too
-        rep.update(path=u'/addon/%s/' % addon.id)
+        rep.update(path='/addon/%s/' % addon.id)
         result = self.serialize(rep)
-        assert result['guid'] == u'legacy@mozilla'
-        assert result['replacement'] == [u'newstuff@mozilla']
+        assert result['guid'] == 'legacy@mozilla'
+        assert result['replacement'] == ['newstuff@mozilla']
 
     def test_invalid_addons(self):
-        """Broken paths, invalid add-ons, etc, should fail gracefully to None.
-        """
+        """Broken paths, invalid add-ons, etc, should fail gracefully to None."""
         rep = ReplacementAddon.objects.create(
-            guid='legacy@mozilla', path=u'/addon/stuff/')
+            guid='legacy@mozilla', path='/addon/stuff/'
+        )
         result = self.serialize(rep)
-        assert result['guid'] == u'legacy@mozilla'
+        assert result['guid'] == 'legacy@mozilla'
         # Addon path doesn't exist.
         assert result['replacement'] == []
 
         # Add the add-on but make it not public
-        addon = addon_factory(slug=u'stuff', guid=u'newstuff@mozilla',
-                              status=amo.STATUS_NULL)
+        addon = addon_factory(
+            slug='stuff', guid='newstuff@mozilla', status=amo.STATUS_NULL
+        )
         result = self.serialize(rep)
-        assert result['guid'] == u'legacy@mozilla'
+        assert result['guid'] == 'legacy@mozilla'
         assert result['replacement'] == []
 
         # Double check that the test is good and it will work once public.
-        addon.update(status=amo.STATUS_PUBLIC)
+        addon.versions.get().file.update(status=amo.STATUS_APPROVED)
         result = self.serialize(rep)
-        assert result['replacement'] == [u'newstuff@mozilla']
+        assert result['replacement'] == ['newstuff@mozilla']
 
         # But urls aren't resolved - and don't break everything
-        rep.update(path=absolutify(addon.get_url_path()))
+        rep.update(path=addon.get_absolute_url())
         result = self.serialize(rep)
-        assert result['guid'] == u'legacy@mozilla'
+        assert result['guid'] == 'legacy@mozilla'
         assert result['replacement'] == []
 
     def test_valid_collection_path(self):
-        addon = addon_factory(slug=u'stuff', guid=u'newstuff@mozilla')
-        me = user_factory(username=u'me')
-        collection = collection_factory(slug=u'bag', author=me)
+        addon = addon_factory(slug='stuff', guid='newstuff@mozilla')
+        me = user_factory(username='me')
+        collection = collection_factory(slug='bag', author=me)
         collection.add_addon(addon)
 
         rep = ReplacementAddon.objects.create(
-            guid=u'legacy@mozilla', path=u'/collections/me/bag/')
+            guid='legacy@mozilla', path='/collections/me/bag/'
+        )
         result = self.serialize(rep)
-        assert result['guid'] == u'legacy@mozilla'
-        assert result['replacement'] == [u'newstuff@mozilla']
+        assert result['guid'] == 'legacy@mozilla'
+        assert result['replacement'] == ['newstuff@mozilla']
 
         # Edge case, but should accept numeric user IDs too
-        rep.update(path=u'/collections/%s/bag/' % me.id)
+        rep.update(path='/collections/%s/bag/' % me.id)
         result = self.serialize(rep)
-        assert result['guid'] == u'legacy@mozilla'
-        assert result['replacement'] == [u'newstuff@mozilla']
+        assert result['guid'] == 'legacy@mozilla'
+        assert result['replacement'] == ['newstuff@mozilla']
 
     def test_invalid_collections(self):
         """Broken paths, invalid users or collections, should fail gracefully
         to None."""
         rep = ReplacementAddon.objects.create(
-            guid=u'legacy@mozilla', path=u'/collections/me/bag/')
+            guid='legacy@mozilla', path='/collections/me/bag/'
+        )
         result = self.serialize(rep)
-        assert result['guid'] == u'legacy@mozilla'
+        assert result['guid'] == 'legacy@mozilla'
         assert result['replacement'] == []
 
         # Create the user but not the collection.
-        me = user_factory(username=u'me')
+        me = user_factory(username='me')
         result = self.serialize(rep)
-        assert result['guid'] == u'legacy@mozilla'
+        assert result['guid'] == 'legacy@mozilla'
         assert result['replacement'] == []
 
         # Create the collection but make the add-on invalid.
-        addon = addon_factory(slug=u'stuff', guid=u'newstuff@mozilla',
-                              status=amo.STATUS_NULL)
-        collection = collection_factory(slug=u'bag', author=me)
+        addon = addon_factory(
+            slug='stuff', guid='newstuff@mozilla', status=amo.STATUS_NULL
+        )
+        collection = collection_factory(slug='bag', author=me)
         collection.add_addon(addon)
         result = self.serialize(rep)
-        assert result['guid'] == u'legacy@mozilla'
+        assert result['guid'] == 'legacy@mozilla'
         assert result['replacement'] == []
 
         # Double check that the test is good and it will work once public.
-        addon.update(status=amo.STATUS_PUBLIC)
+        addon.versions.get().file.update(status=amo.STATUS_APPROVED)
         result = self.serialize(rep)
-        assert result['replacement'] == [u'newstuff@mozilla']
+        assert result['replacement'] == ['newstuff@mozilla']
 
 
-class TestCompatOverrideSerializer(TestCase):
+class TestAddonAuthorSerializer(TestCase):
+    def test_basic(self):
+        user = user_factory(read_dev_agreement=self.days_ago(0))
+        addon = addon_factory(users=(user,))
+        addonuser = addon.addonuser_set.get()
 
-    def serialize(self, override):
-        serializer = CompatOverrideSerializer()
-        return serializer.to_representation(override)
-
-    def test_linked_addon(self):
-        addon = addon_factory(guid='extrabad@thing')
-        override = CompatOverride.objects.create(
-            name='override with addon', guid=addon.guid, addon=addon)
-        CompatOverrideRange.objects.create(
-            compat=override, app=amo.FIREFOX.id)
-        result = self.serialize(override)
-
-        assert ['addon_guid', 'addon_id', 'name', 'version_ranges'] == sorted(
-            result.keys())
-        assert result['addon_guid'] == 'extrabad@thing'
-        assert result['addon_id'] == addon.id
-        assert result['name'] == 'override with addon'
-        version_range = {
-            'addon_min_version': '0',
-            'addon_max_version': '*',
-            'applications': [{
-                'name': amo.FIREFOX.pretty,
-                'id': amo.FIREFOX.id,
-                'min_version': '0',
-                'max_version': '*',
-                'guid': amo.FIREFOX.guid
-            }]
+        data = AddonAuthorSerializer().to_representation(instance=addonuser)
+        assert data == {
+            'user_id': user.id,
+            'role': 'owner',
+            'position': 0,
+            'listed': True,
+            'name': user.name,
+            'email': user.email,
         }
-        assert result['version_ranges'] == [version_range]
-
-    def test_no_addon(self):
-        override = CompatOverride.objects.create(
-            name='override', guid='foo@baa')
-        CompatOverrideRange.objects.create(
-            compat=override, app=amo.FIREFOX.id)
-        result = self.serialize(override)
-
-        assert ['addon_guid', 'addon_id', 'name', 'version_ranges'] == sorted(
-            result.keys())
-        assert result['addon_guid'] == 'foo@baa'
-        assert result['addon_id'] is None
-        assert result['name'] == 'override'
-        version_range = {
-            'addon_min_version': '0',
-            'addon_max_version': '*',
-            'applications': [{
-                'name': amo.FIREFOX.pretty,
-                'id': amo.FIREFOX.id,
-                'min_version': '0',
-                'max_version': '*',
-                'guid': amo.FIREFOX.guid
-            }]
-        }
-        assert result['version_ranges'] == [version_range]
-
-    def test_multiple_ranges(self):
-        override = CompatOverride.objects.create(
-            name='override with multiple ranges', guid='foo@baa')
-        CompatOverrideRange.objects.create(
-            compat=override, app=amo.FIREFOX.id, min_version='23.4',
-            max_version='56.7.*')
-        CompatOverrideRange.objects.create(
-            compat=override, app=amo.ANDROID.id, min_app_version='1.35',
-            max_app_version='90.*')
-        result = self.serialize(override)
-
-        assert ['addon_guid', 'addon_id', 'name', 'version_ranges'] == sorted(
-            result.keys())
-        assert result['addon_guid'] == 'foo@baa'
-        assert result['addon_id'] is None
-        assert result['name'] == 'override with multiple ranges'
-        assert len(result['version_ranges']) == 2
-        version_range_firefox = {
-            'addon_min_version': '23.4',
-            'addon_max_version': '56.7.*',
-            'applications': [{
-                'name': amo.FIREFOX.pretty,
-                'id': amo.FIREFOX.id,
-                'min_version': '0',
-                'max_version': '*',
-                'guid': amo.FIREFOX.guid
-            }]
-        }
-        assert version_range_firefox in result['version_ranges']
-        version_range_android = {
-            'addon_min_version': '0',
-            'addon_max_version': '*',
-            'applications': [{
-                'name': amo.ANDROID.pretty,
-                'id': amo.ANDROID.id,
-                'min_version': '1.35',
-                'max_version': '90.*',
-                'guid': amo.ANDROID.guid
-            }]
-        }
-        assert version_range_android in result['version_ranges']
-
-    def test_collapsed_ranges(self):
-        """Collapsed ranges are where there is a single version range of
-        affected addons, but multiple applications affected."""
-        override = CompatOverride.objects.create(
-            name='override with single version range', guid='foo@baa')
-        CompatOverrideRange.objects.create(
-            compat=override, app=amo.FIREFOX.id,
-            min_version='23.4', max_version='56.7.*')
-        CompatOverrideRange.objects.create(
-            compat=override, app=amo.ANDROID.id,
-            min_version='23.4', max_version='56.7.*',
-            min_app_version='1.35', max_app_version='90.*')
-        result = self.serialize(override)
-
-        assert ['addon_guid', 'addon_id', 'name', 'version_ranges'] == sorted(
-            result.keys())
-        assert result['addon_guid'] == 'foo@baa'
-        assert result['addon_id'] is None
-        assert result['name'] == 'override with single version range'
-        assert len(result['version_ranges']) == 1
-        assert result['version_ranges'][0]['addon_min_version'] == '23.4'
-        assert result['version_ranges'][0]['addon_max_version'] == '56.7.*'
-        applications = result['version_ranges'][0]['applications']
-        assert len(applications) == 2
-        application_firefox = {
-            'name': amo.FIREFOX.pretty,
-            'id': amo.FIREFOX.id,
-            'min_version': '0',
-            'max_version': '*',
-            'guid': amo.FIREFOX.guid
-        }
-        assert application_firefox in applications
-        application_android = {
-            'name': amo.ANDROID.pretty,
-            'id': amo.ANDROID.id,
-            'min_version': '1.35',
-            'max_version': '90.*',
-            'guid': amo.ANDROID.guid
-        }
-        assert application_android in applications

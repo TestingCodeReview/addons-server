@@ -1,39 +1,33 @@
-# -*- coding: utf-8 -*-
-
-import collections
 import mimetypes
 import os
-import random
+import uuid
 
 from django.conf import settings
-from django.utils.translation import activate
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import IntegrityError
 from django.test.client import RequestFactory
-from fxa.constants import ENVIRONMENT_URLS
-from fxa.core import Client
-from fxa.tests.utils import TestEmailAccount
+from django.utils.translation import activate
+
 from rest_framework import serializers
 
 import olympia.core.logger
-
-from olympia.amo.tests import user_factory, addon_factory, copy_file_to_temp
 from olympia import amo
-from olympia.addons.forms import icons
-from olympia.addons.models import AddonUser, Preview, Addon
+from olympia.access.models import Group, GroupUser
+from olympia.addons.models import Addon, AddonUser, Preview
 from olympia.addons.utils import generate_addon_guid
-from olympia.constants.applications import APPS, FIREFOX
-from olympia.constants.base import (
-    ADDON_EXTENSION,
-    ADDON_PERSONA,
-    STATUS_PUBLIC
-)
+from olympia.amo.tests import addon_factory, copy_file_to_temp, user_factory
+from olympia.constants.applications import FIREFOX
+from olympia.constants.base import ADDON_EXTENSION, ADDON_STATICTHEME
+from olympia.constants.promoted import RECOMMENDED_API_NAME
+from olympia.devhub.utils import create_version_for_upload
+from olympia.hero.models import PrimaryHero, SecondaryHero
 from olympia.landfill.collection import generate_collection
-from olympia.landfill.generators import generate_themes
-from olympia.landfill.user import generate_user
-from olympia.files.tests.test_file_viewer import get_file
+from olympia.promoted.models import PromotedAddon, PromotedGroup
 from olympia.ratings.models import Rating
 from olympia.users.models import UserProfile
-from olympia.devhub.tasks import create_version_for_upload
+
+from .version import generate_version
+
 
 log = olympia.core.logger.getLogger('z.users')
 
@@ -42,28 +36,26 @@ class GenerateAddonsSerializer(serializers.Serializer):
     count = serializers.IntegerField(default=10)
 
     def __init__(self):
-        self.fxa_email = os.environ['FXA_EMAIL']
-        self.fxa_password = os.environ['FXA_PASSWORD']
-        self.fxa_id = self._create_fxa_user()
+        self.fxa_id = None
+        self.fxa_email = 'uitest-%s@restmail.net' % uuid.uuid4()
         self.user = self._create_addon_user()
-
-    def _create_fxa_user(self):
-        """Create fxa user for logging in."""
-        fxa_client = Client(ENVIRONMENT_URLS['stable']['authentication'])
-        account = TestEmailAccount(email=self.fxa_email)
-        password = self.fxa_password
-        FxAccount = collections.namedtuple('FxAccount', 'email password')
-        fxa_account = FxAccount(email=account.email, password=password)
-        session = fxa_client.create_account(fxa_account.email,
-                                            fxa_account.password)
-        account.fetch()
-        message = account.wait_for_email(
-            lambda m: 'x-verify-code' in m['headers'] and
-            session.uid == m['headers']['x-uid']
+        self.recommended, _ = PromotedGroup.objects.get_or_create(
+            api_name=RECOMMENDED_API_NAME,
+            defaults={
+                'name': 'Recommended',
+                'search_ranking_bump': 5.0,
+                'listed_pre_review': True,
+                'badged': True,
+                'autograph_signing_states': {
+                    'firefox': 'recommended',
+                    'android': 'recommended-android',
+                },
+                'can_primary_hero': True,
+                'can_be_compatible_with_all_fenix_versions': True,
+                'high_profile': True,
+                'high_profile_rating': True,
+            },
         )
-        session.verify_email_code(message['headers']['x-verify-code'])
-        log.debug('fxa account created: {}'.format(fxa_account))
-        return session.uid
 
     def _create_addon_user(self):
         """Create addon user with fxa information assigned."""
@@ -72,11 +64,14 @@ class GenerateAddonsSerializer(serializers.Serializer):
                 username='uitest',
                 email=self.fxa_email,
                 fxa_id=self.fxa_id,
-                display_name='uitest'
+                display_name='uitest',
+                last_login_ip='127.0.0.1',
             )
-        except Exception as e:
-            log.debug('There was a problem creating the user: {}.'
-                      ' Returning user from database'.format(e))
+        except IntegrityError as e:
+            log.info(
+                f'There was a problem creating the user: {e}.'
+                ' Returning user from database'
+            )
             return UserProfile.objects.get(username='uitest')
 
     def create_generic_featured_addons(self):
@@ -86,9 +81,34 @@ class GenerateAddonsSerializer(serializers.Serializer):
         generated.
 
         """
+        for _ in range(5):
+            addon = addon_factory(
+                status=amo.STATUS_APPROVED,
+                promoted_kwargs={'api_name': self.recommended.api_name},
+            )
+            AddonUser.objects.create(user=user_factory(), addon=addon)
+            promoted_group = PromotedGroup.objects.all_for(addon=addon).first()
+            PromotedAddon.objects.update_or_create(
+                addon=addon,
+                promoted_group=promoted_group,
+                application_id=amo.FIREFOX.id,
+            )
+            PrimaryHero.objects.create(addon=addon, enabled=True)
+            SecondaryHero.objects.create(
+                enabled=True,
+                headline='This is a headline',
+                description='Hero Description',
+            )
+
+    def create_generic_featured_themes(self):
         for _ in range(10):
-            AddonUser.objects.create(
-                user=user_factory(), addon=addon_factory())
+            addon = addon_factory(
+                status=amo.STATUS_APPROVED,
+                type=ADDON_STATICTHEME,
+                promoted_kwargs={'api_name': self.recommended.api_name},
+            )
+            generate_version(addon=addon)
+            addon.update_version()
 
     def create_named_addon_with_author(self, name, author=None):
         """Create a generic addon and a user.
@@ -100,23 +120,29 @@ class GenerateAddonsSerializer(serializers.Serializer):
         if author is None:
             author = user_factory()
         try:
-            generate_user(author)
-        except Exception:  # django.db.utils.IntegrityError
+            user = UserProfile.objects.create(
+                username=author, email=f'{author}@email.com'
+            )
+            user.update(id=settings.TASK_USER_ID)
+        except IntegrityError:
             # If the user is already made, use that same user,
             # if not use created user
             addon = addon_factory(
-                status=STATUS_PUBLIC,
+                status=amo.STATUS_APPROVED,
                 users=[UserProfile.objects.get(username=author)],
-                name=u'{}'.format(name),
-                slug=u'{}'.format(name),
+                name=f'{name}',
+                slug=f'{name}',
+                promoted_kwargs={'api_name': self.recommended.api_name},
             )
             addon.save()
         else:
+            author.update(id=settings.TASK_USER_ID)
             addon = addon_factory(
-                status=STATUS_PUBLIC,
+                status=amo.STATUS_APPROVED,
                 users=[UserProfile.objects.get(username=author.username)],
-                name=u'{}'.format(name),
-                slug=u'{}'.format(name),
+                name=f'{name}',
+                slug=f'{name}',
+                promoted_kwargs={'api_name': self.recommended.api_name},
             )
             addon.save()
         return addon
@@ -131,30 +157,22 @@ class GenerateAddonsSerializer(serializers.Serializer):
         'ui-tester2'. It has a version number.
 
         """
-        default_icons = [x[0] for x in icons() if x[0].startswith('icon/')]
         addon = addon_factory(
-            status=STATUS_PUBLIC,
+            status=amo.STATUS_APPROVED,
             type=ADDON_EXTENSION,
             average_daily_users=5000,
             users=[self.user],
             average_rating=5,
-            description=u'My Addon description',
-            file_kw={
-                'hash': 'fakehash',
-                'platform': amo.PLATFORM_ALL.id,
-                'size': 42,
-            },
+            description='My Addon description',
             guid=generate_addon_guid(),
-            icon_type=random.choice(default_icons),
-            name=u'Ui-Addon',
-            public_stats=True,
+            name='Ui-Addon',
             slug='ui-test-2',
-            summary=u'My Addon summary',
-            tags=['some_tag', 'another_tag', 'ui-testing',
-                  'selenium', 'python'],
+            summary='My Addon summary',
+            tags=['some_tag', 'another_tag', 'ui-testing', 'selenium', 'python'],
             total_ratings=500,
             weekly_downloads=9999999,
             developer_comments='This is a testing addon.',
+            promoted_kwargs={'api_name': self.recommended.api_name},
         )
         Preview.objects.create(addon=addon, position=1)
         Rating.objects.create(addon=addon, rating=5, user=user_factory())
@@ -165,13 +183,12 @@ class GenerateAddonsSerializer(serializers.Serializer):
         Rating.objects.create(addon=addon, rating=5, user=user_factory())
         Rating.objects.create(addon=addon, rating=5, user=user_factory())
         Rating.objects.create(addon=addon, rating=5, user=user_factory())
-        AddonUser.objects.create(user=user_factory(username='ui-tester2'),
-                                 addon=addon, listed=True)
+        AddonUser.objects.create(
+            user=user_factory(username='ui-tester2'), addon=addon, listed=True
+        )
         addon.save()
         generate_collection(addon, app=FIREFOX)
-        print(
-            'Created addon {0} for testing successfully'
-            .format(addon.name))
+        print(f'Created addon {addon.name} for testing successfully')
 
     def create_featured_android_addon(self):
         """Creates a custom addon named 'Ui-Addon-Android'.
@@ -184,41 +201,39 @@ class GenerateAddonsSerializer(serializers.Serializer):
         It is an Android addon.
 
         """
-        default_icons = [x[0] for x in icons() if x[0].startswith('icon/')]
         addon = addon_factory(
-            status=STATUS_PUBLIC,
+            status=amo.STATUS_APPROVED,
             type=ADDON_EXTENSION,
             average_daily_users=5656,
             users=[self.user],
             average_rating=5,
-            description=u'My Addon description about ANDROID',
-            file_kw={
-                'hash': 'fakehash',
-                'platform': amo.PLATFORM_ANDROID.id,
-                'size': 42,
-            },
+            description='My Addon description about ANDROID',
             guid=generate_addon_guid(),
-            icon_type=random.choice(default_icons),
-            name=u'Ui-Addon-Android',
-            public_stats=True,
+            name='Ui-Addon-Android',
             slug='ui-test-addon-android',
-            summary=u'My Addon summary for Android',
-            tags=['some_tag', 'another_tag', 'ui-testing',
-                  'selenium', 'python', 'android'],
+            summary='My Addon summary for Android',
+            tags=[
+                'some_tag',
+                'another_tag',
+                'ui-testing',
+                'selenium',
+                'python',
+                'android',
+            ],
             total_ratings=500,
             weekly_downloads=9999999,
             developer_comments='This is a testing addon for Android.',
+            promoted_kwargs={'api_name': self.recommended.api_name},
         )
         Preview.objects.create(addon=addon, position=1)
         Rating.objects.create(addon=addon, rating=5, user=user_factory())
         Rating.objects.create(addon=addon, rating=5, user=user_factory())
-        AddonUser.objects.create(user=user_factory(username='ui-tester2'),
-                                 addon=addon, listed=True)
+        AddonUser.objects.create(
+            user=user_factory(username='ui-tester2'), addon=addon, listed=True
+        )
         addon.save()
         generate_collection(addon, app=FIREFOX)
-        print(
-            'Created addon {0} for testing successfully'
-            .format(addon.name))
+        print(f'Created addon {addon.name} for testing successfully')
 
     def create_featured_addon_with_version_for_install(self):
         """Creates a custom addon named 'Ui-Addon'.
@@ -230,7 +245,6 @@ class GenerateAddonsSerializer(serializers.Serializer):
         'ui-tester2'. It has a version number.
 
         """
-        default_icons = [x[0] for x in icons() if x[0].startswith('icon/')]
         try:
             addon = Addon.objects.get(guid='@webextension-guid')
         except Addon.DoesNotExist:
@@ -239,23 +253,19 @@ class GenerateAddonsSerializer(serializers.Serializer):
                 average_daily_users=5000,
                 users=[self.user],
                 average_rating=5,
-                description=u'My Addon description',
+                description='My Addon description',
                 guid='@webextension-guid',
-                icon_type=random.choice(default_icons),
-                name=u'Ui-Addon-Install',
-                public_stats=True,
+                name='Ui-Addon-Install',
                 slug='ui-test-install',
-                summary=u'My Addon summary',
-                tags=['some_tag', 'another_tag', 'ui-testing',
-                      'selenium', 'python'],
+                summary='My Addon summary',
+                tags=['some_tag', 'another_tag', 'ui-testing', 'selenium', 'python'],
                 weekly_downloads=9999999,
                 developer_comments='This is a testing addon.',
+                promoted_kwargs={'api_name': self.recommended.api_name},
             )
             addon.save()
             generate_collection(addon, app=FIREFOX)
-            print(
-                'Created addon {0} for testing successfully'
-                .format(addon.name))
+            print(f'Created addon {addon.name} for testing successfully')
         return addon
 
     def create_featured_theme(self):
@@ -267,48 +277,28 @@ class GenerateAddonsSerializer(serializers.Serializer):
 
         """
         addon = addon_factory(
-            status=STATUS_PUBLIC,
-            type=ADDON_PERSONA,
+            status=amo.STATUS_APPROVED,
+            type=ADDON_STATICTHEME,
             average_daily_users=4242,
             users=[self.user],
             average_rating=5,
-            description=u'My UI Theme description',
-            file_kw={
-                'hash': 'fakehash',
-                'platform': amo.PLATFORM_ALL.id,
-                'size': 42,
-            },
+            description='My UI Theme description',
             guid=generate_addon_guid(),
-            homepage=u'https://www.example.org/',
-            name=u'Ui-Test Theme',
-            public_stats=True,
+            homepage='https://www.example.org/',
+            name='Ui-Test Theme',
             slug='ui-test',
-            summary=u'My UI theme summary',
-            support_email=u'support@example.org',
-            support_url=u'https://support.example.org/support/ui-theme-addon/',
-            tags=['some_tag', 'another_tag', 'ui-testing',
-                    'selenium', 'python'],
+            summary='My UI theme summary',
+            support_email='support@example.org',
+            support_url='https://support.example.org/support/ui-theme-addon/',
+            tags=['some_tag', 'another_tag', 'ui-testing', 'selenium', 'python'],
             total_ratings=777,
             weekly_downloads=123456,
             developer_comments='This is a testing theme, used within pytest.',
+            promoted_kwargs={'api_name': self.recommended.api_name},
         )
         addon.save()
-        generate_collection(
-            addon,
-            app=FIREFOX,
-            type=amo.COLLECTION_FEATURED)
-        print('Created Theme {0} for testing successfully'.format(addon.name))
-
-    def create_featured_collections(self):
-        """Creates exactly 4 collections that are featured.
-
-        This fixture uses the generate_collection function from olympia.
-
-        """
-        for _ in range(4):
-            addon = addon_factory(type=amo.ADDON_EXTENSION)
-            generate_collection(
-                addon, APPS['firefox'], type=amo.COLLECTION_FEATURED)
+        generate_collection(addon, app=FIREFOX)
+        print(f'Created Theme {addon.name} for testing successfully')
 
     def create_featured_themes(self):
         """Creates exactly 6 themes that will be not featured.
@@ -318,10 +308,13 @@ class GenerateAddonsSerializer(serializers.Serializer):
         It will also create 6 themes that are featured with random authors.
 
         """
-        generate_themes(6, 'uitest@mozilla.com')
         for _ in range(6):
-            addon = addon_factory(status=STATUS_PUBLIC, type=ADDON_PERSONA)
-            generate_collection(addon, app=FIREFOX)
+            addon = addon_factory(
+                status=amo.STATUS_APPROVED,
+                type=ADDON_STATICTHEME,
+                promoted_kwargs={'api_name': self.recommended.api_name},
+            )
+            generate_collection(addon)
 
     def create_a_named_collection_and_addon(self, name, author):
         """Creates a collection with a name and author."""
@@ -330,8 +323,7 @@ class GenerateAddonsSerializer(serializers.Serializer):
             self.create_named_addon_with_author(name, author=author),
             app=FIREFOX,
             author=UserProfile.objects.get(username=author),
-            type=amo.COLLECTION_FEATURED,
-            name=name
+            name=name,
         )
 
     def create_installable_addon(self):
@@ -346,22 +338,34 @@ class GenerateAddonsSerializer(serializers.Serializer):
 
         user, _ = UserProfile.objects.get_or_create(
             pk=settings.TASK_USER_ID,
-            defaults={'email': 'admin@mozilla.com', 'username': 'admin'})
+            defaults={'email': 'admin@mozilla.com', 'username': 'admin'},
+        )
+        if not user.last_login_ip:
+            user.update(last_login_ip='127.0.0.1')
+        # Groups should have been created by loaddata initial.json at this
+        # point, we need our user to be part of a group allowed to submit
+        # extensions signed by Mozilla. Let's use Admins (pk=1) as a shortcut.
+        GroupUser.objects.get_or_create(
+            user=user, group=Group.objects.get(name='Admins')
+        )
 
         # generate a proper uploaded file that simulates what django requires
         # as request.POST
+        root = os.path.join(settings.ROOT, 'src/olympia/files/fixtures/files')
         file_to_upload = 'webextension_signed_already.xpi'
-        file_path = get_file(file_to_upload)
+        file_path = os.path.join(root, file_to_upload)
 
         # make sure we are not using the file in the source-tree but a
         # temporary one to avoid the files get moved somewhere else and
         # deleted from source tree
         with copy_file_to_temp(file_path) as temporary_path:
-            data = open(temporary_path).read()
+            with open(temporary_path, 'rb') as temporary_file:
+                data = temporary_file.read()
             filedata = SimpleUploadedFile(
                 file_to_upload,
                 data,
-                content_type=mimetypes.guess_type(file_to_upload)[0])
+                content_type=mimetypes.guess_type(file_to_upload)[0],
+            )
 
             # now, lets upload the file into the system
             from olympia.devhub.views import handle_upload
@@ -372,13 +376,18 @@ class GenerateAddonsSerializer(serializers.Serializer):
             upload = handle_upload(
                 filedata=filedata,
                 request=request,
-                channel=amo.RELEASE_CHANNEL_LISTED,
+                channel=amo.CHANNEL_LISTED,
                 addon=addon,
             )
+            upload.ip_address = '127.0.0.1'
 
             # And let's create a new version for that upload.
             create_version_for_upload(
-                upload.addon, upload, amo.RELEASE_CHANNEL_LISTED)
+                addon=upload.addon,
+                upload=upload,
+                channel=amo.CHANNEL_LISTED,
+                client_info=None,
+            )
 
             # Change status to public
-            addon.update(status=amo.STATUS_PUBLIC)
+            addon.update(status=amo.STATUS_APPROVED)

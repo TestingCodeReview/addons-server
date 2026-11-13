@@ -6,7 +6,12 @@ from django import http
 from django.conf import settings
 from django.core.exceptions import PermissionDenied
 
+from rest_framework import exceptions as drf_exceptions
+from rest_framework.authentication import get_authorization_header
+from rest_framework.settings import api_settings
+
 import olympia.core.logger
+from olympia.accounts.utils import check_for_session_anomaly, redirect_for_login
 
 from . import models as context
 
@@ -14,26 +19,28 @@ from . import models as context
 task_log = olympia.core.logger.getLogger('z.task')
 
 
-def login_required(f=None, redirect=True):
+def login_required(f):
     """
-    Like Django's login_required, but with to= instead of next=.
+    Like Django's login_required, but with to= instead of next=, and added
+    session consistency checks.
+    """
 
-    If redirect=False then we return 401 instead of redirecting to the
-    login page.  That's nice for ajax views.
-    """
     def decorator(func):
         @functools.wraps(func)
         def wrapper(request, *args, **kw):
-            # Prevent circular ref in accounts.utils
-            from olympia.accounts.utils import redirect_for_login
             if request.user.is_authenticated:
+                if hasattr(request, 'session'):
+                    check_for_session_anomaly(
+                        session=request.session,
+                        headers=request.headers,
+                        user=request.user,
+                    )
                 return func(request, *args, **kw)
             else:
-                if redirect:
-                    return redirect_for_login(request)
-                else:
-                    return http.HttpResponse(status=401)
+                return redirect_for_login(request)
+
         return wrapper
+
     if f:
         return decorator(f)
     else:
@@ -47,6 +54,7 @@ def post_required(f):
             return http.HttpResponseNotAllowed(['POST'])
         else:
             return f(request, *args, **kw)
+
     return wrapper
 
 
@@ -56,11 +64,14 @@ def permission_required(permission):
         @login_required
         def wrapper(request, *args, **kw):
             from olympia.access import acl
-            if acl.action_allowed(request, permission):
+
+            if acl.action_allowed_for(request.user, permission):
                 return f(request, *args, **kw)
             else:
                 raise PermissionDenied
+
         return wrapper
+
     return decorator
 
 
@@ -71,13 +82,14 @@ def json_response(response, has_trans=False, status_code=200):
     """
     # to avoid circular imports with users.models
     from .utils import AMOJSONEncoder
+
     if has_trans:
         response = json.dumps(response, cls=AMOJSONEncoder)
     else:
         response = json.dumps(response)
-    return http.HttpResponse(response,
-                             content_type='application/json',
-                             status=status_code)
+    return http.HttpResponse(
+        response, content_type='application/json', status=status_code
+    )
 
 
 def json_view(f=None, has_trans=False, status_code=200):
@@ -88,9 +100,12 @@ def json_view(f=None, has_trans=False, status_code=200):
             if isinstance(response, http.HttpResponse):
                 return response
             else:
-                return json_response(response, has_trans=has_trans,
-                                     status_code=status_code)
+                return json_response(
+                    response, has_trans=has_trans, status_code=status_code
+                )
+
         return wrapper
+
     if f:
         return decorator(f)
     else:
@@ -98,7 +113,8 @@ def json_view(f=None, has_trans=False, status_code=200):
 
 
 json_view.error = lambda s: http.HttpResponseBadRequest(
-    json.dumps(s), content_type='application/json')
+    json.dumps(s), content_type='application/json'
+)
 
 
 def use_primary_db(f):
@@ -106,6 +122,7 @@ def use_primary_db(f):
     def wrapper(*args, **kw):
         with context.use_primary_db():
             return f(*args, **kw)
+
     return wrapper
 
 
@@ -130,8 +147,10 @@ def set_modified_on(f):
             # kwargs to the set_modified_on_object task. Useful to set
             # things like icon hashes.
             kwargs_from_result = result if isinstance(result, dict) else {}
-            task_log.info('Delaying setting modified on object: %s, %s' %
-                          (obj_info[0], obj_info[1]))
+            task_log.info(
+                'Delaying setting modified on object: %s, %s'
+                % (obj_info[0], obj_info[1])
+            )
             # Execute set_modified_on_object in NFS_LAG_DELAY seconds. This
             # allows us to make sure any changes have been written to disk
             # before changing modification date and/or image hashes stored
@@ -140,15 +159,20 @@ def set_modified_on(f):
             set_modified_on_object.apply_async(
                 args=obj_info,
                 kwargs=kwargs_from_result,
-                eta=(datetime.datetime.now() +
-                     datetime.timedelta(seconds=settings.NFS_LAG_DELAY)))
+                eta=(
+                    datetime.datetime.now()
+                    + datetime.timedelta(seconds=settings.NFS_LAG_DELAY)
+                ),
+            )
         return result
+
     return wrapper
 
 
 def allow_cross_site_request(f):
     """Allow other sites to access this resource, see
     https://developer.mozilla.org/en/HTTP_access_control."""
+
     @functools.wraps(f)
     def wrapper(request, *args, **kw):
         response = f(request, *args, **kw)
@@ -158,21 +182,42 @@ def allow_cross_site_request(f):
         response['Access-Control-Allow-Origin'] = '*'
         response['Access-Control-Allow-Methods'] = 'GET'
         return response
+
     return wrapper
 
 
-def allow_mine(f):
+def api_authentication(f):
+    """Allows API authentication to be used by this django view. Standard auth will
+    already have been attempted by this point so api auth will only be tried for
+    anonymous (unauthenticated) requests."""
+
+    from olympia.api.authentication import JWTKeyAuthentication, SessionIDAuthentication
+
     @functools.wraps(f)
-    def wrapper(request, user_id, *args, **kw):
-        """
-        If the author is `mine` then show the current user's collection
-        (or something).
-        """
-        # Prevent circular ref in accounts.utils
-        from olympia.accounts.utils import redirect_for_login
-        if user_id == 'mine':
-            if not request.user.is_authenticated:
-                return redirect_for_login(request)
-            user_id = request.user.id
-        return f(request, user_id, *args, **kw)
+    def wrapper(request, *args, **kw):
+        if request.user.is_anonymous and get_authorization_header(request):
+            # if user isn't authenticated with standard auth, try the API auth methods
+            try:
+                for api_auth in (SessionIDAuthentication, JWTKeyAuthentication):
+                    api_auth = api_auth()
+                    result = api_auth.authenticate(request)
+                    if result:
+                        request.user, _ = result
+                        break
+            except drf_exceptions.AuthenticationFailed as exc:
+                # We have to set some props DRF would usually set in the APIView
+                exc.auth_header = api_auth.authenticate_header(request)
+                response = api_settings.EXCEPTION_HANDLER(exc, None)
+                response.accepted_renderer = api_settings.DEFAULT_RENDERER_CLASSES[0]()
+                response.accepted_media_type = response.accepted_renderer.media_type
+                response.renderer_context = {
+                    'view': None,
+                    'args': args,
+                    'kwargs': kw,
+                    'request': request,
+                }
+                return response
+
+        return f(request, *args, **kw)
+
     return wrapper

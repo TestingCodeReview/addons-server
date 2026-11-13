@@ -1,70 +1,79 @@
 import collections
 import contextlib
-import datetime
 import errno
 import functools
+import hashlib
 import itertools
 import json
 import operator
 import os
-import random
 import re
-import scandir
 import shutil
-import six
-import string
 import subprocess
+import sys
+import tempfile
 import time
 import unicodedata
-
-from six.moves.urllib_parse import parse_qsl, ParseResult, unquote_to_bytes
+from datetime import UTC, datetime, timedelta
+from mimetypes import guess_extension
+from urllib.parse import (
+    ParseResult,
+    unquote,
+    urlencode as urllib_urlencode,
+    urlparse,
+)
 
 import django.core.mail
-
+from django import forms
 from django.conf import settings
-from django.core.cache import cache
-from django.core.files.storage import (
-    FileSystemStorage, default_storage as storage)
-from django.core.paginator import (
-    EmptyPage, InvalidPage, Paginator as DjangoPaginator)
-from django.core.validators import ValidationError, validate_slug
+from django.core.exceptions import FieldDoesNotExist
+from django.core.files.storage import FileSystemStorage, default_storage as storage
+from django.core.paginator import EmptyPage, InvalidPage, Paginator as DjangoPaginator
+from django.core.validators import MaxLengthValidator, ValidationError, validate_slug
 from django.forms.fields import Field
-from django.http import HttpResponse
+from django.http import HttpResponse, QueryDict
+from django.http.response import HttpResponseRedirectBase
 from django.template import engines, loader
+from django.urls import reverse
 from django.utils import translation
-from django.utils.encoding import force_bytes, force_text
-from django.utils.http import _urlparse as django_urlparse, quote_etag
+from django.utils.encoding import force_bytes, force_str
+from django.utils.functional import cached_property
+from django.utils.http import quote_etag, url_has_allowed_host_and_scheme
+from django.utils.translation import gettext_lazy as _
 
-import bleach
-import colorgram
-import html5lib
-import jinja2
-import pytz
 import basket
-
+import colorgram
+import homoglyphs_fork
+import html5lib
+import pytz
 from babel import Locale
 from django_statsd.clients import statsd
-from easy_thumbnails import processors
+from google.api_core.exceptions import PreconditionFailed
+from google.cloud import storage as google_storage
 from html5lib.serializer import HTMLSerializer
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from rest_framework.utils.encoders import JSONEncoder
+from rest_framework.utils.formatting import lazy_format
 
+from olympia import amo
+from olympia.amo.validators import OneOrMorePrintableCharacterValidator
+from olympia.constants.abuse import REPORTED_MEDIA_BACKUP_EXPIRATION_DAYS
+from olympia.core.languages import LANGUAGES_NOT_IN_BABEL
 from olympia.core.logger import getLogger
-from olympia.amo import ADDON_ICON_SIZES, search
-from olympia.amo.pagination import ESPaginator
-from olympia.amo.urlresolvers import linkify_with_outgoing, reverse
-from olympia.translations.models import Translation
-from olympia.users.models import UserNotification
-from olympia.users.utils import UnsubscribeCode
 from olympia.lib import unicodehelper
+from olympia.translations.fields import LocaleErrorMessage
+from olympia.translations.models import Translation
+from olympia.users.utils import UnsubscribeCode
 
 
 log = getLogger('z.amo')
 
+# Module cache for homoglyph instances, since initialization is costly.
+_homoglyphs_cache = {}
 
-def render(request, template, ctx=None, status=None, content_type=None):
-    rendered = loader.render_to_string(template, ctx, request=request)
-    return HttpResponse(rendered, status=status, content_type=content_type)
+
+# Basic regexp to detect links.
+URL_RE = re.compile(r'https?://\S+', re.IGNORECASE)
 
 
 def from_string(string):
@@ -72,7 +81,7 @@ def from_string(string):
 
 
 def days_ago(n):
-    return datetime.datetime.now() - datetime.timedelta(days=n)
+    return datetime.now() - timedelta(days=n)
 
 
 def urlparams(url_, hash=None, **query):
@@ -82,21 +91,23 @@ def urlparams(url_, hash=None, **query):
     New query params will be appended to existing parameters, except duplicate
     names, which will be replaced.
     """
-    url = django_urlparse(force_text(url_))
+    url = urlparse(force_str(url_))
 
     fragment = hash if hash is not None else url.fragment
 
-    # Use dict(parse_qsl) so we don't get lists of values.
-    q = url.query
-    query_dict = dict(parse_qsl(force_text(q))) if q else {}
-    query_dict.update(
-        (k, force_bytes(v) if v is not None else v) for k, v in query.items())
-    query_string = urlencode(
-        [(k, unquote_to_bytes(v))
-         for k, v in query_dict.items() if v is not None])
-    new = ParseResult(url.scheme, url.netloc, url.path, url.params,
-                      query_string, fragment)
-    return new.geturl()
+    # Use a QueryDict to keep all values for a given key, e.g. foo=one&foo=two.
+    query_dict = QueryDict(url.query, mutable=True)
+    # Don't use .update(), as it would append a new value instead of replacing.
+    for k, v in query.items():
+        if v is not None:
+            query_dict[k] = unquote(str(v))
+        elif k in query_dict:
+            del query_dict[k]
+
+    result = ParseResult(
+        url.scheme, url.netloc, url.path, url.params, query_dict.urlencode(), fragment
+    )
+    return result.geturl()
 
 
 def partial(func, *args, **kw):
@@ -109,14 +120,7 @@ def isotime(t):
     """Date/Time format according to ISO 8601"""
     if not hasattr(t, 'tzinfo'):
         return
-    return _append_tz(t).astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def epoch(t):
-    """Date/Time converted to seconds since epoch"""
-    if not hasattr(t, 'tzinfo'):
-        return
-    return int(time.mktime(_append_tz(t).timetuple()))
+    return _append_tz(t).astimezone(pytz.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 def _append_tz(t):
@@ -124,15 +128,15 @@ def _append_tz(t):
     return tz.localize(t)
 
 
-def sorted_groupby(seq, key):
+def sorted_groupby(seq, key, *, reverse=False):
     """
     Given a sequence, we sort it and group it by a key.
 
     key should be a string (used with attrgetter) or a function.
     """
-    if not hasattr(key, '__call__'):
+    if not callable(key):
         key = operator.attrgetter(key)
-    return itertools.groupby(sorted(seq, key=key), key=key)
+    return itertools.groupby(sorted(seq, key=key, reverse=reverse), key=key)
 
 
 def paginate(request, queryset, per_page=20, count=None):
@@ -143,11 +147,7 @@ def paginate(request, queryset, per_page=20, count=None):
     ``.count()`` on the queryset.  This can be good if the queryset would
     produce an expensive count query.
     """
-    if isinstance(queryset, search.ES):
-        paginator = ESPaginator(
-            queryset, per_page, use_elasticsearch_dsl=False)
-    else:
-        paginator = DjangoPaginator(queryset, per_page)
+    paginator = DjangoPaginator(queryset, per_page)
 
     if count is not None:
         paginator.count = count
@@ -164,7 +164,7 @@ def paginate(request, queryset, per_page=20, count=None):
     except (EmptyPage, InvalidPage):
         paginated = paginator.page(1)
 
-    paginated.url = u'%s?%s' % (request.path, request.GET.urlencode())
+    paginated.url = f'{request.path}?{request.GET.urlencode()}'
     return paginated
 
 
@@ -173,44 +173,58 @@ def decode_json(json_string):
     return json.loads(unicodehelper.decode(json_string))
 
 
-def send_mail(subject, message, from_email=None, recipient_list=None,
-              use_deny_list=True, perm_setting=None, manage_url=None,
-              headers=None, cc=None, real_email=False, html_message=None,
-              attachments=None, max_retries=3, reply_to=None):
+def send_mail(
+    subject,
+    message,
+    from_email=None,
+    recipient_list=None,
+    use_deny_list=True,
+    perm_setting=None,
+    manage_url=None,
+    headers=None,
+    cc=None,
+    real_email=False,
+    html_message=None,
+    attachments=None,
+    max_retries=3,
+    reply_to=None,
+    countdown=None,
+):
     """
     A wrapper around django.core.mail.EmailMessage.
 
     Adds deny checking and error logging.
     """
-    from olympia.amo.templatetags.jinja_helpers import absolutify
     from olympia.amo.tasks import send_email
+    from olympia.amo.templatetags.jinja_helpers import absolutify
     from olympia.users import notifications
+    from olympia.users.models import UserNotification
 
     if not recipient_list:
         return True
 
-    if isinstance(recipient_list, six.string_types):
-        raise ValueError('recipient_list should be a list, not a string.')
+    if isinstance(recipient_list, str):
+        raise TypeError('recipient_list should be a list, not a string.')
 
     # Check against user notification settings
     if perm_setting:
-        if isinstance(perm_setting, six.string_types):
+        if isinstance(perm_setting, str):
             perm_setting = notifications.NOTIFICATIONS_BY_SHORT[perm_setting]
-        perms = dict(UserNotification.objects
-                                     .filter(user__email__in=recipient_list,
-                                             notification_id=perm_setting.id)
-                                     .values_list('user__email', 'enabled'))
+        perms = dict(
+            UserNotification.objects.filter(
+                user__email__in=recipient_list, notification_id=perm_setting.id
+            ).values_list('user__email', 'enabled')
+        )
 
         d = perm_setting.default_checked
-        recipient_list = [e for e in recipient_list
-                          if e and perms.setdefault(e, d)]
+        recipient_list = [e for e in recipient_list if e and perms.setdefault(e, d)]
 
     # Prune denied emails.
     if use_deny_list:
         white_list = []
         for email in recipient_list:
             if email and email.lower() in settings.EMAIL_DENY_LIST:
-                log.debug('Blacklisted email removed from list: %s' % email)
+                log.info('Blacklisted email removed from list: %s' % email)
             else:
                 white_list.append(email)
     else:
@@ -219,10 +233,9 @@ def send_mail(subject, message, from_email=None, recipient_list=None,
     if not from_email:
         from_email = settings.DEFAULT_FROM_EMAIL
 
-    if cc:
-        # If not six.string_types, assume it is already a list.
-        if isinstance(cc, six.string_types):
-            cc = [cc]
+    # If not str, assume it is already a list.
+    if cc and isinstance(cc, str):
+        cc = [cc]
 
     if not headers:
         headers = {}
@@ -241,27 +254,32 @@ def send_mail(subject, message, from_email=None, recipient_list=None,
             'max_retries': max_retries,
             'real_email': real_email,
             'reply_to': reply_to,
+            'countdown': countdown,
         }
         kwargs.update(options)
         # Email subject *must not* contain newlines
         args = (list(recipients), ' '.join(subject.splitlines()), message)
-        return send_email.delay(*args, **kwargs)
+        send_email.delay(*args, **kwargs)
+        return True
 
     if white_list:
         if perm_setting:
             html_template = loader.get_template('amo/emails/unsubscribe.html')
             text_template = loader.get_template('amo/emails/unsubscribe.ltxt')
             if not manage_url:
-                manage_url = urlparams(absolutify(
-                    reverse('users.edit', add_prefix=False)),
-                    'acct-notify')
+                manage_url = urlparams(
+                    absolutify(reverse('users.edit', add_prefix=False)), 'acct-notify'
+                )
             for recipient in white_list:
                 # Add unsubscribe link to footer.
                 token, hash = UnsubscribeCode.create(recipient)
                 unsubscribe_url = absolutify(
-                    reverse('users.unsubscribe',
-                            args=[token, hash, perm_setting.short],
-                            add_prefix=False))
+                    reverse(
+                        'users.unsubscribe',
+                        args=[force_str(token), hash, perm_setting.short],
+                        add_prefix=False,
+                    )
+                )
 
                 context = {
                     'message': message,
@@ -280,15 +298,23 @@ def send_mail(subject, message, from_email=None, recipient_list=None,
                     context['message'] = html_message
                     with translation.override(settings.LANGUAGE_CODE):
                         html_with_unsubscribe = html_template.render(context)
-                        result = send([recipient], message_with_unsubscribe,
-                                      html_message=html_with_unsubscribe,
-                                      attachments=attachments)
+                        result = send(
+                            [recipient],
+                            message_with_unsubscribe,
+                            html_message=html_with_unsubscribe,
+                            attachments=attachments,
+                        )
                 else:
-                    result = send([recipient], message_with_unsubscribe,
-                                  attachments=attachments)
+                    result = send(
+                        [recipient], message_with_unsubscribe, attachments=attachments
+                    )
         else:
-            result = send(recipient_list, message=message,
-                          html_message=html_message, attachments=attachments)
+            result = send(
+                recipient_list,
+                message=message,
+                html_message=html_message,
+                attachments=attachments,
+            )
     else:
         result = True
 
@@ -316,16 +342,20 @@ def send_mail_jinja(subject, template, context, *args, **kwargs):
     return msg
 
 
-def send_html_mail_jinja(subject, html_template, text_template, context,
-                         *args, **kwargs):
+def send_html_mail_jinja(
+    subject, html_template, text_template, context, *args, **kwargs
+):
     """Sends HTML mail using a Jinja template with autoescaping turned off."""
     # Get a jinja environment so we can override autoescaping for text emails.
     with no_jinja_autoescape():
         html_template = loader.get_template(html_template)
         text_template = loader.get_template(text_template)
-    msg = send_mail(subject, text_template.render(context),
-                    html_message=html_template.render(context), *args,
-                    **kwargs)
+    msg = send_mail(
+        subject,
+        text_template.render(context),
+        *args,
+        **{'html_message': html_template.render(context), **kwargs},
+    )
     return msg
 
 
@@ -345,7 +375,8 @@ def sync_user_with_basket(user):
     except Exception as exc:
         acceptable_errors = (
             basket.errors.BASKET_INVALID_EMAIL,
-            basket.errors.BASKET_UNKNOWN_EMAIL)
+            basket.errors.BASKET_UNKNOWN_EMAIL,
+        )
 
         if getattr(exc, 'code', None) in acceptable_errors:
             return None
@@ -369,7 +400,8 @@ def subscribe_newsletter(user_profile, basket_id, request=None):
         basket_id,
         sync='Y',
         source_url=request.build_absolute_uri() if request else None,
-        optin='Y')
+        optin='Y',
+    )
     return response['status'] == 'ok'
 
 
@@ -386,7 +418,8 @@ def unsubscribe_newsletter(user_profile, basket_id):
     # newsletters.
     if user_profile.basket_token:
         response = basket.unsubscribe(
-            user_profile.basket_token, user_profile.email, basket_id)
+            user_profile.basket_token, user_profile.email, basket_id
+        )
         return response['status'] == 'ok'
     return False
 
@@ -412,31 +445,9 @@ def chunked(seq, n):
 def urlencode(items):
     """A Unicode-safe URLencoder."""
     try:
-        return six.moves.urllib_parse.urlencode(items)
+        return urllib_urlencode(items)
     except UnicodeEncodeError:
-        return six.moves.urllib_parse.urlencode(
-            [(k, force_bytes(v)) for k, v in items])
-
-
-def randslice(qs, limit, exclude=None):
-    """
-    Get a random slice of items from ``qs`` of size ``limit``.
-
-    There will be two queries.  One to find out how many elements are in ``qs``
-    and another to get a slice.  The count is so we don't go out of bounds.
-    If exclude is given, we make sure that pk doesn't show up in the slice.
-
-    This replaces qs.order_by('?')[:limit].
-    """
-    cnt = qs.count()
-    # Get one extra in case we find the element that should be excluded.
-    if exclude is not None:
-        limit += 1
-    rand = 0 if limit > cnt else random.randint(0, cnt - limit)
-    slice_ = list(qs[rand:rand + limit])
-    if exclude is not None:
-        slice_ = [o for o in slice_ if o.pk != exclude][:limit - 1]
-    return slice_
+        return urllib_urlencode([(k, force_bytes(v)) for k, v in items])
 
 
 # Extra characters outside of alphanumerics that we'll allow.
@@ -448,7 +459,7 @@ def slugify(s, ok=SLUG_OK, lower=True, spaces=False, delimiter='-'):
     # http://www.unicode.org/reports/tr44/tr44-4.html#GC_Values_Table
     rv = []
 
-    for c in force_text(s):
+    for c in force_str(s):
         cat = unicodedata.category(c)[0]
         if cat in 'LN' or c in ok:
             rv.append(c)
@@ -460,31 +471,119 @@ def slugify(s, ok=SLUG_OK, lower=True, spaces=False, delimiter='-'):
     return new.lower() if lower else new
 
 
-def normalize_string(value, strip_punctuation=False):
-    """Normalizes a unicode string.
+@functools.cache
+def build_characters_normalization_replacement_table(categories_to_strip):
+    """Return a dict of characters to replace when normalizing strings, to be
+    used with <str>.translate().
 
-     * decomposes unicode characters
-     * strips whitespaces, newlines and tabs
-     * optionally removes puncutation
+    Results are cached in memory as building the table can be quite slow.
     """
-    value = unicodedata.normalize('NFD', force_text(value))
-    value = value.encode('utf-8', 'ignore')
+    from olympia.amo.confusables import additional_character_replacements
 
-    if strip_punctuation:
-        value = value.translate(None, force_bytes(string.punctuation))
-    return force_text(b' '.join(value.split()))
+    translations_table = dict.fromkeys(
+        i
+        for i in range(sys.maxunicode)
+        if unicodedata.category(chr(i))[0] in categories_to_strip
+        or chr(i) in OneOrMorePrintableCharacterValidator.special_blank_characters
+    )
+
+    # additional characters replacement table - this can override symbols we
+    # would strip if we only used the table generated above.
+    additional_replacement_table = dict(
+        itertools.chain(
+            *(
+                list(zip(map(ord, letters), itertools.repeat(ord(replacement))))
+                for replacement, letters in additional_character_replacements.items()
+            )
+        )
+    )
+    translations_table.update(additional_replacement_table)
+    return translations_table
 
 
-def slug_validator(s, ok=SLUG_OK, lower=True, spaces=False, delimiter='-',
-                   message=validate_slug.message, code=validate_slug.code):
+class Homoglyphs(homoglyphs_fork.Homoglyphs):
+    def get_lower_ascii_variants(self, text):
+        """
+        Return an iterator over ascii variants of the given text.
+
+        Similar to what to_ascii() would return, except the result is a an
+        iterator, not a sorted/uniqueness'ed list, and each yielded variant is
+        returned in lowercase.
+        """
+        for variant in self._get_combinations(text, ascii=True):
+            yield variant.lower()
+
+
+def normalize_string_for_name_checks(
+    value, categories_to_strip=('Z', 'P', 'M', 'C', 'S')
+):
+    """Normalize a unicode string to perform name checks on it.
+
+    * decomposes unicode characters (also applying compatibility decomposition
+      to replace letter equivalents)
+    * replaces some confusable characters with corresponding ascii character
+    * strips all characters belonging to categories_to_strip. By default strip
+      whitespace, punctuation, mark, control, symbol & special
+      invisible characters (since the string was decomposed, this should also
+      remove a bunch of accents)
+    """
+    # Normalize first to decompose characters.
+    value = unicodedata.normalize('NFKD', force_str(value))
+    # Strip/replace depending on categories_to_strip passed as argument.
+    translations_table = build_characters_normalization_replacement_table(
+        categories_to_strip
+    )
+    value = value.translate(translations_table)
+    return value
+
+
+def generate_lowercase_homoglyphs_variants_for_string(value):
+    """Generate an iterator of lowercase homoglyph variants for a given string.
+
+    Value passed as argument is a string that is expected to have gone through
+    normalization to remove characters we don't want first, see
+    normalize_string_for_name_checks().
+    """
+    cache_key = '_homoglyphs_long_string' if len(value) > 50 else '_homoglyphs'
+    if cache_key not in _homoglyphs_cache:
+        _homoglyphs_cache[cache_key] = Homoglyphs(
+            # Load everything at once, we're caching this instance and will be
+            # reusing it a lot, it's more efficient than loading the json files
+            # over and over, especially as STRATEGY_LOAD would cause the same
+            # json files to be loaded multiple times for strings containing
+            # multiple alphabets.
+            languages=homoglyphs_fork.Languages.get_all(),
+            categories=homoglyphs_fork.Categories.get_all(),
+            strategy=homoglyphs_fork.STRATEGY_REMOVE,
+            ascii_range=range(ord('A'), ord('z') + 1),
+        )
+        if len(value) > 50:
+            # Small trade-off: for large strings, remove 'I' as a variant of 'l':
+            # `l` appears often enough in large strings that it would cause
+            # combinatorial explosion issues, and the confusion between the 2 is
+            # usually not that big of a problem in this direction (it is in the
+            # other: we want to keep `l` as a variant of `I`).
+            #
+            # Examples:
+            # - A short string ending in "lol" would be unaffected and generate
+            #   "(...)lol", "(...)loi", "(...)ioi" and "(...)iol" variants.
+            # - A long string ending in "IoI" would be unaffected and generate
+            #   the same "(...)lol", "(...)loi", "(...)ioi" and "(...)iol" variants
+            # - A long string ending in "lol" no longer generate variants because
+            #   of that ending.
+            _homoglyphs_cache[cache_key].table['l'].remove('I')
+    return _homoglyphs_cache[cache_key].get_lower_ascii_variants(value)
+
+
+def slug_validator(slug, message=validate_slug.message):
     """
     Raise an error if the string has any punctuation characters.
 
     Regexes don't work here because they won't check alnums in the right
     locale.
     """
-    if not (s and slugify(s, ok, lower, spaces, delimiter) == s):
-        raise ValidationError(message, code=code)
+    if not (slug and slugify(slug, lower=False) == slug):
+        raise ValidationError(message, code=validate_slug.code)
 
 
 def raise_required():
@@ -497,10 +596,12 @@ def clean_nl(string):
     cleaned text.
     """
 
-    html_blocks = ['{http://www.w3.org/1999/xhtml}blockquote',
-                   '{http://www.w3.org/1999/xhtml}ol',
-                   '{http://www.w3.org/1999/xhtml}li',
-                   '{http://www.w3.org/1999/xhtml}ul']
+    html_blocks = [
+        '{http://www.w3.org/1999/xhtml}blockquote',
+        '{http://www.w3.org/1999/xhtml}ol',
+        '{http://www.w3.org/1999/xhtml}li',
+        '{http://www.w3.org/1999/xhtml}ul',
+    ]
 
     if not string:
         return string
@@ -528,11 +629,10 @@ def clean_nl(string):
                 tree.tail = tree.tail[1:]
 
         for child in tree:  # Recurse down the tree.
-            if tree.tag in html_blocks:
-                # Strip new lines directly inside block level elements: remove
-                # the last new lines from the children's tails.
-                if child.tail:
-                    child.tail = child.tail.rstrip('\n')
+            # Strip new lines directly inside block level elements: remove
+            # the last new lines from the children's tails.
+            if tree.tag in html_blocks and child.tail:
+                child.tail = child.tail.rstrip('\n')
             parse_html(child)
         return tree
 
@@ -541,8 +641,7 @@ def clean_nl(string):
     # Serialize the parsed tree back to html.
     walker = html5lib.treewalkers.getTreeWalker('etree')
     stream = walker(parse)
-    serializer = HTMLSerializer(quote_attr_values='always',
-                                omit_optional_tags=False)
+    serializer = HTMLSerializer(quote_attr_values='always', omit_optional_tags=False)
     return serializer.render(stream)
 
 
@@ -550,7 +649,7 @@ def image_size(filename):
     """
     Return an image size tuple, as returned by PIL.
     """
-    with Image.open(filename) as img:
+    with Image.open(filename, formats=amo.VALID_IMAGE_FORMATS) as img:
         size = img.size
     return size
 
@@ -574,88 +673,147 @@ def pngcrush_image(src, **kw):
         # comment, because that's what comes with Debian stretch that is used
         # for our docker container).
         cmd = [settings.PNGCRUSH_BIN, '-q', '-reduce', '-ow', src, tmp_path]
-        process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = process.communicate()
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        _stdout, stderr = process.communicate()
 
         if process.returncode != 0:
-            log.error('Error optimizing image: %s; %s' % (src, stderr.strip()))
+            log.error(f'Error optimizing image: {src}; {stderr.strip()}')
             return False
 
         log.info('Image optimization completed for: %s' % src)
         return True
 
     except Exception as e:
-        log.error('Error optimizing image: %s; %s' % (src, e))
+        log.error(f'Error optimizing image: {src}; {e}')
     return False
 
 
-def resize_image(source, destination, size=None):
-    """Resizes and image from src, to dst.
+def convert_svg_to_png(svg_file, png_file):
+    try:
+        if not os.path.exists(os.path.dirname(png_file)):
+            os.makedirs(os.path.dirname(png_file))
+        command = [
+            settings.RSVG_CONVERT_BIN,
+            '--output',
+            png_file,
+            svg_file,
+        ]
+        subprocess.check_call(command)
+    except OSError as io_error:
+        log.info(io_error)
+        return False
+    except subprocess.CalledProcessError as process_error:
+        log.info(process_error)
+        return False
+    return True
+
+
+def resize_image(source, destination, size=None, *, format='png', quality=80):
+    """Resizes and image from source, to destination.
     Returns a tuple of new width and height, original width and height.
 
     When dealing with local files it's up to you to ensure that all directories
-    exist leading up to the dst filename.
+    exist leading up to the destination filename.
+
+    quality kwarg is only valid for jpeg format - it's ignored for png.
     """
     if source == destination:
-        raise Exception(
-            "source and destination can't be the same: %s" % source)
+        raise RuntimeError("source and destination can't be the same: %s" % source)
+    source_fileext = os.path.splitext(source)[1]
+    if source_fileext == '.svg':
+        tmp_args = {
+            'dir': settings.TMP_PATH,
+            'mode': 'w+b',
+            'suffix': '.png',
+            'delete': not settings.DEBUG,
+        }
+        with tempfile.NamedTemporaryFile(**tmp_args) as temporary_png:
+            convert_svg_to_png(source, temporary_png.name)
+            im = Image.open(temporary_png.name, formats=('PNG',))
+            im.load()
+    else:
+        with storage.open(source, 'rb') as fp:
+            im = Image.open(fp, formats=amo.VALID_IMAGE_FORMATS)
+            im.load()
+    im = im.convert('RGBA')
+    original_size = im.size
+    if size:
+        target_width, target_height = size
+        source_width, source_height = im.size
+        scale = min(target_width / source_width, target_height / source_height)
+        if scale <= 1:
+            im = im.resize(
+                (
+                    round(source_width * scale),
+                    round(source_height * scale),
+                ),
+                # Antialias is deprecated and renamed to Lanczos in PIL
+                resample=Image.Resampling.LANCZOS,
+            )
 
-    with storage.open(source, 'rb') as fp:
-        im = Image.open(fp)
-        im = im.convert('RGBA')
-        original_size = im.size
-        if size:
-            im = processors.scale_and_crop(im, size)
-    with storage.open(destination, 'wb') as fp:
-        # Save the image to PNG in destination file path. Don't keep the ICC
-        # profile as it can mess up pngcrush badly (mozilla/addons/issues/697).
-        im.save(fp, 'png', icc_profile=None)
-    pngcrush_image(destination)
-    return (im.size, original_size)
+    with storage.open(destination, 'wb') as dest_file:
+        if format == 'png':
+            # Save the image to PNG in destination file path.
+            # Don't keep the ICC profile as it can mess up pngcrush badly
+            # (mozilla/addons/issues/697).
+            im.save(dest_file, 'png', icc_profile=None)
+            pngcrush_image(destination)
+        else:
+            # Create a white rgba background for transparency
+            final_im = Image.new('RGBA', im.size, 'WHITE')
+            final_im.paste(im, (0, 0), im)
+            final_im = final_im.convert('RGB')
+            final_im.save(dest_file, 'JPEG', quality=quality)
+            final_im.close()
+    new_size = im.size
+    im.close()
+    return (new_size, original_size)
 
 
-def remove_icons(destination):
-    for size in ADDON_ICON_SIZES:
-        filename = '%s-%s.png' % (destination, size)
-        if storage.exists(filename):
-            storage.delete(filename)
+class ImageCheck:
+    def __init__(self, data):
+        self._data = data
+        # Accept animated png type mimetype if accepting pngs, the caller will
+        # use is_animated() separately if they don't want to accept those.
+        self.valid_types = (
+            amo.VALID_IMAGE_TYPES + ('image/apng',)
+            if 'image/png' in amo.VALID_IMAGE_TYPES
+            else amo.VALID_IMAGE_TYPES
+        )
 
-
-class ImageCheck(object):
-
-    def __init__(self, image):
-        self._img = image
-
-    def is_image(self):
-        if not hasattr(self, '_is_image'):
+    def is_valid_image(self):
+        if not hasattr(self, '_is_valid_image'):
             try:
-                self._img.seek(0)
-                self.img = Image.open(self._img)
+                self._data.seek(0)
+                self.img = Image.open(self._data, formats=amo.VALID_IMAGE_FORMATS)
                 # PIL doesn't tell us what errors it will raise at this point,
                 # just "suitable ones", so let's catch them all.
                 self.img.verify()
-                self._is_image = True
-            except Exception:
-                log.error('Error decoding image', exc_info=True)
-                self._is_image = False
-        return self._is_image
+                self._is_valid_image = (
+                    self.img.get_format_mimetype() in self.valid_types
+                )
+            except UnidentifiedImageError:
+                self._is_valid_image = False
+            except Exception as exc:
+                log.exception('Error decoding image', exc_info=exc)
+                self._is_valid_image = False
+        return self._is_valid_image
 
     @property
     def size(self):
-        if not self.is_image():
+        if not self.is_valid_image():
             return None
         return self.img.size if hasattr(self, 'img') else None
 
     def is_animated(self, size=100000):
-        if not self.is_image():
+        if not self.is_valid_image():
             return False
 
         if self.img.format == 'PNG':
-            self._img.seek(0)
+            self._data.seek(0)
             data = b''
             while True:
-                chunk = self._img.read(size)
+                chunk = self._data.read(size)
                 if not chunk:
                     break
                 data += chunk
@@ -667,8 +825,8 @@ class ImageCheck(object):
             # The image has been verified, and thus the file closed, we need to
             # reopen. Check the "verify" method of the Image object:
             # http://pillow.readthedocs.io/en/latest/reference/Image.html
-            self._img.seek(0)
-            img = Image.open(self._img)
+            self._data.seek(0)
+            img = Image.open(self._data, formats=('GIF',))
             # See the PIL docs for how this works:
             # http://www.pythonware.com/library/pil/handbook/introduction.htm
             try:
@@ -678,8 +836,9 @@ class ImageCheck(object):
             return True
 
 
-class MenuItem():
+class MenuItem:
     """Refinement item with nestable children for use in menus."""
+
     url, text, selected, children = ('', '', False, [])
 
 
@@ -691,84 +850,46 @@ def to_language(locale):
     # Django returns en-us but we want to see en-US.
     elif '-' in locale:
         idx = locale.find('-')
-        return locale[:idx].lower() + '-' + locale[idx + 1:].upper()
+        return locale[:idx].lower() + '-' + locale[idx + 1 :].upper()
     else:
         return translation.trans_real.to_language(locale)
 
 
 def get_locale_from_lang(lang):
-    """Pass in a language (u'en-US') get back a Locale object courtesy of
+    """Pass in a language ('en-US') get back a Locale object courtesy of
     Babel.  Use this to figure out currencies, bidi, names, etc."""
     # Special fake language can just act like English for formatting and such.
-    # Do the same for 'cak' because it's not in http://cldr.unicode.org/ and
+    # Do the same for languages not in http://cldr.unicode.org/ and
     # therefore not supported by Babel - trying to fake the class leads to a
     # rabbit hole of more errors because we need valid locale data on disk, to
     # get decimal formatting, plural rules etc.
-    if not lang or lang in ('cak',):
+    if not lang or lang in LANGUAGES_NOT_IN_BABEL:
         lang = 'en'
     return Locale.parse(translation.to_locale(lang))
 
 
-class HttpResponseSendFile(HttpResponse):
-
-    def __init__(self, request, path, content=None, status=None,
-                 content_type='application/octet-stream', etag=None):
-        self.request = request
-        self.path = path
-        super(HttpResponseSendFile, self).__init__('', status=status,
-                                                   content_type=content_type)
-        header_path = self.path
-        if isinstance(header_path, six.text_type):
-            header_path = header_path.encode('utf8')
-        if settings.XSENDFILE:
-            self[settings.XSENDFILE_HEADER] = header_path
+class HttpResponseXSendFile(HttpResponse):
+    def __init__(
+        self,
+        request,
+        path,
+        content=None,
+        status=None,
+        content_type='application/octet-stream',
+        etag=None,
+        attachment=False,
+    ):
+        super().__init__('', status=status, content_type=content_type)
+        # We normalize the path because if it contains double dots, nginx will
+        # flag the URI as unsafe.
+        self[settings.XSENDFILE_HEADER] = force_bytes(os.path.normpath(path))
         if etag:
             self['ETag'] = quote_etag(etag)
+        if attachment:
+            self['Content-Disposition'] = 'attachment'
 
     def __iter__(self):
-        if settings.XSENDFILE:
-            return iter([])
-
-        chunk = 4096
-        fp = open(self.path, 'rb')
-        if 'wsgi.file_wrapper' in self.request.META:
-            return self.request.META['wsgi.file_wrapper'](fp, chunk)
-        else:
-            self['Content-Length'] = os.path.getsize(self.path)
-
-            def wrapper():
-                while True:
-                    data = fp.read(chunk)
-                    if not data:
-                        break
-                    yield data
-            return wrapper()
-
-
-def cache_ns_key(namespace, increment=False):
-    """
-    Returns a key with namespace value appended. If increment is True, the
-    namespace will be incremented effectively invalidating the cache.
-
-    Memcache doesn't have namespaces, but we can simulate them by storing a
-    "%(key)s_namespace" value. Invalidating the namespace simply requires
-    editing that key. Your application will no longer request the old keys,
-    and they will eventually fall off the end of the LRU and be reclaimed.
-    """
-    ns_key = 'ns:%s' % namespace
-    if increment:
-        try:
-            ns_val = cache.incr(ns_key)
-        except ValueError:
-            log.info('Cache increment failed for key: %s. Resetting.' % ns_key)
-            ns_val = epoch(datetime.datetime.now())
-            cache.set(ns_key, ns_val, None)
-    else:
-        ns_val = cache.get(ns_key)
-        if ns_val is None:
-            ns_val = epoch(datetime.datetime.now())
-            cache.set(ns_key, ns_val, None)
-    return '%s:%s' % (ns_val, ns_key)
+        return iter([])
 
 
 def get_email_backend(real_email=False):
@@ -783,53 +904,47 @@ def get_email_backend(real_email=False):
     return django.core.mail.get_connection(backend)
 
 
-def escape_all(value):
-    """Escape html in JSON value, including nested items.
-
-    Only linkify full urls, including a scheme, if "linkify_only_full" is True.
-
-    """
-    if isinstance(value, six.string_types):
-        value = jinja2.escape(force_text(value))
-        value = linkify_with_outgoing(value)
-        return value
-    elif isinstance(value, list):
-        for i, lv in enumerate(value):
-            value[i] = escape_all(lv)
-    elif isinstance(value, dict):
-        for k, lv in six.iteritems(value):
-            value[k] = escape_all(lv)
-    elif isinstance(value, Translation):
-        value = jinja2.escape(force_text(value))
-    return value
-
-
-class LocalFileStorage(FileSystemStorage):
-    """Local storage to an unregulated absolute file path.
-
-    Unregulated means that, unlike the default file storage, you can write to
-    any path on the system if you have access.
-
-    Unlike Django's default FileSystemStorage, this class behaves more like a
+class SafeStorage(FileSystemStorage):
+    """Unlike Django's default FileSystemStorage, this class behaves more like a
     "cloud" storage system. Specifically, you never have to write defensive
     code that prepares for leading directory paths to exist.
+
+    Storage is relative to settings.STORAGE_ROOT by default.
     """
 
-    def __init__(self, base_url=None):
-        super(LocalFileStorage, self).__init__(base_url=base_url)
+    DEFAULT_CHUNK_SIZE = 64 * 2**10  # 64kB
 
-    def delete(self, name):
-        """Delete a file or empty directory path.
+    root_setting = 'STORAGE_ROOT'
 
-        Unlike the default file system storage this will also delete an empty
-        directory path. This behavior is more in line with other storage
-        systems like S3.
+    def __init__(self, *args, rel_location=None, **kwargs):
+        """Default storage root can be changed with `root_setting` kwarg.
+
+        If `location` kwarg is provided then that will be used instead of default root.
+        If `rel_location` kwarg is provided then a relative path under `root_setting` is
+        used. It is an error to provide both `location` and `rel_location`.
         """
-        full_path = self.path(name)
-        if os.path.isdir(full_path):
-            os.rmdir(full_path)
+        if 'root_setting' in kwargs:
+            self.root_setting = kwargs.pop('root_setting')
+        self.rel_location = rel_location
+        assert not (rel_location is not None and kwargs.get('location') is not None), (
+            "Don't provide both location and rel_location"
+        )
+        super().__init__(*args, **kwargs)
+
+    def _clear_cached_properties(self, setting, **kwargs):
+        """Reset setting based property values."""
+        if setting == self.root_setting:
+            self.__dict__.pop('base_location', None)
+            self.__dict__.pop('location', None)
         else:
-            return super(LocalFileStorage, self).delete(name)
+            super()._clear_cached_properties(setting, **kwargs)
+
+    @cached_property
+    def base_location(self):
+        return self._value_or_setting(
+            self._location,
+            os.path.join(getattr(settings, self.root_setting), self.rel_location or ''),
+        )
 
     def _open(self, name, mode='rb'):
         if mode.startswith('w'):
@@ -842,39 +957,125 @@ class LocalFileStorage(FileSystemStorage):
                     pass
                 else:
                     raise
-        return super(LocalFileStorage, self)._open(name, mode=mode)
+        return super()._open(name, mode=mode)
 
     def path(self, name):
-        """Actual file system path to name without any safety checks."""
-        return os.path.normpath(
-            os.path.join(force_bytes(self.location), force_bytes(name)))
+        return os.path.normpath(super().path(force_str(name)))
+
+    def walk(self, path):
+        """
+        Generate the file names in a stored directory tree by walking the tree
+        top-down.
+
+        For each directory in the tree rooted at the directory top (including top
+        itself), it yields a 3-tuple (dirpath, dirnames, filenames).
+        """
+        roots = [force_str(path)]
+        while len(roots):
+            new_roots = []
+            for root in roots:
+                root = force_str(root)
+                dirs, files = self.listdir(root)
+                files = [force_str(f) for f in files]
+                dirs = [force_str(d) for d in dirs]
+                yield root, dirs, files
+                for dn in dirs:
+                    dn = force_str(dn)
+                    new_roots.append(f'{root}/{dn}')
+            roots[:] = new_roots
+
+    def copy_stored_file(self, src_path, dest_path, chunk_size=DEFAULT_CHUNK_SIZE):
+        """
+        Copy one storage path to another storage path.
+
+        Each path will be managed by the same storage implementation.
+
+        Note: both src_path and dest_path must be sub directories of self.location.
+        """
+        if src_path == dest_path:
+            return
+        with (
+            self.open(src_path, 'rb') as src,
+            self.open(dest_path, 'wb') as dest,
+        ):
+            while True:
+                chunk = src.read(chunk_size)
+                if chunk:
+                    dest.write(chunk)
+                else:
+                    break
+
+    def move_stored_file(self, src_path, dest_path, chunk_size=DEFAULT_CHUNK_SIZE):
+        """
+        Move a storage path to another storage path.
+
+        The source file will be copied to the new path then deleted.
+        This attempts to be compatible with a wide range of storage backends
+        rather than attempt to be optimized for each individual one.
+
+        Note: both src_path and dest_path must be sub directories of self.location.
+        """
+        self.copy_stored_file(src_path, dest_path, chunk_size=chunk_size)
+        self.delete(src_path)
+
+    def rm_stored_dir(self, dir_path):
+        """
+        Removes a stored directory and all files stored beneath that path.
+        """
+        empty_dirs = []
+        # Delete all files first then all empty directories.
+        for root, _dirs, files in self.walk(dir_path):
+            for fn in files:
+                self.delete(f'{root}/{fn}')
+            empty_dirs.insert(0, root)
+        empty_dirs.append(dir_path)
+        for dn in empty_dirs:
+            self.delete(dn)
 
 
-def attach_trans_dict(model, objs):
-    """Put all translations into a translations dict."""
+def attach_trans_dict(model, objs, *, field_names=None):
+    """Put all translations from either all or specified non-deferred
+    translated fields by names from objs into a translations dict on each
+    instance."""
     # Get the ids of all the translations we need to fetch.
-    fields = model._meta.translated_fields
-    ids = [getattr(obj, f.attname) for f in fields
-           for obj in objs if getattr(obj, f.attname, None) is not None]
+    try:
+        deferred_fields = objs[0].get_deferred_fields()
+    except IndexError:
+        return
+    if field_names is not None:
+        fields = [model._meta.get_field(name) for name in field_names]
+    else:
+        fields = model._meta.translated_fields
+    fields = [field for field in fields if field.attname not in deferred_fields]
+    ids = [
+        getattr(obj, field.attname)
+        for field in fields
+        for obj in objs
+        if getattr(obj, field.attname, None) is not None
+    ]
 
-    # Get translations in a dict, ids will be the keys. It's important to
-    # consume the result of sorted_groupby, which is an iterator.
-    qs = Translation.objects.filter(id__in=ids, localized_string__isnull=False)
+    if ids:
+        # Get translations in a dict, ids will be the keys. It's important to
+        # consume the result of sorted_groupby, which is an iterator.
+        qs = Translation.objects.filter(id__in=ids, localized_string__isnull=False)
+    else:
+        qs = []
     all_translations = {
-        field_id: sorted(list(translations), key=lambda t: t.locale)
+        field_id: sorted(translations, key=lambda t: t.locale)
         for field_id, translations in sorted_groupby(qs, lambda t: t.id)
     }
 
     def get_locale_and_string(translation, new_class):
         """Convert the translation to new_class (making PurifiedTranslations
-           and LinkifiedTranslations work) and return locale / string tuple."""
+        and LinkifiedTranslations work) and return locale / string tuple."""
         converted_translation = new_class()
         converted_translation.__dict__ = translation.__dict__
-        return (converted_translation.locale.lower(),
-                six.text_type(converted_translation))
+        return (converted_translation.locale.lower(), str(converted_translation))
 
     # Build and attach translations for each field on each object.
     for obj in objs:
+        if not obj:
+            continue
         obj.translations = collections.defaultdict(list)
         for field in fields:
             t_id = getattr(obj, field.attname, None)
@@ -884,7 +1085,8 @@ def attach_trans_dict(model, objs):
 
             obj.translations[t_id] = [
                 get_locale_and_string(t, field.remote_field.model)
-                for t in field_translations]
+                for t in field_translations
+            ]
 
 
 def rm_local_tmp_dir(path):
@@ -894,9 +1096,9 @@ def rm_local_tmp_dir(path):
     certain that your executing code is operating on a local temp dir, not a
     directory managed by the Django Storage API.
     """
-    path = force_text(path)
-    tmp_path = force_text(settings.TMP_PATH)
-    assert path.startswith(tmp_path)
+    path = force_str(path)
+    tmp_path = force_str(settings.TMP_PATH)
+    assert path.startswith((tmp_path, tempfile.gettempdir()))
     return shutil.rmtree(path)
 
 
@@ -918,10 +1120,10 @@ def timer(*func, **kwargs):
             if test_only and not settings.IN_TEST_SUITE:
                 return func(*args, **kw)
             else:
-                name = (key if key else
-                        '%s.%s' % (func.__module__, func.__name__))
+                name = key if key else f'{func.__module__}.{func.__name__}'
                 with statsd.timer('timer.%s' % name):
                     return func(*args, **kw)
+
         return wrapper
 
     if func:
@@ -952,30 +1154,100 @@ def find_language(locale):
     return None
 
 
-def has_links(html):
-    """Return True if links (text or markup) are found in the given html."""
-    # Call bleach.linkify to transform text links to real links, and add some
-    # content to the ``href`` attribute. If the result is different from the
-    # initial string, links were found.
-    class LinkFound(Exception):
-        pass
+def has_urls(content):
+    """Return True if URLs are found in the given html."""
 
-    def raise_on_link(attrs, new):
-        raise LinkFound
+    return URL_RE.search(content) if content else False
 
-    try:
-        bleach.linkify(html, callbacks=[raise_on_link])
-    except LinkFound:
-        return True
-    return False
+
+def verify_condition_with_locales(*, value, check_function, form=None, field_name=None):
+    """
+    Check that the given `check_function` function does not raise a ValidationError
+    for the given `value`. If `value` is a `dict`, it assumes the keys are
+    locales and the values are translations in those locales.
+
+    `form` and `field_name` can be passed to transform to ValidationError that
+    would be raised into a locale-aware error message that is added to the
+    form.
+    """
+
+    if not isinstance(value, dict):
+        check_function(value)
+    else:
+        for locale, localized_name in value.items():
+            try:
+                check_function(localized_name)
+            except forms.ValidationError as exc:
+                if form is not None and field_name is not None:
+                    for message in exc.messages:
+                        error_message = LocaleErrorMessage(
+                            message=message, locale=locale
+                        )
+                        form.add_error(field_name, error_message)
+                else:
+                    raise
+
+
+def validate_name(
+    name,
+    *,
+    check_function,
+    error_message=None,
+    form=None,
+    field_name='name',
+):
+    """Validate a name like field value by applying the check_function over the
+    value (going over each locale if the value is a dict) and all lowercase
+    homoglyphs variants after normalization.
+
+    Raises an error if a value has too many homoglyph variants."""
+    if error_message is None:
+        error_message = _('This name cannot be used.')
+
+    def variant_checker(name):
+        normalized_name = normalize_string_for_name_checks(
+            name, categories_to_strip=('P')
+        ).lower()
+
+        variants = generate_lowercase_homoglyphs_variants_for_string(
+            normalize_string_for_name_checks(name)
+        )
+
+        for index, variant in enumerate(variants):
+            if index > 65535:
+                # index > 65535 means over 16 confusable characters with 2
+                # variants each. That name is likely suspicious, and it's too
+                # expensive to continue anyway. Reject it immediately.
+                raise forms.ValidationError(error_message)
+
+            if check_function:
+                check_function(normalized_name, variant)
+
+    verify_condition_with_locales(
+        value=name, check_function=variant_checker, form=form, field_name=field_name
+    )
+    return name
+
+
+def verify_no_urls(value, *, form=None, field_name=None):
+    def _check(value):
+        if has_urls(value):
+            raise forms.ValidationError(_('URLs are not allowed.'))
+
+    verify_condition_with_locales(
+        value=value, check_function=_check, form=form, field_name=field_name
+    )
+    return value
 
 
 def walkfiles(folder, suffix=''):
     """Iterator over files in folder, recursively."""
-    return (os.path.join(basename, filename)
-            for basename, dirnames, filenames in scandir.walk(folder)
-            for filename in filenames
-            if filename.endswith(suffix))
+    return (
+        os.path.join(basename, filename)
+        for basename, dirnames, filenames in os.walk(folder)
+        for filename in filenames
+        if filename.endswith(suffix)
+    )
 
 
 def utc_millesecs_from_epoch(for_datetime=None):
@@ -985,7 +1257,7 @@ def utc_millesecs_from_epoch(for_datetime=None):
     If `for_datetime` is None, the current datetime will be used.
     """
     if not for_datetime:
-        for_datetime = datetime.datetime.now()
+        for_datetime = datetime.now()
     # Number of seconds.
     seconds = time.mktime(for_datetime.utctimetuple())
     # timetuple() doesn't care about more precision than seconds, but we do.
@@ -998,34 +1270,215 @@ def utc_millesecs_from_epoch(for_datetime=None):
 def extract_colors_from_image(path):
     try:
         image_colors = colorgram.extract(path, 6)
-        colors = [{
-            'h': color.hsl.h,
-            's': color.hsl.s,
-            'l': color.hsl.l,
-            'ratio': color.proportion
-        } for color in image_colors]
-    except IOError:
+        colors = [
+            {
+                'h': color.hsl.h,
+                's': color.hsl.s,
+                'l': color.hsl.l,
+                'ratio': color.proportion,
+            }
+            for color in image_colors
+        ]
+    except OSError:
         colors = None
     return colors
+
+
+def use_fake_fxa(config):
+    """Return whether or not to use a fake FxA server for authentication.
+    Should always return False in non-local environments"""
+    return settings.ENV in ('local', 'test') and config.get('client_id') == ''
 
 
 class AMOJSONEncoder(JSONEncoder):
     def default(self, obj):
         if isinstance(obj, Translation):
-            return force_text(obj)
-        return super(AMOJSONEncoder, self).default(obj)
+            return force_str(obj)
+        return super().default(obj)
 
 
-class StopWatch():
+class StopWatch:
+    _timestamp = None
+
     def __init__(self, label_prefix=''):
         self.prefix = label_prefix
 
     def start(self):
-        self._timestamp = datetime.datetime.utcnow()
+        self._timestamp = datetime.now(UTC)
 
     def log_interval(self, label):
-        now = datetime.datetime.utcnow()
+        if not self._timestamp:
+            return
+        now = datetime.now(UTC)
         statsd.timing(self.prefix + label, now - self._timestamp)
-        log.debug(
-            "%s: %s", self.prefix + label, now - self._timestamp)
+        log.info('%s: %s', self.prefix + label, now - self._timestamp)
         self._timestamp = now
+
+
+class HttpResponseTemporaryRedirect(HttpResponseRedirectBase):
+    """This is similar to a 302 but keeps the request method and body so we can
+    redirect POSTs too."""
+
+    status_code = 307
+
+
+class HttpResponseURITooLong(HttpResponse):
+    status_code = 414
+
+
+def is_safe_url(url, request, allowed_hosts=None):
+    """Use Django's `url_has_allowed_host_and_scheme()` and pass a configured
+    list of allowed hosts and enforce HTTPS.  `allowed_hosts` can be specified."""
+    if not allowed_hosts:
+        allowed_hosts = (settings.DOMAIN,)
+        if settings.ADDONS_FRONTEND_PROXY_PORT:
+            allowed_hosts = allowed_hosts + (
+                f'{settings.DOMAIN}:{settings.ADDONS_FRONTEND_PROXY_PORT}',
+            )
+
+    require_https = request.is_secure() if request else False
+    return url_has_allowed_host_and_scheme(
+        url, allowed_hosts=allowed_hosts, require_https=require_https
+    )
+
+
+def id_to_path(pk, breadth=1):
+    """
+    Generate a path from a pk, to distribute folders in the file system. There
+    are 2 sublevels made from the last digits of the pk.
+
+    The breadth argument (defaults to 1) controls the number of digits used at
+    each sublevel. Zero-padding is applied to always have a fixed number of
+    directories for each sublevel.
+
+    At breadth=1, there should be 10 * 10 * x directories, resulting in:
+    1 => 1/01/1
+    12 => 2/12/12
+    123456 => 6/56/123456
+
+
+    At breadth=2, there should be 100 * 100 * x directories, resulting in:
+    1 => 01/0001/1
+    12 => 12/0012/12
+    123 => 23/0123/0123
+    1234 => 34/1234/1234
+    123456 => 56/3456/123456
+    123456789 => 89/6789/123456789
+    """
+    pk = str(pk)
+    padded_pk = pk.zfill(2 * breadth)
+    path = [padded_pk[-breadth:], padded_pk[-breadth * 2 :]]
+    # We always append the unpadded pk as the final directory.
+    path.append(pk)
+    return os.path.join(*path)
+
+
+class BaseModelSerializerAndFormMixin:
+    """
+    Base mixin to apply custom behavior to our ModelForms and ModelSerializers.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.set_max_length_on_fields_where_necessary()
+
+    def set_max_length_on_fields_where_necessary(self):
+        """
+        Automatically set max_length and associated validator on fields that
+        map to a model field where it's already set.
+
+        Allow declaring custom fields without having to re-declare the same
+        max_length for those fields.
+
+        Should be called at __init__() time."""
+        for field_name, field in self.fields.items():
+            if getattr(field, 'read_only', False):
+                continue
+            source = getattr(field, 'source', field_name)
+            if getattr(field, 'max_length', None) is None and self.Meta.model:
+                try:
+                    model_field = self.Meta.model._meta.get_field(source)
+                except FieldDoesNotExist:
+                    continue
+                if (max_length := getattr(model_field, 'max_length', None)) is not None:
+                    field.max_length = max_length
+                    # Normally setting max_length on the field would be enough,
+                    # but because we're late, after the field's __init__(), we
+                    # also need to:
+                    # - Update the widget attributes again, for form fields
+                    if hasattr(field, 'widget'):
+                        field.widget.attrs.update(field.widget_attrs(field.widget))
+                        # - Update the sub-widgets too if there are any (our
+                        #   translations widgets work like that)
+                        if hasattr(field.widget, 'widgets'):
+                            for widget in field.widget.widgets:
+                                widget.attrs.update(field.widget_attrs(widget))
+                    # - Convert that max_length into a validator ourselves if
+                    #   the field requires it. Unfortunately some fields
+                    #   (FileField) do not work like that and instead deal with
+                    #   max_length dynamically, with a custom error message
+                    #   that is generated dynamically, so we need to avoid
+                    #   those. If a compatible error message for max_length is
+                    #   set, or no message at all, we're good.
+                    message = getattr(field, 'error_messages', {}).get('max_length')
+                    if message is None or re.findall(r'\{.*?\}', str(message)) == [
+                        '{max_length}'
+                    ]:
+                        if message:
+                            message = lazy_format(
+                                field.error_messages['max_length'],
+                                max_length=field.max_length,
+                            )
+                        field.validators.append(
+                            MaxLengthValidator(field.max_length, message=message)
+                        )
+
+
+def backup_storage_enabled():
+    return bool(
+        settings.GOOGLE_APPLICATION_CREDENTIALS_STORAGE
+        and settings.GOOGLE_STORAGE_REPORTED_CONTENT_BUCKET
+    )
+
+
+def backup_storage_blob(backup_file_name_remote):
+    storage_client = google_storage.Client.from_service_account_json(
+        settings.GOOGLE_APPLICATION_CREDENTIALS_STORAGE
+    )
+    bucket = storage_client.bucket(settings.GOOGLE_STORAGE_REPORTED_CONTENT_BUCKET)
+    return bucket.blob(backup_file_name_remote)
+
+
+def copy_file_to_backup_storage(local_file_path, content_type):
+    with open(local_file_path, 'rb') as f:
+        hash_ = hashlib.sha256(f.read())
+    # The path itself is also part of the hash, so that we store different
+    # copies for different types and owners of content (2 different UserProfile
+    # or one UserProfile and one Addon should have different backup copies)
+    hash_.update(os.path.abspath(local_file_path).encode('utf-8'))
+    ext = guess_extension(content_type)
+    backup_file_name_remote = f'{hash_.hexdigest()}{ext}'
+    blob = backup_storage_blob(backup_file_name_remote)
+    # If the object already exists, generation_match_precondition set to 0 will
+    # force the upload to fail. We want that, we don't need a second copy as
+    # the name is based on the hash of the file.
+    generation_match_precondition = 0
+    try:
+        blob.upload_from_filename(
+            local_file_path, if_generation_match=generation_match_precondition
+        )
+    except PreconditionFailed:
+        pass
+    return backup_file_name_remote
+
+
+def create_signed_url_for_file_backup(backup_file_name_remote):
+    blob = backup_storage_blob(backup_file_name_remote)
+    return blob.generate_signed_url(
+        expiration=timedelta(days=REPORTED_MEDIA_BACKUP_EXPIRATION_DAYS)
+    )
+
+
+def download_file_contents_from_backup_storage(backup_file_name_remote):
+    blob = backup_storage_blob(backup_file_name_remote)
+    return blob.download_as_bytes()

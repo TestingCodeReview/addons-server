@@ -1,11 +1,7 @@
 import pytest
 
 from olympia.translations.models import Translation
-from olympia.translations.utils import (
-    transfield_changed, truncate, truncate_text)
-
-
-pytestmark = pytest.mark.django_db
+from olympia.translations.utils import transfield_changed, truncate, truncate_text
 
 
 def test_truncate_text():
@@ -22,22 +18,22 @@ def test_truncate():
     assert truncate(s, 100) == s
     assert truncate(s, 6) == '<p>one</p><ol><li>two...</li></ol>'
     assert truncate(s, 5, True) == '<p>one</p><ol><li>tw...</li></ol>'
-    assert truncate(s, 11) == (
-        '<p>one</p><ol><li>two</li><li>three...</li></ol>')
-    assert truncate(s, 15) == (
-        '<p>one</p><ol><li>two</li><li>three</li></ol>four...')
+    assert truncate(s, 11) == ('<p>one</p><ol><li>two</li><li>three...</li></ol>')
+    assert truncate(s, 15) == ('<p>one</p><ol><li>two</li><li>three</li></ol>four...')
     assert truncate(s, 13, True, 'xxx') == (
-        '<p>one</p><ol><li>two</li><li>three</li></ol>foxxx')
+        '<p>one</p><ol><li>two</li><li>three</li></ol>foxxx'
+    )
 
 
+@pytest.mark.django_db
 def test_transfield_changed():
     initial = {
         'some_field': 'some_val',
         'name_en-us': Translation.objects.create(
-            id=500, locale='en-us', localized_string='test_name')
+            id=500, locale='en-us', localized_string='test_name'
+        ),
     }
-    data = {'some_field': 'some_val',
-            'name': {'init': '', 'en-us': 'test_name'}}
+    data = {'some_field': 'some_val', 'name': {'init': '', 'en-us': 'test_name'}}
 
     # No change.
     assert transfield_changed('name', initial, data) == 0
@@ -49,7 +45,8 @@ def test_transfield_changed():
     # New localization.
     data['name']['en-us'] = 'test_name'
     data['name']['en-af'] = Translation.objects.create(
-        id=505, locale='en-af', localized_string='test_name_localized')
+        id=505, locale='en-af', localized_string='test_name_localized'
+    )
     assert transfield_changed('name', initial, data) == 1
 
     # Deleted localization.

@@ -2,7 +2,14 @@
 Signing
 =======
 
-.. note:: This API requires :doc:`authentication <auth>`.
+.. warning::
+
+    These v3 APIs are now deprecated and you should switch to a newer version before
+    it is removed. See :ref:`the API versions available<api-versions-list>` for details
+    of the different API versions available and the deprecation timeline.
+
+.. note::
+    This API requires :doc:`authentication <auth>`.
 
 The following API endpoints help you get your add-on signed by Mozilla
 so it can be installed into Firefox without error. See
@@ -15,7 +22,7 @@ Client Libraries
 
 The following libraries will make it easier to use the signing API:
 
-* `sign-addon <https://github.com/mozilla/sign-addon/>`_, for general programattic use in
+* `sign-addon <https://github.com/mozilla/sign-addon/>`_, for general programmatic use in
   `NodeJS <https://nodejs.org/>`_
 * `web-ext sign <https://developer.mozilla.org/en-US/Add-ons/WebExtensions/Getting_started_with_web-ext#Signing_your_extension_for_distribution>`_,
   for developing `Web Extensions <https://developer.mozilla.org/en-US/Add-ons/WebExtensions>`_
@@ -166,7 +173,7 @@ automatically or after a manual review. Once review is complete then the
                 "automated_signing": true,
                 "files": [
                     {
-                        "download_url": "https://addons.mozilla.org/api/v3/downloads/file/100/example-id.0-fx+an.xpi?src=api",
+                        "download_url": "https://addons.mozilla.org/api/v3/downloads/file/100/example-id.0-fx+an.xpi",
                         "hash": "sha256:1bb945266bf370170a656350d9b640cbcaf70e671cf753c410e604219cdd9267",
                         "signed": true
                     }
@@ -226,7 +233,7 @@ This endpoint returns the actual file data for download.
 
     .. sourcecode:: bash
 
-        curl "https://addons.mozilla.org/api/v3/file/123/some-addon.xpi?src=api"
+        curl "https://addons.mozilla.org/api/v3/file/123/some-addon.xpi"
             -g -H "Authorization: JWT <jwt-token>"
 
     :param file_id: the primary key of the add-on file.

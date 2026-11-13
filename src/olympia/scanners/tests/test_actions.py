@@ -1,0 +1,1902 @@
+import json
+import uuid
+from datetime import datetime, timedelta
+from unittest import mock
+
+from django.conf import settings
+from django.core import mail
+from django.urls import reverse
+
+import pytest
+import responses
+
+from olympia import amo
+from olympia.abuse.models import CinderJob, CinderPolicy, ContentDecision
+from olympia.activity.models import ActivityLog
+from olympia.amo.tests import (
+    TestCase,
+    addon_factory,
+    user_factory,
+    version_factory,
+)
+from olympia.blocklist.models import Block, BlocklistSubmission, BlockType, BlockVersion
+from olympia.constants.abuse import DECISION_ACTIONS, POLICY_EXPOSURE
+from olympia.constants.scanners import (
+    DELAY_AUTO_APPROVAL,
+    DELAY_AUTO_APPROVAL_INDEFINITELY,
+    DISABLE_AND_BLOCK,
+    FLAG_FOR_HUMAN_REVIEW,
+    NO_ACTION,
+    YARA,
+)
+from olympia.files.models import FileUpload
+from olympia.reviewers.models import UsageTier
+from olympia.scanners.actions import (
+    _delay_auto_approval,
+    _delay_auto_approval_indefinitely,
+    _delay_auto_approval_indefinitely_and_restrict,
+    _delay_auto_approval_indefinitely_and_restrict_future_approvals,
+    _disable_and_block,
+    _flag_for_human_review,
+    _no_action,
+)
+from olympia.scanners.models import (
+    ScannerResult,
+    ScannerRule,
+)
+from olympia.users.models import (
+    RESTRICTION_TYPES,
+    EmailUserRestriction,
+    IPNetworkUserRestriction,
+)
+
+
+class TestActions(TestCase):
+    def setUp(self):
+        user_factory(pk=settings.TASK_USER_ID)
+        self.cinder_create_decision_url = (
+            f'{settings.CINDER_SERVER_URL}v1/create_decision'
+        )
+        responses.add_callback(
+            responses.POST,
+            self.cinder_create_decision_url,
+            callback=lambda r: (201, {}, json.dumps({'uuid': uuid.uuid4().hex})),
+        )
+
+    def test_action_does_nothing(self):
+        version = version_factory(addon=addon_factory())
+        _no_action(version=version, rule=None)
+
+    def test_flags_a_version_for_human_review(self):
+        version = version_factory(addon=addon_factory())
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        # We'll return True because there is an active scanner NHR (that we created).
+        assert _flag_for_human_review(version=version, rule=None)
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        assert (
+            version.needshumanreview_set.get().reason
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
+        )
+
+    def test_does_not_flag_for_human_review_twice_still_active(self):
+        version = version_factory(addon=addon_factory())
+        nhr = version.needshumanreview_set.create(
+            reason=version.needshumanreview_set.model.REASONS.SCANNER_ACTION,
+            is_active=True,
+        )
+
+        # We'll return True because there is an active scanner NHR...
+        assert _flag_for_human_review(version=version, rule=None)
+
+        # ... But we haven't added an extra flag.
+        assert (
+            version.needshumanreview_set.filter(
+                reason=version.needshumanreview_set.model.REASONS.SCANNER_ACTION
+            ).count()
+            == 1
+        )
+
+        # The original one is still here and still active.
+        assert nhr.reload().is_active
+
+    def test_does_not_flag_for_human_review_twice_inactive(self):
+        version = version_factory(addon=addon_factory())
+        nhr = version.needshumanreview_set.create(
+            reason=version.needshumanreview_set.model.REASONS.SCANNER_ACTION,
+            is_active=False,
+        )
+
+        # We'll return False because there is a scanner NHR but it's inactive.
+        assert not _flag_for_human_review(version=version, rule=None)
+
+        # ... But we haven't added an extra flag.
+        assert (
+            version.needshumanreview_set.filter(
+                reason=version.needshumanreview_set.model.REASONS.SCANNER_ACTION
+            ).count()
+            == 1
+        )
+
+        # The original one is still here and still inactive.
+        assert not nhr.reload().is_active
+
+    def test_delay_auto_approval(self):
+        addon = addon_factory(file_kw={'status': amo.STATUS_AWAITING_REVIEW})
+        version = addon.current_version
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval(version=version, rule=None)
+        self.assertCloseToNow(
+            addon.auto_approval_delayed_until,
+            now=datetime.now() + timedelta(hours=24),
+        )
+        self.assertCloseToNow(
+            addon.auto_approval_delayed_until_unlisted,
+            now=datetime.now() + timedelta(hours=24),
+        )
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        self.assertCloseToNow(
+            version.due_date,
+            now=datetime.now() + timedelta(hours=24),
+        )
+        assert (
+            version.needshumanreview_set.get().reason
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
+        )
+
+    def test_delay_auto_approval_overwrite_null(self):
+        addon = addon_factory(
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+        )
+        version = addon.current_version
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval(version=version, rule=None)
+        self.assertCloseToNow(
+            addon.auto_approval_delayed_until,
+            now=datetime.now() + timedelta(hours=24),
+        )
+        self.assertCloseToNow(
+            addon.auto_approval_delayed_until_unlisted,
+            now=datetime.now() + timedelta(hours=24),
+        )
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        self.assertCloseToNow(
+            version.due_date,
+            now=datetime.now() + timedelta(hours=24),
+        )
+        assert version.needshumanreview_set.count() == 1
+        assert (
+            version.needshumanreview_set.get().reason
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
+        )
+
+    def test_delay_auto_approval_overwrite_existing_lower_delay_on_right_channels(self):
+        addon = addon_factory(
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+            reviewer_flags={
+                'auto_approval_delayed_until': datetime.now() + timedelta(days=2),
+                'auto_approval_delayed_until_unlisted': datetime.now()
+                - timedelta(days=2),
+            },
+        )
+        version = addon.current_version
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        self.assertCloseToNow(
+            addon.auto_approval_delayed_until, now=datetime.now() + timedelta(days=2)
+        )
+        self.assertCloseToNow(
+            addon.auto_approval_delayed_until_unlisted,
+            now=datetime.now() - timedelta(days=2),
+        )
+        _delay_auto_approval(version=version, rule=None)
+        self.assertCloseToNow(
+            addon.auto_approval_delayed_until, now=datetime.now() + timedelta(days=2)
+        )
+        self.assertCloseToNow(
+            addon.auto_approval_delayed_until_unlisted,
+            now=datetime.now() + timedelta(hours=24),
+        )
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        # due date _was_ set to in 24 hours no matter what since it's per-version.
+        self.assertCloseToNow(
+            version.due_date,
+            now=datetime.now() + timedelta(hours=24),
+        )
+        assert version.needshumanreview_set.count() == 1
+        assert (
+            version.needshumanreview_set.get().reason
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
+        )
+
+    def test_delay_auto_approval_dont_overwrite_existing_higher_delay(self):
+        addon = addon_factory(
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+            reviewer_flags={
+                'auto_approval_delayed_until': datetime.now() + timedelta(days=2),
+                'auto_approval_delayed_until_unlisted': datetime.now()
+                + timedelta(days=2),
+            },
+        )
+        version = addon.current_version
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        self.assertCloseToNow(
+            addon.auto_approval_delayed_until, now=datetime.now() + timedelta(days=2)
+        )
+        self.assertCloseToNow(
+            addon.auto_approval_delayed_until_unlisted,
+            now=datetime.now() + timedelta(days=2),
+        )
+        _delay_auto_approval(version=version, rule=None)
+        self.assertCloseToNow(
+            addon.auto_approval_delayed_until, now=datetime.now() + timedelta(days=2)
+        )
+        self.assertCloseToNow(
+            addon.auto_approval_delayed_until_unlisted,
+            now=datetime.now() + timedelta(days=2),
+        )
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        # due date _was_ set to in 24 hours no matter what since it's per-version.
+        self.assertCloseToNow(
+            version.due_date,
+            now=datetime.now() + timedelta(hours=24),
+        )
+        assert version.needshumanreview_set.count() == 1
+        assert (
+            version.needshumanreview_set.get().reason
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
+        )
+
+    def test_delay_auto_approval_overwrite_existing_lower_delay(self):
+        addon = addon_factory(
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+            reviewer_flags={'auto_approval_delayed_until': datetime.now()},
+        )
+        version = addon.current_version
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        self.assertCloseToNow(addon.auto_approval_delayed_until, now=datetime.now())
+        assert addon.auto_approval_delayed_until_unlisted is None
+        _delay_auto_approval(version=version, rule=None)
+        self.assertCloseToNow(
+            addon.auto_approval_delayed_until, now=datetime.now() + timedelta(hours=24)
+        )
+        self.assertCloseToNow(
+            addon.auto_approval_delayed_until_unlisted,
+            now=datetime.now() + timedelta(hours=24),
+        )
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        # due date _was_ set to in 24 hours no matter what since it's per-version.
+        self.assertCloseToNow(
+            version.due_date,
+            now=datetime.now() + timedelta(hours=24),
+        )
+        assert version.needshumanreview_set.count() == 1
+        assert (
+            version.needshumanreview_set.get().reason
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
+        )
+
+    def test_delay_auto_approval_existing_due_date_older(self):
+        addon = addon_factory(
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+            reviewer_flags={'auto_approval_disabled': True},
+            version_kw={'due_date': self.days_ago(1)},
+        )
+        version = addon.current_version
+        self.assertCloseToNow(version.due_date, now=self.days_ago(1))
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval(version=version, rule=None)
+        addon.reviewerflags.reload()
+        self.assertCloseToNow(
+            addon.auto_approval_delayed_until,
+            now=datetime.now() + timedelta(hours=24),
+        )
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        # We kept the original due date as it's shorter.
+        self.assertCloseToNow(version.due_date, now=self.days_ago(1))
+        assert version.needshumanreview_set.count() == 1
+        assert (
+            version.needshumanreview_set.get().reason
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
+        )
+
+    def test_delay_auto_approval_existing_due_date_newer(self):
+        addon = addon_factory(
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+            reviewer_flags={'auto_approval_disabled': True},
+            version_kw={'due_date': datetime.now() + timedelta(hours=72)},
+        )
+        version = addon.current_version
+        self.assertCloseToNow(
+            version.due_date,
+            now=datetime.now() + timedelta(hours=72),
+        )
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval(version=version, rule=None)
+        addon.reviewerflags.reload()
+        self.assertCloseToNow(
+            addon.auto_approval_delayed_until,
+            now=datetime.now() + timedelta(hours=24),
+        )
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        # We overrode the due date with 24 hours so that it goes back to the
+        # top of the queue.
+        self.assertCloseToNow(
+            version.due_date,
+            now=datetime.now() + timedelta(hours=24),
+        )
+        assert version.needshumanreview_set.count() == 1
+        assert (
+            version.needshumanreview_set.get().reason
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
+        )
+
+    def test_delay_auto_approval_already_flagged_active(self):
+        addon = addon_factory(file_kw={'status': amo.STATUS_AWAITING_REVIEW})
+        version = addon.current_version
+        # Create an existing active flag.
+        version.needshumanreview_set.create(
+            reason=version.needshumanreview_set.model.REASONS.SCANNER_ACTION,
+            is_active=True,
+        )
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval(version=version, rule=None)
+        # Everything still happening as normal, an active flag doesn't prevent
+        # the action from running.
+        self.assertCloseToNow(
+            addon.auto_approval_delayed_until,
+            now=datetime.now() + timedelta(hours=24),
+        )
+        self.assertCloseToNow(
+            addon.auto_approval_delayed_until_unlisted,
+            now=datetime.now() + timedelta(hours=24),
+        )
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        self.assertCloseToNow(
+            version.due_date,
+            now=datetime.now() + timedelta(hours=24),
+        )
+        # We haven't flagged it multiple times.
+        assert version.needshumanreview_set.count() == 1
+
+    def test_delay_auto_approval_already_flagged_inactive(self):
+        addon = addon_factory(file_kw={'status': amo.STATUS_AWAITING_REVIEW})
+        version = addon.current_version
+        # Create an existing inactive flag.
+        version.needshumanreview_set.create(
+            reason=version.needshumanreview_set.model.REASONS.SCANNER_ACTION,
+            is_active=False,
+        )
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval(version=version, rule=None)
+        # An inactive scanner action NHR flag means we shouldn't execute the
+        # action.
+        assert not addon.auto_approval_delayed_until
+        assert not addon.auto_approval_delayed_until_unlisted
+
+        # We shouldn't re-flag either.
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        assert not version.due_date
+
+    def test_delay_auto_approval_indefinitely(self):
+        addon = addon_factory(file_kw={'status': amo.STATUS_AWAITING_REVIEW})
+        version = addon.current_version
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval_indefinitely(version=version, rule=None)
+        assert addon.auto_approval_delayed_until == datetime.max
+        assert addon.auto_approval_delayed_until_unlisted == datetime.max
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        assert version.needshumanreview_set.count() == 1
+        assert (
+            version.needshumanreview_set.get().reason
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
+        )
+
+    def test_delay_auto_approval_indefinitely_overwrite_existing(self):
+        addon = addon_factory(
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+            reviewer_flags={'auto_approval_delayed_until': datetime.now()},
+        )
+        version = addon.current_version
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        self.assertCloseToNow(addon.auto_approval_delayed_until)
+        assert addon.auto_approval_delayed_until_unlisted is None
+        _delay_auto_approval_indefinitely(version=version, rule=None)
+        addon.reviewerflags.reload()
+        assert addon.auto_approval_delayed_until == datetime.max
+        assert addon.auto_approval_delayed_until_unlisted == datetime.max
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        assert version.needshumanreview_set.count() == 1
+        assert (
+            version.needshumanreview_set.get().reason
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
+        )
+
+    def test_delay_auto_approval_indefinitely_overwrite_existing_unlisted(self):
+        addon = addon_factory(
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+            reviewer_flags={'auto_approval_delayed_until_unlisted': datetime.now()},
+        )
+        version = addon.current_version
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        assert addon.auto_approval_delayed_until is None
+        self.assertCloseToNow(addon.auto_approval_delayed_until_unlisted)
+        _delay_auto_approval_indefinitely(version=version, rule=None)
+        addon.reviewerflags.reload()
+        assert addon.auto_approval_delayed_until == datetime.max
+        assert addon.auto_approval_delayed_until_unlisted == datetime.max
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        assert version.needshumanreview_set.count() == 1
+        assert (
+            version.needshumanreview_set.get().reason
+            == version.needshumanreview_set.model.REASONS.SCANNER_ACTION
+        )
+
+    def test_delay_auto_approval_indefinitely_already_flagged_active(self):
+        addon = addon_factory(file_kw={'status': amo.STATUS_AWAITING_REVIEW})
+        version = addon.current_version
+        # Create an existing active flag.
+        version.needshumanreview_set.create(
+            reason=version.needshumanreview_set.model.REASONS.SCANNER_ACTION,
+            is_active=True,
+        )
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval_indefinitely(version=version, rule=None)
+        # Everything still happening as normal, an active flag doesn't prevent
+        # the action from running.
+        assert addon.auto_approval_delayed_until == datetime.max
+        assert addon.auto_approval_delayed_until_unlisted == datetime.max
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        assert version.due_date
+        # We haven't flagged it multiple times.
+        assert version.needshumanreview_set.count() == 1
+
+    def test_delay_auto_approval_indefinitely_already_flagged_inactive(self):
+        addon = addon_factory(file_kw={'status': amo.STATUS_AWAITING_REVIEW})
+        version = addon.current_version
+        # Create an existing inactive flag.
+        version.needshumanreview_set.create(
+            reason=version.needshumanreview_set.model.REASONS.SCANNER_ACTION,
+            is_active=False,
+        )
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval_indefinitely(version=version, rule=None)
+        # An inactive scanner action NHR flag means we shouldn't execute the
+        # action.
+        assert not addon.auto_approval_delayed_until
+        assert not addon.auto_approval_delayed_until_unlisted
+
+        # We shouldn't re-flag either.
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        assert not version.due_date
+
+    def test_delay_auto_approval_indefinitely_and_restrict(self):
+        user1 = user_factory(last_login_ip='5.6.7.8')
+        user2 = user_factory(last_login_ip='')
+        user3 = user_factory()
+        user4 = user_factory(last_login_ip='4.8.15.16')
+        addon = addon_factory(users=[user1, user2])
+        FileUpload.objects.create(
+            addon=addon,
+            user=user3,
+            version=addon.current_version.version,
+            ip_address='1.2.3.4',
+            source=amo.UPLOAD_SOURCE_DEVHUB,
+            channel=amo.CHANNEL_LISTED,
+        )
+        version = addon.current_version
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval_indefinitely_and_restrict(version=version, rule=None)
+        assert addon.auto_approval_delayed_until == datetime.max
+        assert addon.auto_approval_delayed_until_unlisted == datetime.max
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        assert EmailUserRestriction.objects.filter(
+            email_pattern=user1.email,
+            restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION,
+        ).exists()
+        assert EmailUserRestriction.objects.filter(
+            email_pattern=user2.email,
+            restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION,
+        ).exists()
+        assert EmailUserRestriction.objects.filter(
+            email_pattern=user3.email,
+            restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION,
+        ).exists()
+        assert not EmailUserRestriction.objects.filter(
+            email_pattern=user4.email
+        ).exists()
+        for restriction in EmailUserRestriction.objects.all():
+            assert restriction.reason == (
+                'Automatically added because of a match by rule "None" on '
+                f'Addon {addon.pk} Version {addon.current_version.pk}.'
+            )
+
+        assert IPNetworkUserRestriction.objects.filter(
+            network='5.6.7.8/32', restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION
+        ).exists()
+        assert IPNetworkUserRestriction.objects.filter(
+            network='1.2.3.4/32', restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION
+        ).exists()
+        assert not IPNetworkUserRestriction.objects.filter(network=None).exists()
+        assert not IPNetworkUserRestriction.objects.filter(network='').exists()
+        assert not IPNetworkUserRestriction.objects.filter(
+            restriction_type=RESTRICTION_TYPES.ADDON_APPROVAL
+        ).exists()
+        assert not EmailUserRestriction.objects.filter(
+            restriction_type=RESTRICTION_TYPES.ADDON_APPROVAL
+        ).exists()
+        for restriction in IPNetworkUserRestriction.objects.all():
+            assert restriction.reason == (
+                'Automatically added because of a match by rule "None" on '
+                f'Addon {addon.pk} Version {addon.current_version.pk}.'
+            )
+
+    def test_delay_auto_approval_indefinitely_and_restrict_with_ipv6(self):
+        user1 = user_factory(last_login_ip='2001:0db8:4815:1623:4200:1337:cafe:d00d')
+        user2 = user_factory(last_login_ip='')
+        user3 = user_factory()
+        addon = addon_factory(users=[user1, user2])
+        FileUpload.objects.create(
+            addon=addon,
+            user=user3,
+            version=addon.current_version.version,
+            ip_address='1.2.3.4',
+            source=amo.UPLOAD_SOURCE_DEVHUB,
+            channel=amo.CHANNEL_LISTED,
+        )
+        version = addon.current_version
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval_indefinitely_and_restrict(version=version, rule=None)
+
+        # For IPv6, the /64 was restricted.
+        assert IPNetworkUserRestriction.objects.filter(
+            network='2001:db8:4815:1623::/64',
+            restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION,
+        ).exists()
+        # For IPv4, the /32 (equivalent to that single IP) was restricted.
+        assert IPNetworkUserRestriction.objects.filter(
+            network='1.2.3.4/32', restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION
+        ).exists()
+        assert not IPNetworkUserRestriction.objects.filter(network=None).exists()
+        assert not IPNetworkUserRestriction.objects.filter(network='').exists()
+        assert not IPNetworkUserRestriction.objects.filter(
+            restriction_type=RESTRICTION_TYPES.ADDON_APPROVAL
+        ).exists()
+
+        for restriction in IPNetworkUserRestriction.objects.all():
+            assert restriction.reason == (
+                'Automatically added because of a match by rule "None" on '
+                f'Addon {addon.pk} Version {addon.current_version.pk}.'
+            )
+
+    def test_delay_auto_approval_indefinitely_and_restrict_already_restricted(self):
+        user1 = user_factory(last_login_ip='5.6.7.8')
+        user2 = user_factory(last_login_ip='', email='foo+variant@example.com')
+        user3 = user_factory(email='foo@example.com')
+        user4 = user_factory(last_login_ip='4.8.15.16')
+        existing_restriction1 = EmailUserRestriction.objects.create(
+            email_pattern=user1.email
+        )
+        existing_restriction2 = EmailUserRestriction.objects.create(
+            email_pattern=user3.email
+        )
+        existing_restriction3 = IPNetworkUserRestriction.objects.create(
+            network='5.6.7.8/32'
+        )
+        addon = addon_factory(users=[user1, user2])
+        FileUpload.objects.create(
+            addon=addon,
+            user=user3,
+            version=addon.current_version.version,
+            ip_address='1.2.3.4',
+            source=amo.UPLOAD_SOURCE_DEVHUB,
+            channel=amo.CHANNEL_LISTED,
+        )
+        version = addon.current_version
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval_indefinitely_and_restrict(version=version, rule=None)
+        assert addon.auto_approval_delayed_until == datetime.max
+        assert addon.auto_approval_delayed_until_unlisted == datetime.max
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        assert EmailUserRestriction.objects.filter(
+            email_pattern=user1.email,
+            restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION,
+        ).exists()
+        assert EmailUserRestriction.objects.filter(
+            email_pattern=EmailUserRestriction.normalize_email(user2.email),
+            restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION,
+        ).exists()
+        assert EmailUserRestriction.objects.filter(
+            email_pattern=user3.email,
+            restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION,
+        ).exists()
+        assert not EmailUserRestriction.objects.filter(
+            email_pattern=user4.email
+        ).exists()
+        for restriction in EmailUserRestriction.objects.all():
+            if restriction.pk in (existing_restriction1.pk, existing_restriction2.pk):
+                assert restriction.reason is None
+            else:
+                assert restriction.reason == (
+                    'Automatically added because of a match by rule "None" on '
+                    f'Addon {addon.pk} Version {addon.current_version.pk}.'
+                )
+
+        assert IPNetworkUserRestriction.objects.filter(
+            network='5.6.7.8/32', restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION
+        ).exists()
+        assert IPNetworkUserRestriction.objects.filter(
+            network='1.2.3.4/32', restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION
+        ).exists()
+        assert not IPNetworkUserRestriction.objects.filter(network=None).exists()
+        assert not IPNetworkUserRestriction.objects.filter(network='').exists()
+        for restriction in IPNetworkUserRestriction.objects.all():
+            if restriction.pk in (existing_restriction3.pk,):
+                assert restriction.reason is None
+            else:
+                assert restriction.reason == (
+                    'Automatically added because of a match by rule "None" on '
+                    f'Addon {addon.pk} Version {addon.current_version.pk}.'
+                )
+
+    def test_delay_auto_approval_indefinitely_and_restrict_already_restricted_other(
+        self,
+    ):
+        rule = ScannerRule.objects.create(
+            scanner=YARA,
+            name=(
+                'This is a very long rule name that goes over 100 characters, which is '
+                'quite a lot but we need to test this scenario to make sure this works '
+                'properly even in this case.'
+            ),
+        )
+        user1 = user_factory(last_login_ip='5.6.7.8')
+        user2 = user_factory(last_login_ip='')
+        user3 = user_factory()
+        user4 = user_factory(last_login_ip='4.8.15.16')
+        existing_restriction1 = EmailUserRestriction.objects.create(
+            email_pattern=user1.email, restriction_type=RESTRICTION_TYPES.ADDON_APPROVAL
+        )
+        existing_restriction2 = EmailUserRestriction.objects.create(
+            email_pattern=user3.email, restriction_type=RESTRICTION_TYPES.ADDON_APPROVAL
+        )
+        existing_restriction3 = IPNetworkUserRestriction.objects.create(
+            network='5.6.7.8/32', restriction_type=RESTRICTION_TYPES.ADDON_APPROVAL
+        )
+        addon = addon_factory(users=[user1, user2])
+        FileUpload.objects.create(
+            addon=addon,
+            user=user3,
+            version=addon.current_version.version,
+            ip_address='1.2.3.4',
+            source=amo.UPLOAD_SOURCE_DEVHUB,
+            channel=amo.CHANNEL_LISTED,
+        )
+        version = addon.current_version
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval_indefinitely_and_restrict(version=version, rule=rule)
+        assert addon.auto_approval_delayed_until == datetime.max
+        assert addon.auto_approval_delayed_until_unlisted == datetime.max
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        # We added a new restriction for submission without touching the existing one
+        # for approval for user1 and user3
+        assert EmailUserRestriction.objects.filter(
+            email_pattern=user1.email,
+            restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION,
+        ).exists()
+        assert EmailUserRestriction.objects.filter(
+            email_pattern=user1.email, restriction_type=RESTRICTION_TYPES.ADDON_APPROVAL
+        ).exists()
+        assert EmailUserRestriction.objects.filter(
+            email_pattern=user2.email,
+            restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION,
+        ).exists()
+        assert EmailUserRestriction.objects.filter(
+            email_pattern=user3.email,
+            restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION,
+        ).exists()
+        assert EmailUserRestriction.objects.filter(
+            email_pattern=user3.email, restriction_type=RESTRICTION_TYPES.ADDON_APPROVAL
+        ).exists()
+        assert not EmailUserRestriction.objects.filter(
+            email_pattern=user4.email
+        ).exists()
+        for restriction in EmailUserRestriction.objects.all():
+            if restriction.pk in (existing_restriction1.pk, existing_restriction2.pk):
+                assert restriction.reason is None
+            else:
+                assert restriction.reason == (
+                    'Automatically added because of a match by rule "This is a very '
+                    'long rule name that goes over 100 characters, which is quite a '
+                    'lot but we need to test this scenario to make sure this works '
+                    'properly e" on '
+                    f'Addon {addon.pk} Version {addon.current_version.pk}.'
+                )
+
+        # Like above, we added a new restriction for submission, this time for the ip,
+        # but we left the one for approval.
+        assert IPNetworkUserRestriction.objects.filter(
+            network='5.6.7.8/32', restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION
+        ).exists()
+        assert IPNetworkUserRestriction.objects.filter(
+            network='5.6.7.8/32', restriction_type=RESTRICTION_TYPES.ADDON_APPROVAL
+        ).exists()
+        assert IPNetworkUserRestriction.objects.filter(
+            network='1.2.3.4/32', restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION
+        ).exists()
+        assert not IPNetworkUserRestriction.objects.filter(network=None).exists()
+        assert not IPNetworkUserRestriction.objects.filter(network='').exists()
+        for restriction in IPNetworkUserRestriction.objects.all():
+            if restriction.pk in (existing_restriction3.pk,):
+                assert restriction.reason is None
+            else:
+                assert restriction.reason == (
+                    'Automatically added because of a match by rule "This is a very '
+                    'long rule name that goes over 100 characters, which is quite a '
+                    'lot but we need to test this scenario to make sure this works '
+                    'properly e" on '
+                    f'Addon {addon.pk} Version {addon.current_version.pk}.'
+                )
+
+    def test_delay_auto_approval_indefinitely_and_restrict_already_flagged_active(self):
+        user = user_factory(last_login_ip='5.6.7.8')
+        addon = addon_factory(users=[user])
+        version = addon.current_version
+        # Create an existing active flag.
+        version.needshumanreview_set.create(
+            reason=version.needshumanreview_set.model.REASONS.SCANNER_ACTION,
+            is_active=True,
+        )
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval_indefinitely_and_restrict(version=version, rule=None)
+        # Everything still happening as normal, an active flag doesn't prevent
+        # the action from running.
+        assert addon.auto_approval_delayed_until == datetime.max
+        assert addon.auto_approval_delayed_until_unlisted == datetime.max
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        assert EmailUserRestriction.objects.filter(
+            email_pattern=user.email,
+            restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION,
+        ).exists()
+        assert IPNetworkUserRestriction.objects.filter(
+            network='5.6.7.8/32', restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION
+        ).exists()
+        assert version.due_date
+        # We haven't flagged it multiple times.
+        assert version.needshumanreview_set.count() == 1
+
+    def test_delay_auto_approval_indefinitely_and_restrict_already_flagged_inactive(
+        self,
+    ):
+        user = user_factory(last_login_ip='5.6.7.8')
+        addon = addon_factory(users=[user])
+        version = addon.current_version
+        # Create an existing inactive flag.
+        version.needshumanreview_set.create(
+            reason=version.needshumanreview_set.model.REASONS.SCANNER_ACTION,
+            is_active=False,
+        )
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval_indefinitely_and_restrict(version=version, rule=None)
+        # An inactive scanner action NHR flag means we shouldn't execute the
+        # action.
+        assert not addon.auto_approval_delayed_until
+        assert not addon.auto_approval_delayed_until_unlisted
+        assert not EmailUserRestriction.objects.filter(
+            email_pattern=user.email
+        ).exists()
+        assert not IPNetworkUserRestriction.objects.filter(
+            network='5.6.7.8/32'
+        ).exists()
+
+        # We shouldn't re-flag either.
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        assert not version.due_date
+
+    def test_delay_auto_approval_indefinitely_and_restrict_future_approvals(self):
+        user1 = user_factory(last_login_ip='5.6.7.8')
+        user2 = user_factory(last_login_ip='')
+        user3 = user_factory()
+        user4 = user_factory(last_login_ip='4.8.15.16')
+        EmailUserRestriction.objects.create(
+            email_pattern=user1.email,
+            restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION,
+        )
+        EmailUserRestriction.objects.create(
+            email_pattern=user3.email,
+            restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION,
+        )
+        IPNetworkUserRestriction.objects.create(
+            network='5.6.7.8/32', restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION
+        )
+        addon = addon_factory(users=[user1, user2])
+        FileUpload.objects.create(
+            addon=addon,
+            user=user3,
+            version=addon.current_version.version,
+            ip_address='1.2.3.4',
+            source=amo.UPLOAD_SOURCE_DEVHUB,
+            channel=amo.CHANNEL_LISTED,
+        )
+        version = addon.current_version
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval_indefinitely_and_restrict_future_approvals(
+            version=version, rule=None
+        )
+        assert addon.auto_approval_delayed_until == datetime.max
+        assert addon.auto_approval_delayed_until_unlisted == datetime.max
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        # We added a new restriction for approval without touching the existing one
+        # for submission for user1 and user3
+        assert EmailUserRestriction.objects.filter(
+            email_pattern=user1.email, restriction_type=RESTRICTION_TYPES.ADDON_APPROVAL
+        ).exists()
+        assert EmailUserRestriction.objects.filter(
+            email_pattern=user1.email,
+            restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION,
+        ).exists()
+        assert EmailUserRestriction.objects.filter(
+            email_pattern=user2.email, restriction_type=RESTRICTION_TYPES.ADDON_APPROVAL
+        ).exists()
+        assert EmailUserRestriction.objects.filter(
+            email_pattern=user3.email, restriction_type=RESTRICTION_TYPES.ADDON_APPROVAL
+        ).exists()
+        assert EmailUserRestriction.objects.filter(
+            email_pattern=user3.email,
+            restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION,
+        ).exists()
+        assert not EmailUserRestriction.objects.filter(
+            email_pattern=user4.email
+        ).exists()
+
+        # Like above, we added a new restriction for approval, this time for the ip,
+        # but we left the one for submission.
+        assert IPNetworkUserRestriction.objects.filter(
+            network='5.6.7.8/32', restriction_type=RESTRICTION_TYPES.ADDON_APPROVAL
+        ).exists()
+        assert IPNetworkUserRestriction.objects.filter(
+            network='5.6.7.8/32', restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION
+        ).exists()
+        assert IPNetworkUserRestriction.objects.filter(
+            network='1.2.3.4/32', restriction_type=RESTRICTION_TYPES.ADDON_APPROVAL
+        ).exists()
+        assert not IPNetworkUserRestriction.objects.filter(network=None).exists()
+        assert not IPNetworkUserRestriction.objects.filter(network='').exists()
+
+    def test_restrict_future_approvals_already_flagged_active(self):
+        user = user_factory(last_login_ip='5.6.7.8')
+        addon = addon_factory(users=[user])
+        version = addon.current_version
+        # Create an existing active flag.
+        version.needshumanreview_set.create(
+            reason=version.needshumanreview_set.model.REASONS.SCANNER_ACTION,
+            is_active=True,
+        )
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval_indefinitely_and_restrict_future_approvals(
+            version=version, rule=None
+        )
+        # Everything still happening as normal, an active flag doesn't prevent
+        # the action from running.
+        assert addon.auto_approval_delayed_until == datetime.max
+        assert addon.auto_approval_delayed_until_unlisted == datetime.max
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        assert EmailUserRestriction.objects.filter(
+            email_pattern=user.email,
+            restriction_type=RESTRICTION_TYPES.ADDON_APPROVAL,
+        ).exists()
+        assert IPNetworkUserRestriction.objects.filter(
+            network='5.6.7.8/32', restriction_type=RESTRICTION_TYPES.ADDON_APPROVAL
+        ).exists()
+        assert version.due_date
+        # We haven't flagged it multiple times.
+        assert version.needshumanreview_set.count() == 1
+
+    def test_restrict_future_approvals_already_flagged_inactive(self):
+        user = user_factory(last_login_ip='5.6.7.8')
+        addon = addon_factory(users=[user])
+        version = addon.current_version
+        # Create an existing inactive flag.
+        version.needshumanreview_set.create(
+            reason=version.needshumanreview_set.model.REASONS.SCANNER_ACTION,
+            is_active=False,
+        )
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval_indefinitely_and_restrict_future_approvals(
+            version=version, rule=None
+        )
+        # An inactive scanner action NHR flag means we shouldn't execute the
+        # action.
+        assert not addon.auto_approval_delayed_until
+        assert not addon.auto_approval_delayed_until_unlisted
+        assert not EmailUserRestriction.objects.filter(
+            email_pattern=user.email
+        ).exists()
+        assert not IPNetworkUserRestriction.objects.filter(
+            network='5.6.7.8/32'
+        ).exists()
+
+        # We shouldn't re-flag either.
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        assert not version.due_date
+
+    def test_delay_auto_approval_indefinitely_and_restrict_nothing_to_restrict(self):
+        addon = addon_factory()
+        version = addon.current_version
+        assert not version.needshumanreview_set.filter(is_active=True).exists()
+        assert addon.auto_approval_delayed_until is None
+        _delay_auto_approval_indefinitely(version=version, rule=None)
+        assert addon.auto_approval_delayed_until == datetime.max
+        assert addon.auto_approval_delayed_until_unlisted == datetime.max
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+
+    def do_disable_and_block(self, addon):
+        existing_decision_count = ContentDecision.objects.count()
+        UsageTier.objects.create(
+            upper_adu_threshold=10000, disable_and_block_action_available=True
+        )
+        version1 = addon.current_version
+        version2 = version_factory(addon=addon)
+        rule = ScannerRule.objects.create(scanner=YARA, name='Test Rule')
+        _disable_and_block(version=version2, rule=rule)
+        assert addon.reload().status == amo.STATUS_DISABLED
+        assert addon.block
+        assert version1.is_blocked
+        assert version1.file.reload().status == amo.STATUS_DISABLED
+        assert version1.blockversion.block_type == BlockType.SOFT_BLOCKED
+        assert version2.is_blocked
+        assert version2.file.reload().status == amo.STATUS_DISABLED
+        assert version2.blockversion.block_type == BlockType.SOFT_BLOCKED
+        assert ContentDecision.objects.count() == existing_decision_count + 1
+
+        assert (
+            ActivityLog.objects.filter(
+                addonlog__addon=addon, action=amo.LOG.FORCE_DISABLE.id
+            )
+            .get()
+            .details['reason']
+            == 'Rejected and blocked due to: scanner rule "Test Rule"'
+        )
+
+        for author in addon.authors.all():
+            assert EmailUserRestriction.objects.filter(
+                email_pattern=author.email,
+                restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION,
+            ).exists()
+            network = IPNetworkUserRestriction.network_from_ip(author.last_login_ip)
+            assert IPNetworkUserRestriction.objects.filter(
+                network=network, restriction_type=RESTRICTION_TYPES.ADDON_SUBMISSION
+            ).exists()
+
+    def test_disable_and_block(self):
+        user = user_factory(last_login_ip='172.16.0.1')
+        self.do_disable_and_block(addon_factory(average_daily_users=4242, users=[user]))
+
+    @mock.patch('olympia.scanners.actions.reject_and_block_addons')
+    def test_disable_and_block_with_mock(self, reject_and_block_addons_mock):
+        UsageTier.objects.create(
+            upper_adu_threshold=10000, disable_and_block_action_available=True
+        )
+        user = user_factory(last_login_ip='172.16.0.1')
+        addon = addon_factory(average_daily_users=4242, users=[user])
+        rule = ScannerRule.objects.create(scanner=YARA, name='Test Rule')
+        _disable_and_block(version=addon.current_version, rule=rule)
+        assert reject_and_block_addons_mock.call_count == 1
+        assert reject_and_block_addons_mock.call_args.args == ([addon],)
+        assert reject_and_block_addons_mock.call_args.kwargs == {
+            'reject_reason': 'scanner rule "Test Rule"',
+            'scanner_match_rule': rule,
+            'scanner_match_version': addon.current_version,
+        }
+
+    def test_disable_and_block_second_level_approval(self):
+        UsageTier.objects.create(
+            upper_adu_threshold=10000, disable_and_block_action_available=True
+        )
+        addon = addon_factory(
+            average_daily_users=4242,
+            promoted_kwargs={
+                'api_name': 'high_profile',
+                'high_profile': True,
+            },
+            version_kw={'promotion_approved': False},
+        )
+
+        version1 = addon.current_version
+        version2 = version_factory(addon=addon)
+        rule = ScannerRule.objects.create(scanner=YARA, name='Test Rule')
+        _disable_and_block(version=version2, rule=rule)
+        assert addon.reload().status == amo.STATUS_APPROVED  # Not disabled yet
+        assert not addon.block
+        assert not version1.is_blocked
+        assert version1.file.reload().status == amo.STATUS_APPROVED  # Not disabled yet
+        assert not version2.is_blocked
+        assert version2.file.reload().status == amo.STATUS_APPROVED  # Not disabled yet
+        assert ContentDecision.objects.count() == 1
+        decision = ContentDecision.objects.get()
+        assert not decision.action_date  # Action pending approval
+        assert (
+            ActivityLog.objects.filter(
+                addonlog__addon=addon, action=amo.LOG.HELD_ACTION_FORCE_DISABLE.id
+            )
+            .get()
+            .details['reason']
+            == 'Rejected and blocked due to: scanner rule "Test Rule"'
+        )
+        # We haven't added restrictions yet because of send level approval.
+        assert not EmailUserRestriction.objects.exists()
+        assert not IPNetworkUserRestriction.objects.exists()
+        # ContentDecision has relevant metadata to add restrictions later if
+        # the decision goes through.
+        assert decision.metadata['scanner_match_rule'] == rule.pk
+        assert decision.metadata['scanner_match_version'] == version2.pk
+
+    def test_disable_and_block_not_available_for_that_tier(self):
+        tier = UsageTier.objects.create(lower_adu_threshold=1)
+        assert not tier.disable_and_block_action_available  # Default is False
+        user = user_factory(last_login_ip='172.16.0.1')
+        addon = addon_factory(average_daily_users=1234, users=[user])
+        assert addon.get_usage_tier() == tier
+        version = addon.current_version
+        _disable_and_block(version=version, rule=None)
+        # Should not have been disabled & blocked, disable_and_block_action_available
+        # is False.
+        assert addon.status == amo.STATUS_APPROVED
+        assert not Block.objects.exists()
+        assert not BlockVersion.objects.exists()
+        # Should have been flagged for review and auto-approval disabled as a
+        # fallback.
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        addon.reviewerflags.reload()
+        assert addon.auto_approval_delayed_until == datetime.max
+        assert addon.auto_approval_delayed_until_unlisted == datetime.max
+        # We didn't add restrictions.
+        assert not EmailUserRestriction.objects.exists()
+        assert not IPNetworkUserRestriction.objects.exists()
+
+    def test_disable_and_block_no_usage_tier(self):
+        user = user_factory(last_login_ip='172.16.0.1')
+        addon = addon_factory(users=[user])
+        version = addon.current_version
+        _disable_and_block(version=version, rule=None)
+        # Should not have been disabled & blocked since it's not in any tier
+        assert addon.status == amo.STATUS_APPROVED
+        assert not Block.objects.exists()
+        assert not BlockVersion.objects.exists()
+        # Should have been flagged for review and auto-approval disabled as a
+        # fallback.
+        assert version.needshumanreview_set.filter(is_active=True).exists()
+        addon.reviewerflags.reload()
+        assert addon.auto_approval_delayed_until == datetime.max
+        assert addon.auto_approval_delayed_until_unlisted == datetime.max
+        # We didn't add restrictions.
+        assert not EmailUserRestriction.objects.exists()
+        assert not IPNetworkUserRestriction.objects.exists()
+
+    def _test_disable_and_block_but_previous_successful_appeal(self, appealed_action):
+        UsageTier.objects.create(
+            upper_adu_threshold=10000, disable_and_block_action_available=True
+        )
+        user = user_factory(last_login_ip='172.16.0.1')
+        addon = addon_factory(average_daily_users=4242, users=[user])
+        version2 = version_factory(addon=addon)
+        appeal_decision = ContentDecision.objects.create(
+            addon=addon,
+            action=DECISION_ACTIONS.AMO_APPROVE,
+            cinder_job=CinderJob.objects.create(target_addon=addon),
+        )
+        ContentDecision.objects.create(
+            addon=addon,
+            action=DECISION_ACTIONS.AMO_BLOCK_ADDON,
+            appeal_job=appeal_decision.cinder_job,
+        )
+
+        _disable_and_block(version=version2, rule=None)
+
+        # Should not have been disabled & blocked because of the previous appeal.
+        assert addon.status == amo.STATUS_APPROVED
+        assert not Block.objects.exists()
+        assert not BlockVersion.objects.exists()
+        # Should have been flagged for review and auto-approval disabled as a
+        # fallback.
+        assert version2.needshumanreview_set.filter(is_active=True).exists()
+        addon.reviewerflags.reload()
+        assert addon.auto_approval_delayed_until == datetime.max
+        assert addon.auto_approval_delayed_until_unlisted == datetime.max
+        # We didn't add restrictions.
+        assert not EmailUserRestriction.objects.exists()
+        assert not IPNetworkUserRestriction.objects.exists()
+
+    def test_disable_and_block_but_previous_successful_appeal_on_block(self):
+        self._test_disable_and_block_but_previous_successful_appeal(
+            DECISION_ACTIONS.AMO_BLOCK_ADDON
+        )
+
+    def test_disable_and_block_but_previous_successful_appeal_on_disable(self):
+        self._test_disable_and_block_but_previous_successful_appeal(
+            DECISION_ACTIONS.AMO_DISABLE_ADDON
+        )
+
+    def test_disable_and_block_but_previous_successful_appeal_on_reject(self):
+        self._test_disable_and_block_but_previous_successful_appeal(
+            DECISION_ACTIONS.AMO_REJECT_VERSION_ADDON
+        )
+
+    def test_disable_and_block_with_unsuccesful_appeal(self):
+        user = user_factory(last_login_ip='172.16.0.1')
+        addon = addon_factory(average_daily_users=4242, users=[user])
+        appeal_decision = ContentDecision.objects.create(
+            addon=addon,
+            action=DECISION_ACTIONS.AMO_DISABLE_ADDON,
+            cinder_job=CinderJob.objects.create(target_addon=addon),
+        )
+        ContentDecision.objects.create(
+            addon=addon,
+            action=DECISION_ACTIONS.AMO_BLOCK_ADDON,
+            appeal_job=appeal_decision.cinder_job,
+        )
+        self.do_disable_and_block(addon)
+
+    def test_disable_and_block_with_unresolved_appeal(self):
+        user = user_factory(last_login_ip='172.16.0.1')
+        addon = addon_factory(average_daily_users=4242, users=[user])
+        appeal_job = CinderJob.objects.create(target_addon=addon)
+        ContentDecision.objects.create(
+            addon=addon,
+            action=DECISION_ACTIONS.AMO_BLOCK_ADDON,
+            appeal_job=appeal_job,
+        )
+        self.do_disable_and_block(addon)
+
+    def test_disable_and_block_with_non_block_appeal(self):
+        user = user_factory(last_login_ip='172.16.0.1')
+        addon = addon_factory(average_daily_users=4242, users=[user])
+        appeal_decision = ContentDecision.objects.create(
+            addon=addon,
+            action=DECISION_ACTIONS.AMO_APPROVE,
+            cinder_job=CinderJob.objects.create(target_addon=addon),
+        )
+        ContentDecision.objects.create(
+            addon=addon,
+            action=DECISION_ACTIONS.AMO_IGNORE,
+            appeal_job=appeal_decision.cinder_job,
+        )
+        self.do_disable_and_block(addon)
+
+
+class TestRunAction(TestCase):
+    def setUp(self):
+        super().setUp()
+        self.scanner = YARA
+        self.author = user_factory()
+        self.addon = addon_factory(users=[self.author])
+        self.version = version_factory(addon=self.addon)
+        self.scanner_rule = ScannerRule.objects.create(
+            name='rule-1', scanner=self.scanner, action=NO_ACTION
+        )
+        self.scanner_result = ScannerResult.objects.create(
+            version=self.version, scanner=self.scanner
+        )
+        self.scanner_result.matched_rules.add(self.scanner_rule)
+        self.task_user = user_factory(pk=settings.TASK_USER_ID)
+        self.cinder_create_decision_url = (
+            f'{settings.CINDER_SERVER_URL}v1/create_decision'
+        )
+        responses.add_callback(
+            responses.POST,
+            self.cinder_create_decision_url,
+            callback=lambda r: (201, {}, json.dumps({'uuid': uuid.uuid4().hex})),
+        )
+
+    @mock.patch('olympia.scanners.models._no_action')
+    def test_execute_workflow_action_runs_no_action(self, no_action_mock):
+        self.scanner_rule.update(action=NO_ACTION)
+
+        ScannerResult.run_actions(self.version)
+
+        assert no_action_mock.called
+        no_action_mock.assert_called_with(version=self.version, rule=self.scanner_rule)
+
+    @mock.patch('olympia.scanners.models._flag_for_human_review')
+    def test_execute_workflow_action_runs_flag_for_human_review(
+        self, flag_for_human_review_mock
+    ):
+        self.scanner_rule.update(action=FLAG_FOR_HUMAN_REVIEW)
+
+        ScannerResult.run_actions(self.version)
+
+        assert flag_for_human_review_mock.called
+        flag_for_human_review_mock.assert_called_with(
+            version=self.version, rule=self.scanner_rule
+        )
+
+    @mock.patch('olympia.scanners.models._delay_auto_approval')
+    def test_execute_workflow_action_runs_delay_auto_approval(
+        self, _delay_auto_approval_mock
+    ):
+        self.scanner_rule.update(action=DELAY_AUTO_APPROVAL)
+
+        ScannerResult.run_actions(self.version)
+
+        assert _delay_auto_approval_mock.called
+        _delay_auto_approval_mock.assert_called_with(
+            version=self.version, rule=self.scanner_rule
+        )
+
+    @mock.patch('olympia.scanners.models._delay_auto_approval_indefinitely')
+    def test_execute_workflow_action_runs_delay_auto_approval_indefinitely(
+        self, _delay_auto_approval_indefinitely_mock
+    ):
+        self.scanner_rule.update(action=DELAY_AUTO_APPROVAL_INDEFINITELY)
+
+        ScannerResult.run_actions(self.version)
+
+        assert _delay_auto_approval_indefinitely_mock.called
+        _delay_auto_approval_indefinitely_mock.assert_called_with(
+            version=self.version, rule=self.scanner_rule
+        )
+
+    @mock.patch('olympia.scanners.models._disable_and_block')
+    def test_execute_workflow_action_runs_disable_and_block(
+        self, _disable_and_block_mock
+    ):
+        self.scanner_rule.update(action=DISABLE_AND_BLOCK)
+
+        ScannerResult.run_actions(self.version)
+
+        assert _disable_and_block_mock.call_count == 1
+        assert _disable_and_block_mock.call_args[1] == {
+            'version': self.version,
+            'rule': self.scanner_rule,
+        }
+
+    @mock.patch('olympia.scanners.models._delay_auto_approval_indefinitely')
+    def test_execute_workflow_action_returns_for_non_extension_addons(
+        self, _delay_auto_approval_indefinitely_mock
+    ):
+        self.scanner_rule.update(action=DELAY_AUTO_APPROVAL_INDEFINITELY)
+        self.addon.update(type=amo.ADDON_DICT)
+
+        ScannerResult.run_actions(self.version)
+
+        assert not _delay_auto_approval_indefinitely_mock.called
+
+        self.addon.update(type=amo.ADDON_LPAPP)
+
+        ScannerResult.run_actions(self.version)
+
+        assert not _delay_auto_approval_indefinitely_mock.called
+
+        self.addon.update(type=amo.ADDON_STATICTHEME)
+
+        ScannerResult.run_actions(self.version)
+
+        assert not _delay_auto_approval_indefinitely_mock.called
+
+    @mock.patch('olympia.scanners.models.log.info')
+    def test_execute_workflow_action_returns_when_no_action_found(self, log_mock):
+        self.scanner_rule.delete()
+
+        ScannerResult.run_actions(self.version)
+
+        assert len(log_mock.call_args_list) == 4
+        assert log_mock.call_args_list[0][0] == (
+            'Checking workflow rules and actions for version %s.',
+            self.version.pk,
+        )
+        assert log_mock.call_args_list[1][0] == (
+            'No workflow action to execute for version %s.',
+            self.version.pk,
+        )
+        assert log_mock.call_args_list[2][0] == (
+            'Checking policy rules and actions for version %s.',
+            self.version.pk,
+        )
+        assert log_mock.call_args_list[3][0] == (
+            'No violated policy found when scanning version %s.',
+            self.version.pk,
+        )
+
+    def test_execute_workflow_action_raise_when_action_is_invalid(self):
+        # `12345` is an invalid action ID
+        self.scanner_rule.update(action=12345)
+
+        with pytest.raises(Exception, match='invalid action 12345'):
+            ScannerResult.run_actions(self.version)
+
+    @mock.patch('olympia.scanners.models._no_action')
+    @mock.patch('olympia.scanners.models._flag_for_human_review')
+    def test_execute_workflow_action_selects_the_action_with_the_highest_severity(
+        self, flag_for_human_review_mock, no_action_mock
+    ):
+        # Create another rule and add it to the current scanner result. This
+        # rule is more severe than `rule-1` created in `setUp()`.
+        rule = ScannerRule.objects.create(
+            name='rule-2', scanner=self.scanner, action=FLAG_FOR_HUMAN_REVIEW
+        )
+        self.scanner_result.matched_rules.add(rule)
+
+        ScannerResult.run_actions(self.version)
+
+        assert not no_action_mock.called
+        assert flag_for_human_review_mock.called
+
+    @mock.patch('olympia.scanners.models._no_action')
+    @mock.patch('olympia.scanners.models._flag_for_human_review')
+    def test_execute_workflow_action_skips_ex_promoted_if_addon_is_promoted(
+        self, flag_for_human_review_mock, no_action_mock
+    ):
+        self.make_addon_promoted(
+            self.addon, api_name='pre_review', listed_pre_review=True
+        )
+        # Create another rule and add it to the current scanner result, but set to
+        # exclude_promoted_addons=True.
+        rule = ScannerRule.objects.create(
+            name='rule-2',
+            scanner=self.scanner,
+            action=FLAG_FOR_HUMAN_REVIEW,
+            exclude_promoted_addons=True,
+        )
+        self.scanner_result.matched_rules.add(rule)
+
+        ScannerResult.run_actions(self.version)
+
+        assert no_action_mock.called
+        assert not flag_for_human_review_mock.called
+
+    @mock.patch('olympia.scanners.models._no_action')
+    @mock.patch('olympia.scanners.models._flag_for_human_review')
+    def test_execute_workflow_action_does_not_skip_ex_promoted_if_addon_is_not_promoted(
+        self, flag_for_human_review_mock, no_action_mock
+    ):
+        # Create another rule and add it to the current scanner result, set to
+        # exclude_promoted_addons=True, but it shouldn't be skipped.
+        rule = ScannerRule.objects.create(
+            name='rule-2',
+            scanner=self.scanner,
+            action=FLAG_FOR_HUMAN_REVIEW,
+            exclude_promoted_addons=True,
+        )
+        self.scanner_result.matched_rules.add(rule)
+
+        ScannerResult.run_actions(self.version)
+
+        assert not no_action_mock.called
+        assert flag_for_human_review_mock.called
+
+    @mock.patch('olympia.scanners.models._no_action')
+    @mock.patch('olympia.scanners.models._flag_for_human_review')
+    def test_execute_workflow_action_selects_active_rules_only(
+        self, flag_for_human_review_mock, no_action_mock
+    ):
+        # Create another rule and add it to the current scanner result. This
+        # rule is more severe than `rule-1` created in `setUp()`. In this test
+        # case, we disable this rule, though.
+        rule = ScannerRule.objects.create(
+            name='rule-2',
+            scanner=self.scanner,
+            action=FLAG_FOR_HUMAN_REVIEW,
+            is_active=False,
+        )
+        self.scanner_result.matched_rules.add(rule)
+
+        ScannerResult.run_actions(self.version)
+
+        assert no_action_mock.called
+        assert not flag_for_human_review_mock.called
+
+    def test_execute_policy_enforcement_action(self):
+        policy = CinderPolicy.objects.create(
+            uuid=uuid.uuid4().hex,
+            name='My Fancy Polîcy',
+            text='Just saying.',
+            # expose_in_reviewer_tools shouldn't matter if the link already
+            # exists - it's only for availability in the admin/reviewer tools.
+            expose_in_reviewer_tools=POLICY_EXPOSURE.NONE,
+            enforcement_actions=[DECISION_ACTIONS.AMO_DISABLE_ADDON.api_value],
+        )
+        # Extra useless policy shouldn't get picked up.
+        CinderPolicy.objects.create(
+            uuid=uuid.uuid4().hex,
+            name='Other policy',
+            text='Do not include me!',
+            enforcement_actions=[DECISION_ACTIONS.AMO_DISABLE_ADDON.api_value],
+        )
+        self.scanner_rule.update(policy=policy)
+
+        ScannerResult.run_actions(self.version)
+
+        self.addon.reload()
+        assert self.addon.status == amo.STATUS_DISABLED
+
+        decision = ContentDecision.objects.latest('pk')
+        assert decision
+        assert decision.action == DECISION_ACTIONS.AMO_DISABLE_ADDON
+        assert decision.action_date
+        assert decision.addon == self.addon
+        assert decision.reviewer_user == self.task_user
+        assert set(decision.target_versions.all()) == set(self.addon.versions.all())
+        assert set(decision.policies.all()) == {policy}
+
+        activity = ActivityLog.objects.latest('pk')
+        assert activity
+        assert activity.user == self.task_user
+        assert activity.action == amo.LOG.FORCE_DISABLE.id
+        assert activity.arguments == [
+            self.addon,
+            decision,
+            policy,
+            *decision.target_versions.order_by('-pk'),
+        ]
+
+        assert len(responses.calls) == 1
+        assert responses.calls[0].request.url == self.cinder_create_decision_url
+
+        assert len(mail.outbox) == 1
+        body = mail.outbox[0].body
+        expected_appeal_url = reverse(
+            'abuse.appeal_author', kwargs={'decision_cinder_id': decision.cinder_id}
+        )
+        assert 'your content does not adhere to the following Mozilla policies' in body
+        assert '- My Fancy Polîcy: Just saying.' in body
+        assert 'Do not include me!' not in body
+        assert expected_appeal_url in body
+
+        # Nothing for human reviewers to do.
+        assert not self.version.needshumanreview_set.exists()
+
+    def test_execute_policy_enforcement_action_multiple_policies(self):
+        policy = CinderPolicy.objects.create(
+            uuid=uuid.uuid4().hex,
+            name='My Fancy Polîcy',
+            text='Just saying.',
+            enforcement_actions=[DECISION_ACTIONS.AMO_DISABLE_ADDON.api_value],
+        )
+        policy2 = CinderPolicy.objects.create(
+            uuid=uuid.uuid4().hex,
+            name='My Secônd Policy',
+            text='Bad content.',
+            # We won't use this policy enforcement actions because the other
+            # one is more aggressive.
+            enforcement_actions=[DECISION_ACTIONS.AMO_REJECT_VERSION_ADDON.api_value],
+        )
+        self.scanner_rule.update(policy=policy)
+        second_rule = ScannerRule.objects.create(
+            scanner=self.scanner, name='rule-2', policy=policy2
+        )
+        self.scanner_result.matched_rules.add(second_rule)
+
+        ScannerResult.run_actions(self.version)
+
+        self.addon.reload()
+        assert self.addon.status == amo.STATUS_DISABLED
+
+        decision = ContentDecision.objects.latest('pk')
+        assert decision
+        assert decision.action == DECISION_ACTIONS.AMO_DISABLE_ADDON
+        assert decision.action_date
+        assert decision.addon == self.addon
+        assert decision.reviewer_user == self.task_user
+        assert set(decision.target_versions.all()) == set(self.addon.versions.all())
+        assert set(decision.policies.all()) == {policy, policy2}
+
+        assert len(mail.outbox) == 1
+        body = mail.outbox[0].body
+        expected_appeal_url = reverse(
+            'abuse.appeal_author', kwargs={'decision_cinder_id': decision.cinder_id}
+        )
+        assert '- My Fancy Polîcy: Just saying.' in body
+        assert '- My Secônd Policy: Bad content.' in body
+        assert expected_appeal_url in body
+
+    def test_execute_policy_enforcement_action_returns_for_non_extension_addons(self):
+        policy = CinderPolicy.objects.create(
+            uuid=uuid.uuid4().hex,
+            name='My Fancy Polîcy',
+            text='Just saying.',
+            enforcement_actions=[DECISION_ACTIONS.AMO_DISABLE_ADDON.api_value],
+        )
+        self.scanner_rule.update(policy=policy)
+        self.addon.update(type=amo.ADDON_STATICTHEME)
+
+        ScannerResult.run_actions(self.version)
+
+        self.addon.reload()
+        assert self.addon.status == amo.STATUS_APPROVED
+
+        assert not ContentDecision.objects.exists()
+        assert not ActivityLog.objects.exists()
+        assert not self.version.needshumanreview_set.exists()
+        assert len(mail.outbox) == 0
+
+    def test_execute_policy_enforcement_action_active_rules_only(self):
+        policy = CinderPolicy.objects.create(
+            uuid=uuid.uuid4().hex,
+            name='My Fancy Polîcy',
+            text='Just saying.',
+            enforcement_actions=[DECISION_ACTIONS.AMO_DISABLE_ADDON.api_value],
+        )
+        self.scanner_rule.update(policy=policy, is_active=False)
+
+        ScannerResult.run_actions(self.version)
+
+        self.addon.reload()
+        assert self.addon.status == amo.STATUS_APPROVED
+
+        assert not ContentDecision.objects.exists()
+        assert not ActivityLog.objects.exists()
+        assert not self.version.needshumanreview_set.exists()
+        assert len(mail.outbox) == 0
+
+    def test_execute_policy_enforcement_action_skips_exclude_promoted(self):
+        policy = CinderPolicy.objects.create(
+            uuid=uuid.uuid4().hex,
+            name='My Fancy Polîcy',
+            text='Just saying.',
+            enforcement_actions=[DECISION_ACTIONS.AMO_DISABLE_ADDON.api_value],
+        )
+        self.scanner_rule.update(policy=policy, exclude_promoted_addons=True)
+        self.make_addon_promoted(
+            # Strategic promoted group is not "high profile", so not subject to
+            # second level approval - if the rule didn't have
+            # exclude_promoted_addons=True the add-on would be taken down.
+            self.addon,
+            api_name='strategic',
+            admin_review=True,
+        )
+
+        ScannerResult.run_actions(self.version)
+
+        self.addon.reload()
+        assert self.addon.status == amo.STATUS_APPROVED
+
+        assert not ContentDecision.objects.exists()
+        assert not ActivityLog.objects.exists()
+        assert not self.version.needshumanreview_set.exists()
+        assert len(mail.outbox) == 0
+
+    def test_execute_policy_enforcement_action_does_not_skip_exclude_promoted(self):
+        policy = CinderPolicy.objects.create(
+            uuid=uuid.uuid4().hex,
+            name='My Fancy Polîcy',
+            text='Just saying.',
+            enforcement_actions=[DECISION_ACTIONS.AMO_DISABLE_ADDON.api_value],
+        )
+        # Rule excludes promoted add-on but the add-on isn't promoted.
+        self.scanner_rule.update(policy=policy, exclude_promoted_addons=True)
+
+        ScannerResult.run_actions(self.version)
+
+        self.addon.reload()
+        assert self.addon.status == amo.STATUS_DISABLED
+
+        assert ContentDecision.objects.exists()
+        assert ActivityLog.objects.exists()
+        assert len(mail.outbox) == 1
+
+    def test_execute_policy_enforcement_action_redundant_policies(self):
+        policy = CinderPolicy.objects.create(
+            uuid=uuid.uuid4().hex,
+            name='My Fancy Polîcy',
+            text='Just saying.',
+            enforcement_actions=[DECISION_ACTIONS.AMO_DISABLE_ADDON.api_value],
+        )
+        policy2 = CinderPolicy.objects.create(
+            uuid=uuid.uuid4().hex,
+            name='My Secônd Policy',
+            text='Bad content.',
+            enforcement_actions=[DECISION_ACTIONS.AMO_DISABLE_ADDON.api_value],
+        )
+        self.scanner_rule.update(policy=policy)
+        second_rule = ScannerRule.objects.create(
+            scanner=self.scanner, name='rule-2', policy=policy2
+        )
+        self.scanner_result.matched_rules.add(second_rule)
+
+        ScannerResult.run_actions(self.version)
+
+        self.addon.reload()
+        assert self.addon.status == amo.STATUS_DISABLED
+
+        assert ContentDecision.objects.count() == 1
+        decision = ContentDecision.objects.latest('pk')
+        assert decision
+        assert decision.action == DECISION_ACTIONS.AMO_DISABLE_ADDON
+        assert decision.action_date
+        assert decision.addon == self.addon
+        assert decision.reviewer_user == self.task_user
+        assert set(decision.target_versions.all()) == set(self.addon.versions.all())
+        assert set(decision.policies.all()) == {policy, policy2}
+
+        assert ActivityLog.objects.count() == 1
+
+        assert len(mail.outbox) == 1
+        body = mail.outbox[0].body
+        expected_appeal_url = reverse(
+            'abuse.appeal_author', kwargs={'decision_cinder_id': decision.cinder_id}
+        )
+        assert '- My Fancy Polîcy: Just saying.' in body
+        assert '- My Secônd Policy: Bad content.' in body
+        assert expected_appeal_url in body
+
+    def test_execute_policy_enforcement_action_multiple_enforcement_actions(self):
+        policy = CinderPolicy.objects.create(
+            uuid=uuid.uuid4().hex,
+            name='My Fancy Polîcy',
+            text='Just saying.',
+            # This policy is misconfigured with 2 primary actions that affect
+            # add-ons. It will be ignored on hit and we'll set a NHR & disable
+            # auto-approval instead.
+            enforcement_actions=[
+                DECISION_ACTIONS.AMO_DISABLE_ADDON.api_value,
+                DECISION_ACTIONS.AMO_REJECT_VERSION_ADDON.api_value,
+            ],
+        )
+        self.scanner_rule.update(policy=policy)
+
+        ScannerResult.run_actions(self.version)
+
+        self.addon.reload()
+        assert self.addon.status == amo.STATUS_APPROVED
+
+        assert ContentDecision.objects.count() == 0
+        assert ActivityLog.objects.count() == 1
+        activity = ActivityLog.objects.latest('pk')
+        assert activity.action == amo.LOG.NEEDS_HUMAN_REVIEW_AUTOMATIC.id
+
+        assert len(responses.calls) == 0
+        assert len(mail.outbox) == 0
+
+        assert self.version.needshumanreview_set.exists()
+        assert self.addon.reviewerflags.auto_approval_delayed_until
+
+    def test_execute_policy_enforcement_action_no_enforcement_actions_on_policies(self):
+        policy = CinderPolicy.objects.create(
+            uuid=uuid.uuid4().hex,
+            name='My Fancy Polîcy',
+            text='Just saying.',
+            # This policy is misconfigured with no primary actions affecting
+            # add-ons. It will be ignored on hit and we'll set a NHR & disable
+            # auto-approval instead.
+            enforcement_actions=[
+                DECISION_ACTIONS.AMO_DELETE_COLLECTION.api_value,
+            ],
+        )
+        self.scanner_rule.update(policy=policy)
+
+        ScannerResult.run_actions(self.version)
+
+        self.addon.reload()
+        assert self.addon.status == amo.STATUS_APPROVED
+
+        assert ContentDecision.objects.count() == 0
+        assert ActivityLog.objects.count() == 1
+        activity = ActivityLog.objects.latest('pk')
+        assert activity.action == amo.LOG.NEEDS_HUMAN_REVIEW_AUTOMATIC.id
+
+        assert len(responses.calls) == 0
+        assert len(mail.outbox) == 0
+
+        assert self.version.needshumanreview_set.exists()
+        assert self.addon.reviewerflags.auto_approval_delayed_until
+
+    def test_execute_policy_enforcement_action_reject_with_followup_actions(self):
+        policy = CinderPolicy.objects.create(
+            uuid=uuid.uuid4().hex,
+            name='My Fancy Polîcy',
+            text='Just saying.',
+            enforcement_actions=[
+                DECISION_ACTIONS.AMO_REJECT_VERSION_ADDON.api_value,
+                DECISION_ACTIONS.AMO_FU_DELAY_MID_HARD_BLOCK_ADDON.api_value,
+            ],
+        )
+        self.scanner_rule.update(policy=policy)
+
+        ScannerResult.run_actions(self.version)
+
+        self.addon.reload()
+        self.version.file.reload()
+        assert self.addon.status == amo.STATUS_APPROVED
+        assert self.addon.current_version.file.status == amo.STATUS_APPROVED
+        assert self.version.file.status == amo.STATUS_DISABLED
+
+        assert ContentDecision.objects.count() == 1
+        decision = ContentDecision.objects.latest('pk')
+        assert decision
+        assert decision.action == DECISION_ACTIONS.AMO_REJECT_VERSION_ADDON
+        assert decision.action_date
+        assert decision.addon == self.addon
+        assert decision.reviewer_user == self.task_user
+        assert set(decision.target_versions.all()) == {self.version}
+        assert set(decision.policies.all()) == {policy}
+
+        assert decision.followup_actions.count() == 1
+        follow_up = decision.followup_actions.latest('pk')
+        assert follow_up.action == DECISION_ACTIONS.AMO_FU_DELAY_MID_HARD_BLOCK_ADDON
+        assert not self.version.is_blocked  # Not blocked yet
+
+        assert BlocklistSubmission.objects.count() == 1
+        submission = BlocklistSubmission.objects.latest('pk')
+        assert submission.input_guids == self.addon.guid
+        assert submission.changed_version_ids == [self.version.pk]
+        assert submission.delayed_until
+
+        assert ActivityLog.objects.count() == 2
+        reject_log = ActivityLog.objects.earliest('pk')
+        assert reject_log.action == amo.LOG.REJECT_VERSION.id
+        assert reject_log.arguments == [self.addon, decision, policy, self.version]
+        submission_log = ActivityLog.objects.latest('pk')
+        assert submission_log.action == amo.LOG.BLOCKLIST_VERSION_DELAY_BLOCKED.id
+        assert submission_log.arguments == [self.addon, decision, self.version, 14]
+
+        assert len(mail.outbox) == 1
+        body = mail.outbox[0].body
+        expected_appeal_url = reverse(
+            'abuse.appeal_author', kwargs={'decision_cinder_id': decision.cinder_id}
+        )
+        assert '- My Fancy Polîcy: Just saying.' in body
+        assert f'Affected versions: {self.version.version}' in body
+        assert expected_appeal_url in body
+
+    def test_execute_policy_enforcement_action_delayed_reject(self):
+        policy = CinderPolicy.objects.create(
+            uuid=uuid.uuid4().hex,
+            name='My Fancy Polîcy',
+            text='Just saying.',
+            enforcement_actions=[
+                DECISION_ACTIONS.AMO_REJECT_VERSION_WARNING_ADDON.api_value,
+            ],
+        )
+        self.scanner_rule.update(policy=policy)
+
+        ScannerResult.run_actions(self.version)
+
+        self.addon.reload()
+        self.version.file.reload()
+        self.version.reviewerflags.reload()
+        assert self.addon.status == amo.STATUS_APPROVED
+        assert self.version.file.status == amo.STATUS_APPROVED
+        self.assertCloseToNow(
+            self.version.reviewerflags.pending_rejection,
+            now=datetime.now() + timedelta(days=30, hours=1),
+        )
+
+        assert ContentDecision.objects.count() == 1
+        decision = ContentDecision.objects.latest('pk')
+        assert decision
+        assert decision.action == DECISION_ACTIONS.AMO_REJECT_VERSION_WARNING_ADDON
+        assert decision.action_date
+        assert decision.addon == self.addon
+        assert decision.reviewer_user == self.task_user
+        assert set(decision.target_versions.all()) == {self.version}
+        assert set(decision.policies.all()) == {policy}
+
+        assert ActivityLog.objects.count() == 1
+        activity = ActivityLog.objects.latest('pk')
+        assert activity.action == amo.LOG.REJECT_VERSION_DELAYED.id
+        assert activity.arguments == [self.addon, decision, policy, self.version]
+
+        assert len(mail.outbox) == 1
+        body = mail.outbox[0].body
+        expected_appeal_url = reverse(
+            'abuse.appeal_author', kwargs={'decision_cinder_id': decision.cinder_id}
+        )
+        assert '- My Fancy Polîcy: Just saying.' in body
+        assert f'Affected versions: {self.version.version}' in body
+        # Not an appealable decision.
+        assert expected_appeal_url not in body
+
+    def test_execute_policy_enforcement_action_2nd_level_approval(self):
+        policy = CinderPolicy.objects.create(
+            uuid=uuid.uuid4().hex,
+            name='My Fancy Polîcy',
+            text='Just saying.',
+            enforcement_actions=[DECISION_ACTIONS.AMO_DISABLE_ADDON.api_value],
+        )
+        self.scanner_rule.update(policy=policy)
+        # Make the add-on high-profile, that will force 2nd level approval.
+        self.make_addon_promoted(self.addon, api_name='high_profile', high_profile=True)
+
+        ScannerResult.run_actions(self.version)
+
+        self.addon.reload()
+        assert self.addon.status == amo.STATUS_APPROVED  # Nothing changed yet.
+
+        decision = ContentDecision.objects.latest('pk')
+        assert decision
+        assert decision.action == DECISION_ACTIONS.AMO_DISABLE_ADDON
+        assert not decision.action_date  # No action date, waiting for approval
+        assert decision.addon == self.addon
+        assert decision.reviewer_user == self.task_user
+        assert set(decision.target_versions.all()) == set(self.addon.versions.all())
+        assert set(decision.policies.all()) == {policy}
+
+        activity = ActivityLog.objects.latest('pk')
+        assert activity
+        assert activity.user == self.task_user
+        assert activity.action == amo.LOG.HELD_ACTION_FORCE_DISABLE.id
+        assert activity.arguments == [
+            self.addon,
+            decision,
+            policy,
+            *decision.target_versions.order_by('-pk'),
+        ]
+
+        assert len(responses.calls) == 1
+        assert responses.calls[0].request.url == self.cinder_create_decision_url
+
+        assert len(mail.outbox) == 0
+
+        # Nothing for human reviewers to do.
+        assert not self.version.needshumanreview_set.exists()
+
+    def _create_additional_matched_rule(self, **kwargs):
+        other_rule = ScannerRule.objects.create(
+            name='rule-2', scanner=self.scanner, **kwargs
+        )
+        other_result = ScannerResult.objects.create(
+            version=self.version, scanner=self.scanner
+        )
+        other_result.matched_rules.add(other_rule)
+        return other_rule
+
+    @mock.patch('olympia.scanners.models._flag_for_human_review')
+    @mock.patch('olympia.scanners.models._delay_auto_approval_indefinitely')
+    def test_execute_workflow_action_limited_to_rules(
+        self, _delay_auto_approval_indefinitely_mock, _flag_for_human_review_mock
+    ):
+        self.scanner_rule.update(action=FLAG_FOR_HUMAN_REVIEW)
+        # More severe, but it's not part of the rules we pass.
+        self._create_additional_matched_rule(action=DELAY_AUTO_APPROVAL_INDEFINITELY)
+
+        ScannerResult.run_actions(
+            self.version, rules=self.scanner_result.matched_rules.all()
+        )
+
+        assert not _delay_auto_approval_indefinitely_mock.called
+        _flag_for_human_review_mock.assert_called_with(
+            version=self.version, rule=self.scanner_rule
+        )
+
+    @mock.patch('olympia.scanners.models._delay_auto_approval_indefinitely')
+    def test_execute_workflow_action_without_rules_considers_all(
+        self, _delay_auto_approval_indefinitely_mock
+    ):
+        self.scanner_rule.update(action=FLAG_FOR_HUMAN_REVIEW)
+        other_rule = self._create_additional_matched_rule(
+            action=DELAY_AUTO_APPROVAL_INDEFINITELY
+        )
+
+        ScannerResult.run_actions(self.version)
+
+        _delay_auto_approval_indefinitely_mock.assert_called_with(
+            version=self.version, rule=other_rule
+        )
+
+    def test_execute_policy_enforcement_action_limited_to_rules(self):
+        policy = CinderPolicy.objects.create(
+            uuid=uuid.uuid4().hex,
+            name='some policy name',
+            text='some policy text',
+            enforcement_actions=[DECISION_ACTIONS.AMO_DISABLE_ADDON.api_value],
+        )
+        # This policy was already enforced through another result: passing
+        # `rules` is what prevents us from enforcing it a second time.
+        self._create_additional_matched_rule(policy=policy)
+
+        ScannerResult.run_actions(
+            self.version, rules=self.scanner_result.matched_rules.all()
+        )
+
+        self.addon.reload()
+        assert self.addon.status == amo.STATUS_APPROVED
+        assert not ContentDecision.objects.exists()
+        assert len(responses.calls) == 0

@@ -1,0 +1,386 @@
+name: CI
+
+on:
+  # Runs when there is a push to the default branch
+  # This triggers tests and a pushed "latest" image
+  # That is deployed to the "dev" environment
+  push:
+    branches:
+      - master
+  # Runs on pull requests to verify changes and push
+  # PR image for local testing
+  pull_request:
+  # Manually dispatch run entire CI on a ref
+  workflow_dispatch:
+  # Runs when a release is published
+  # Pushes a tagged image
+  # That is deployed to the "staging/production" environments
+  release:
+    types: [published]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name}}-${{ github.ref}}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  docs_artifact: docs
+
+jobs:
+  context:
+    runs-on: ubuntu-latest
+
+    outputs:
+      is_fork: ${{ steps.context.outputs.is_fork }}
+      is_release_master: ${{ steps.context.outputs.is_release_master }}
+      is_default_branch: ${{ steps.context.outputs.is_default_branch }}
+      is_release_tag: ${{ steps.context.outputs.is_release_tag }}
+      docker_version: ${{ steps.context.outputs.docker_version }}
+
+      git_ref: ${{ steps.git.outputs.git_ref }}
+      git_ref_link: ${{ steps.git.outputs.git_ref_link }}
+
+    steps:
+      - name: Set context
+        id: context
+        uses: mozilla/addons/.github/actions/context@c2dc2fd5862487f41add188a13243c2e71fdaa42  # 1.3
+
+      - name: Git Reference
+        id: git
+        env:
+          sha: ${{ github.sha }}
+          event_name: ${{ github.event_name }}
+          pr_title: ${{ github.event.pull_request.title }}
+          pr_link: ${{ github.event.pull_request.html_url}}
+          push_title: ${{ github.event.head_commit.message }}
+          push_link: ${{ github.event.head_commit.url }}
+          release_title: ${{ github.event.release.name }}
+          release_link: ${{ github.event.release.html_url }}
+          git_url: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          short_sha=$(echo "${sha}" | cut -c1-7)
+
+          git_ref="no ref"
+          git_ref_link="${git_url}"
+
+          if [[ "${event_name}" == "pull_request" ]]; then
+            git_ref="${pr_title}"
+            git_ref_link="${pr_link}"
+          elif [[ "${event_name}" == "push" ]]; then
+            git_ref="${short_sha} (${push_title}...)"
+            git_ref_link="${push_link}"
+          elif [[ "${event_name}" == "release" ]]; then
+            git_ref="${release_title}"
+            git_ref_link="${release_link}"
+          fi
+
+          git_ref=$(echo -e "${git_ref}" | head -n1 | tr -dc '[:print:]')
+          echo "git_ref=${git_ref}" >> "$GITHUB_OUTPUT"
+          echo "git_ref_link=${git_ref_link}" >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
+  test_actions:
+    permissions:
+      contents: 'read'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [actionlint]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run ${{ matrix.target }}
+        run: make ${{ matrix.target }}
+
+  build:
+    name: ${{ needs.context.outputs.is_fork == 'true' && 'Skip' || 'Build' }}  CI Image
+    runs-on: ubuntu-latest
+    needs: context
+
+    outputs:
+      # If build is skipped we should pass local version to build the image
+      version: ${{ steps.build.outputs.version || 'local' }}
+      digest: ${{ steps.build.outputs.digest || '' }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mozilla-l10n/addons-server-l10n
+          persist-credentials: false
+          path: locale
+
+      - name: Login to Dockerhub
+        if: needs.context.outputs.is_fork == 'false'
+        id: docker_hub
+        uses: mozilla/addons/.github/actions/login-docker@c2dc2fd5862487f41add188a13243c2e71fdaa42  # 1.3
+        with:
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PASS }}
+
+      - name: Build and Push Image
+        if: steps.docker_hub.outcome == 'success'
+        id: build
+        uses: ./.github/actions/build-docker
+        with:
+          registry: ${{ steps.docker_hub.outputs.registry }}
+          image: ${{ steps.docker_hub.outputs.image }}
+          version: ci-${{ needs.context.outputs.docker_version }}
+          push: true
+
+  docs_build:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mozilla-l10n/addons-server-l10n
+          persist-credentials: false
+          path: locale
+
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Build Docs
+        uses: ./.github/actions/run-docker
+        with:
+          digest: ${{ needs.build.outputs.digest }}
+          version: ${{ needs.build.outputs.version }}
+          deps: development
+          run: |
+            make docs
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: 'docs/_build/html'
+          name: ${{ env.docs_artifact }}
+
+  docs_deploy:
+    needs: [context, docs_build]
+    # Only deploy docs on a push event
+    # to the default branch
+    # that is not running on a fork
+    if: |
+      github.event_name == 'push' &&
+      needs.context.outputs.is_default_branch == 'true' &&
+      needs.context.outputs.is_fork == 'false'
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+        with:
+          artifact_name: ${{ env.docs_artifact }}
+
+  locales:
+    runs-on: ubuntu-latest
+    needs: [build, context]
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mozilla-l10n/addons-server-l10n
+          token: ${{ secrets.L10N_GITHUB_TOKEN || github.token }}
+          persist-credentials: ${{ needs.context.outputs.is_default_branch }}
+          path: locale
+
+      - name: Extract Locales
+        uses: ./.github/actions/run-docker
+        with:
+          digest: ${{ needs.build.outputs.digest }}
+          version: ${{ needs.build.outputs.version }}
+          deps: development
+          run: make extract_locales
+
+      - name: Push Locales
+        if:  |
+          github.event_name == 'push' ||
+          github.event_name == 'pull_request'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.L10N_GITHUB_TOKEN || github.token }}
+          is_fork: ${{ needs.context.outputs.is_fork }}
+          is_default_branch: ${{ needs.context.outputs.is_default_branch }}
+          is_push: ${{ github.event_name == 'push' }}
+        run: |
+          if [[ "$is_fork" == 'true' ]]; then
+            cat <<'EOF'
+              Github actions are not authorized to push from workflows triggered by forks.
+              We cannot verify if the l10n extraction push will work or not.
+              Please submit a PR from the base repository if you are modifying l10n extraction scripts.
+          EOF
+          else
+            if [[ "$is_default_branch" == 'true' && "$is_push" == 'true' ]]; then
+              args=""
+            else
+              args="--dry-run"
+            fi
+            make push_locales ARGS="${args}"
+          fi
+
+  health_check:
+    needs: context
+    uses: ./.github/workflows/_health_check.yml
+    with:
+      environment: host
+      slack_channel: ${{ vars.SLACK_ADDONS_PRODUCTION_CHANNEL }}
+
+  test:
+    needs: [context, build]
+    uses: ./.github/workflows/_test_main.yml
+    with:
+      version: ${{ needs.build.outputs.version }}
+      digest: ${{ needs.build.outputs.digest }}
+
+  test_check:
+    needs: [context, build]
+    uses: ./.github/workflows/_test_check.yml
+    with:
+      version: ${{ needs.build.outputs.version }}
+      digest: ${{ needs.build.outputs.digest }}
+
+  push_dockerhub:
+    name: Push Production Docker Image (Dockerhub)
+    runs-on: ubuntu-latest
+    if: |
+      needs.context.outputs.is_release_master == 'true' ||
+      needs.context.outputs.is_release_tag == 'true'
+    needs: [context, build, docs_build, locales, test]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mozilla-l10n/addons-server-l10n
+          persist-credentials: false
+          path: locale
+
+      - name: Login to Dockerhub
+        id: docker_hub
+        uses: mozilla/addons/.github/actions/login-docker@c2dc2fd5862487f41add188a13243c2e71fdaa42  # 1.3
+        with:
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PASS }}
+
+      - name: Build and Push Image
+        id: build
+        uses: ./.github/actions/build-docker
+        with:
+          registry: ${{ steps.docker_hub.outputs.registry }}
+          image: ${{ steps.docker_hub.outputs.image }}
+          version: ${{ needs.context.outputs.docker_version }}
+          push: true
+
+  push_gar:
+    name: Push Production Docker Image (GAR)
+    runs-on: ubuntu-latest
+    if: |
+      needs.context.outputs.is_release_master == 'true' ||
+      needs.context.outputs.is_release_tag == 'true'
+    needs: [context, build, docs_build, locales, test]
+
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+
+    env:
+      registry: us-docker.pkg.dev
+      image: moz-fx-amo-prod/amo-prod/addons-server
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mozilla-l10n/addons-server-l10n
+          persist-credentials: false
+          path: locale
+
+      - name: Login to GAR
+        id: docker_gar
+        uses: mozilla/addons/.github/actions/login-gar@c2dc2fd5862487f41add188a13243c2e71fdaa42  # 1.3
+        with:
+          registry: ${{ env.registry }}
+          service_account: ${{ secrets.GAR_PUSHER_SERVICE_ACCOUNT_EMAIL }}
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+
+      - name: Build and Push Image
+        id: build
+        uses: ./.github/actions/build-docker
+        with:
+          registry: ${{ env.registry }}
+          image: ${{ env.image }}
+          version: ${{ needs.context.outputs.docker_version }}
+          push: true
+
+  notification:
+    runs-on: ubuntu-latest
+    name: Notification (${{ matrix.name }})
+    if: needs.context.outputs.is_fork == 'false' && always()
+    needs: [context, push_dockerhub, push_gar]
+    strategy:
+      matrix:
+        include:
+          -
+            name: Master Build
+            dry_run: ${{ needs.context.outputs.is_release_master != 'true' }}
+          -
+            name: Release Build
+            dry_run: ${{ needs.context.outputs.is_release_tag != 'true' }}
+
+    steps:
+
+    - name: Slack Notification
+      uses: mozilla/addons/.github/actions/slack-workflow-notification@c2dc2fd5862487f41add188a13243c2e71fdaa42  # 1.3
+      with:
+        slack_token: ${{ secrets.SLACK_TOKEN }}
+        slack_channel: ${{ vars.SLACK_ADDONS_PRODUCTION_CHANNEL }}
+        conclusion: "${{ needs.push_gar.result }}"
+        text: "${{ needs.context.outputs.git_ref }}"
+        text_link: "${{ needs.context.outputs.git_ref_link }}"
+        context: |
+          {
+            "actor": "${{ github.event.sender.login }}",
+            "event": "${{ github.event_name }}",
+            "env": "ci",
+            "repo": "${{ github.repository }}"
+          }
+        links: |
+          {
+            "${{ github.run_id }}": "${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}",
+            "${{ github.repository }}": "${{ github.server_url }}/${{ github.repository }}"
+          }
+        dry_run: ${{ matrix.dry_run }}

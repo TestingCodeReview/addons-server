@@ -67,7 +67,8 @@
                 right: 0;
             }
         }
-        ul.refinements li a {
+        ul.refinements li a,
+        ul.refinements li button {
             padding: 0 10px 0 0;
         }
 
@@ -81,90 +82,6 @@
     color: #777;
     font-size: 17px;
     line-height: 1.3em;
-}
-
-#jetpack-overlay {
-    background-color: rgba(0, 0, 0, 0.6);
-    height: 100%;
-    left: 0;
-    position: fixed;
-    top: 0;
-    width: 100%;
-    z-index: 1000;
-    text-align: center;
-
-    video {
-        .border-box();
-        max-height: 100%;
-        padding: 1em;
-        width: 100%;
-    }
-}
-
-#jetpack {
-    ul {
-        color: #777;
-        font-size: 14px;
-        list-style: disc;
-        padding-bottom: 1em;
-        list-style-position: inside;
-
-        li {
-            padding-bottom: 5px;
-        }
-    }
-
-    h2.section {
-        font-family: Georgia;
-        font-size: 25px;
-        font-style: italic;
-        margin-bottom: 0.5em;
-    }
-    p {
-        .p-light;
-        margin-bottom: 1em;
-    }
-    .island p {
-        font-size: 14px;
-    }
-    h2 a {
-        font-weight: bold;
-    }
-    .cols-light {
-        div {
-            padding: 0 2em;
-            margin: 2em 0;
-            border-left: 2px dotted #C6E1FF;
-
-            &:first-child {
-                border-left: 0 none;
-            }
-            h3 {
-                color: #555;
-                font-weight: bold;
-                font-size: 1.3em;
-                margin-bottom: 0.5em;
-            }
-            p {
-                font-size: 1em;
-            }
-        }
-    }
-    .jetpack-builder, .jetpack-sdk {
-        padding: 1em 0 1em 100px;
-        position: relative;
-
-        img {
-            position: absolute;
-            top: 10px;
-            left: 5px;
-        }
-    }
-    .jetpack_footer {
-        color: #555;
-        margin-top: 1em;
-        text-align: center;
-    }
 }
 
 .html-rtl #devhub-promo {
@@ -206,7 +123,6 @@
     li {
         border: medium none;
         padding-bottom: 1em;
-        font-family: verdana;
         font-size: 11px;
 
         a {
@@ -326,7 +242,8 @@
                 width: 12px;
             }
             li.distribution-tag-unlisted,
-            li.distribution-tag-listed {
+            li.distribution-tag-listed,
+            li.distribution-tag-enterprise {
                 padding-top: 5px;
                 border-top: 1px dotted #94bfce;
             }
@@ -348,8 +265,10 @@
         li a {
             color: #3d6db5;
             font-size: .923em;
+            font-weight: inherit;
             padding: 0 0 0 10px;
         }
+
         li.addon-manage a {
             display: inline;
             &:last-child {
@@ -526,17 +445,6 @@
     }
 }
 
-#icon_preview_48 {
-    line-height: 48px;
-    width: 48px;
-    height: 48px;
-
-    img {
-        max-width: 48px;
-        max-height: 48px;
-    }
-}
-
 #icon_preview_64 {
     line-height: 64px;
     width: 64px;
@@ -545,6 +453,17 @@
     img {
         max-width: 64px;
         max-height: 64px;
+    }
+}
+
+#icon_preview_128 {
+    line-height: 128px;
+    width: 128px;
+    height: 128px;
+
+    img {
+        max-width: 128px;
+        max-height: 128px;
     }
 }
 
@@ -579,5 +498,22 @@
     .failure {
          .border-radius(0 5px 5px 0);
         background: #800;
+    }
+}
+
+#content-review-rejection {
+    background-color: #FFF9E2;
+    border: 1px solid #D4D9E3;
+    border-radius: 8px;
+    margin-bottom: 1em;
+    padding: 1em;
+
+    .rejection-policies {
+        margin: 0.5em;
+
+        ul {
+            list-style: disc;
+            padding-inline-start: 1em;
+        }
     }
 }

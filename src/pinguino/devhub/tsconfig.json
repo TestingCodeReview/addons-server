@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["vite/client"],
+
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    // Allow the explicit .ts extension on vite.config.ts's import of ./src/base.ts
+    "allowImportingTsExtensions": true,
+
+    // Lit uses TypeScript's legacy decorators for @customElement/@property.
+    "experimentalDecorators": true,
+    "useDefineForClassFields": false,
+
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["src", "tests", "vite.config.ts", "vitest.config.ts"]
+}

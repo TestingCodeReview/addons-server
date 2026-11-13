@@ -1,72 +1,64 @@
-import os
-import time
+from datetime import date
 
-from datetime import datetime, timedelta
-
-from django.conf import settings
-from django.db import connections
-from django.db.models import Avg, F, Q, Sum
-from django.utils.encoding import force_text
-
-import multidb
-import waffle
-
-from celery import group
+from django.db.models import IntegerField, Value
 
 import olympia.core.logger
-
 from olympia import amo
+from olympia.abuse.tasks import (
+    flag_high_abuse_reports_addons_according_to_review_tier,
+)
 from olympia.addons.models import Addon, FrozenAddon
 from olympia.addons.tasks import (
+    flag_high_hotness_according_to_review_tier,
     update_addon_average_daily_users as _update_addon_average_daily_users,
-    update_addon_download_totals as _update_addon_download_totals,
-    update_appsupport)
+    update_addon_hotness as _update_addon_hotness,
+    update_addon_weekly_downloads as _update_addon_weekly_downloads,
+)
+from olympia.amo.celery import create_chunked_tasks_signatures
 from olympia.amo.decorators import use_primary_db
-from olympia.amo.utils import chunked, walkfiles
-from olympia.files.models import File
-from olympia.lib.es.utils import raise_if_reindex_in_progress
-from olympia.stats.models import UpdateCount
+from olympia.promoted.tasks import add_high_adu_extensions_to_notable
+from olympia.ratings.tasks import flag_high_rating_addons_according_to_review_tier
+from olympia.stats.utils import (
+    get_addons_and_average_daily_users_from_bigquery,
+    get_addons_and_weekly_downloads_from_bigquery,
+    get_averages_by_addon_from_bigquery,
+)
 
 
 log = olympia.core.logger.getLogger('z.cron')
 task_log = olympia.core.logger.getLogger('z.task')
 
 
-def update_addon_average_daily_users():
+def update_addon_average_daily_users(chunk_size=250):
     """Update add-ons ADU totals."""
-    if not waffle.switch_is_active('local-statistics-processing'):
-        return False
-
-    raise_if_reindex_in_progress('amo')
-    cursor = connections[multidb.get_slave()].cursor()
-    q = """SELECT addon_id, AVG(`count`)
-           FROM update_counts
-           WHERE `date` > DATE_SUB(CURDATE(), INTERVAL 13 DAY)
-           GROUP BY addon_id
-           ORDER BY addon_id"""
-    cursor.execute(q)
-    d = cursor.fetchall()
-    cursor.close()
-
-    ts = [_update_addon_average_daily_users.subtask(args=[chunk])
-          for chunk in chunked(d, 250)]
-    group(ts).apply_async()
-
-
-def update_addon_download_totals():
-    """Update add-on total and average downloads."""
-    if not waffle.switch_is_active('local-statistics-processing'):
-        return False
-
-    qs = (
-        Addon.objects
-             .annotate(sum_download_count=Sum('downloadcount__count'))
-             .values_list('id', 'sum_download_count')
-             .order_by('id')
+    counts = dict(
+        # In order to reset the `average_daily_users` values of add-ons that
+        # don't exist in BigQuery, we prepare a set of `(guid, 0)` for most
+        # add-ons.
+        Addon.unfiltered.filter(type__in=amo.ADDON_TYPES_WITH_STATS)
+        .exclude(guid__isnull=True)
+        .exclude(guid__exact='')
+        .exclude(average_daily_users=0)
+        .annotate(count=Value(0, IntegerField()))
+        .values_list('guid', 'count')
+        # Just to make order predictable in tests, we order by id. This
+        # matches the GROUP BY being generated so it should be safe.
+        .order_by('id')
     )
-    ts = [_update_addon_download_totals.subtask(args=[chunk])
-          for chunk in chunked(qs, 250)]
-    group(ts).apply_async()
+    # Update the `counts` with values from BigQuery.
+    counts.update(get_addons_and_average_daily_users_from_bigquery())
+    counts = list(counts.items())
+
+    log.info('Preparing update of `average_daily_users` for %s add-ons.', len(counts))
+
+    (
+        create_chunked_tasks_signatures(
+            _update_addon_average_daily_users, counts, chunk_size
+        )
+        | add_high_adu_extensions_to_notable.si()
+        | flag_high_abuse_reports_addons_according_to_review_tier.si()
+        | flag_high_rating_addons_according_to_review_tier.si()
+    ).apply_async()
 
 
 def _change_last_updated(next):
@@ -85,7 +77,7 @@ def _change_last_updated(next):
     if not changes:
         return
 
-    log.debug('Updating %s add-ons' % len(changes))
+    log.info('Updating %s add-ons' % len(changes))
     # Update + invalidate.
     qs = Addon.objects.filter(id__in=changes).no_transforms()
     for addon in qs:
@@ -102,123 +94,78 @@ def addon_last_updated():
     _change_last_updated(next)
 
     # Get anything that didn't match above.
-    other = (Addon.objects.filter(last_updated__isnull=True)
-             .values_list('id', 'created'))
+    other = Addon.objects.filter(last_updated__isnull=True).values_list('id', 'created')
     _change_last_updated(dict(other))
 
 
-def update_addon_appsupport():
-    # Find all the add-ons that need their app support details updated.
-    newish = (Q(last_updated__gte=F('appsupport__created')) |
-              Q(appsupport__created__isnull=True))
-    # Search providers don't list supported apps.
-    has_app = Q(versions__apps__isnull=False) | Q(type=amo.ADDON_SEARCH)
-    has_file = Q(versions__files__status__in=amo.VALID_FILE_STATUSES)
-    good = Q(has_app, has_file) | Q(type=amo.ADDON_PERSONA)
-    ids = (Addon.objects.valid().distinct()
-           .filter(newish, good).values_list('id', flat=True))
-
-    task_log.info('Updating appsupport for %d new-ish addons.' % len(ids))
-    ts = [update_appsupport.subtask(args=[chunk])
-          for chunk in chunked(ids, 20)]
-    group(ts).apply_async()
-
-
-def hide_disabled_files():
-    # If an add-on or a file is disabled, it should be moved to
-    # GUARDED_ADDONS_PATH so it's not publicly visible.
-    q = (Q(version__addon__status=amo.STATUS_DISABLED) |
-         Q(version__addon__disabled_by_user=True))
-    ids = (File.objects.filter(q | Q(status=amo.STATUS_DISABLED))
-           .values_list('id', flat=True))
-    for chunk in chunked(ids, 300):
-        qs = File.objects.filter(id__in=chunk)
-        qs = qs.select_related('version')
-        for f in qs:
-            f.hide_disabled_file()
-
-
-def unhide_disabled_files():
-    # Files are getting stuck in /guarded-addons for some reason. This job
-    # makes sure guarded add-ons are supposed to be disabled.
-    log = olympia.core.logger.getLogger('z.files.disabled')
-    q = (Q(version__addon__status=amo.STATUS_DISABLED) |
-         Q(version__addon__disabled_by_user=True))
-    files = set(File.objects.filter(q | Q(status=amo.STATUS_DISABLED))
-                .values_list('version__addon', 'filename'))
-    for filepath in walkfiles(settings.GUARDED_ADDONS_PATH):
-        filepath = force_text(filepath)
-        addon, filename = filepath.split('/')[-2:]
-        if tuple([int(addon), filename]) not in files:
-            log.warning(u'File that should not be guarded: %s.', filepath)
-            try:
-                file_ = (File.objects.select_related('version__addon')
-                         .get(version__addon=addon, filename=filename))
-                file_.unhide_disabled_file()
-            except File.DoesNotExist:
-                log.warning(u'File object does not exist for: %s.' % filepath)
-            except Exception:
-                log.error(u'Could not unhide file: %s.' % filepath,
-                          exc_info=True)
-
-
-def deliver_hotness():
+def update_addon_hotness(chunk_size=300):
     """
     Calculate hotness of all add-ons.
 
-    a = avg(users this week)
-    b = avg(users three weeks before this week)
-    hotness = (a-b) / b if a > 1000 and b > 1 else 0
+    a = avg(users this week - excluding week-ends)
+    b = avg(users previous week before this week - excluding week-ends)
+    threshold = 250 if addon type is theme, else 1000
+    hotness = (a-b) / b if a > threshold and b > 1 else 0
     """
-    frozen = set(f.id for f in FrozenAddon.objects.all())
-    all_ids = list((Addon.objects.exclude(type=amo.ADDON_PERSONA)
-                   .filter(status__in=amo.REVIEWED_STATUSES)
-                   .values_list('id', flat=True)))
-    now = datetime.now()
-    one_week = now - timedelta(days=7)
-    four_weeks = now - timedelta(days=28)
+    frozen_guids = list(
+        {fa.addon.guid for fa in FrozenAddon.objects.all() if fa.addon.guid}
+    )
+    log.info('Found %s frozen add-on GUIDs.', len(frozen_guids))
 
-    for ids in chunked(all_ids, 300):
-        addons = Addon.objects.filter(id__in=ids).no_transforms()
-        ids = [a.id for a in addons if a.id not in frozen]
-        qs = (UpdateCount.objects.filter(addon__in=ids)
-              .values_list('addon').annotate(Avg('count')))
-        thisweek = dict(qs.filter(date__gte=one_week))
-        threeweek = dict(qs.filter(date__range=(four_weeks, one_week)))
-        for addon in addons:
-            this, three = thisweek.get(addon.id, 0), threeweek.get(addon.id, 0)
+    # Base list of add-ons that should get their hotness reset to 0 if they
+    # don't have anything in BigQuery. We don't reset the guid-less ones (BQ
+    # won't have data on them, so it'd be innacurate) and the ones that already
+    # have hotness set to 0 (it's pointless to reset it).
+    amo_guids = (
+        Addon.unfiltered.exclude(guid__in=frozen_guids)
+        .exclude(guid__isnull=True)
+        .exclude(guid__exact='')
+        .exclude(hotness=0)
+        .values_list('guid', flat=True)
+    )
+    averages = {
+        guid: {'avg_this_week': 1, 'avg_previous_week': 1} for guid in amo_guids
+    }
+    log.info('Found %s add-on GUIDs in AMO DB.', len(averages))
 
-            # Update the hotness score but only update hotness if necessary.
-            # We don't want to cause unnecessary re-indexes
-            if this > 1000 and three > 1:
-                hotness = (this - three) / float(three)
-                if addon.hotness != hotness:
-                    addon.update(hotness=(this - three) / float(three))
-            else:
-                if addon.hotness != 0:
-                    addon.update(hotness=0)
+    # Gather stats about all add-ons from BigQuery.
+    bq_averages = get_averages_by_addon_from_bigquery(
+        today=date.today(), exclude=frozen_guids
+    )
+    log.info('Found %s add-on GUIDs with averages in BigQuery.', len(bq_averages))
 
-        # Let the database catch its breath.
-        time.sleep(10)
+    averages.update(bq_averages)
+    log.info('Preparing update of `hotness` for %s add-ons.', len(averages))
+
+    (
+        create_chunked_tasks_signatures(
+            _update_addon_hotness, averages.items(), chunk_size
+        )
+        | flag_high_hotness_according_to_review_tier.si()
+    ).apply_async()
 
 
-def cleanup_image_files():
+def update_addon_weekly_downloads(chunk_size=250):
     """
-    Clean up all header images files for themes.
-
-    We use these images to asynchronuously generate thumbnails with
-    tasks, here we delete images that are older than one day.
-
+    Update 7-day add-on download counts.
     """
-    log.info('Removing one day old temporary image files for themes.')
-    for folder in ('persona_header', ):
-        root = os.path.join(settings.TMP_PATH, folder)
-        if not os.path.exists(root):
-            continue
-        for path in os.listdir(root):
-            full_path = os.path.join(root, path)
-            age = time.time() - os.stat(full_path).st_atime
-            if age > 60 * 60 * 24:  # One day.
-                log.debug('Removing image file: %s, %dsecs old.' %
-                          (full_path, age))
-                os.unlink(full_path)
+    counts = dict(
+        # In order to reset the `weekly_downloads` values of add-ons that
+        # don't exist in BigQuery, we prepare a set of `(hashed_guid, 0)`
+        # for most add-ons.
+        Addon.objects.filter(type__in=amo.ADDON_TYPES_WITH_STATS)
+        .exclude(guid__isnull=True)
+        .exclude(guid__exact='')
+        .exclude(weekly_downloads=0)
+        .annotate(count=Value(0, IntegerField()))
+        .values_list('addonguid__hashed_guid', 'count')
+    )
+    # Update the `counts` with values from BigQuery.
+    counts.update(get_addons_and_weekly_downloads_from_bigquery())
+    counts = list(counts.items())
+
+    log.info('Preparing update of `weekly_downloads` for %s add-ons.', len(counts))
+
+    create_chunked_tasks_signatures(
+        _update_addon_weekly_downloads, counts, chunk_size
+    ).apply_async()

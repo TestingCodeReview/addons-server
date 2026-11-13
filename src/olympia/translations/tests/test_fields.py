@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import django  # noqa
 
 from django.db import migrations, models
@@ -20,14 +19,17 @@ def test_translated_field_supports_migration():
         'charfield': TranslatedField(),
     }
 
-    migration = type(str('Migration'), (migrations.Migration,), {
-        'operations': [
-            migrations.CreateModel(
-                name='MyModel', fields=tuple(fields.items()),
-                bases=(models.Model,)
-            ),
-        ],
-    })
+    migration = type(
+        'Migration',
+        (migrations.Migration,),
+        {
+            'operations': [
+                migrations.CreateModel(
+                    name='MyModel', fields=tuple(fields.items()), bases=(models.Model,)
+                ),
+            ],
+        },
+    )
     writer = MigrationWriter(migration)
     output = writer.as_string()
 
@@ -39,9 +41,10 @@ def test_translated_field_supports_migration():
 
 def test_user_foreign_key_field_deconstruct():
     field = TranslatedField(require_locale=False)
-    name, path, args, kwargs = field.deconstruct()
+    _name, _path, _args, kwargs = field.deconstruct()
     new_field_instance = TranslatedField(require_locale=False)
 
     assert kwargs['require_locale'] == new_field_instance.require_locale
     assert kwargs['to'] == new_field_instance.to
     assert kwargs['short'] == new_field_instance.short
+    assert kwargs['db_constraint'] is False

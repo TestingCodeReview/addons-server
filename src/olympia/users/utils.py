@@ -1,25 +1,29 @@
 import base64
+import datetime
 import hashlib
 import hmac
-import uuid
+import urllib
 
-from functools import partial
-
+from django import forms
 from django.conf import settings
-from django.db.models import Q
-from django.utils.encoding import force_bytes, force_text
+from django.core.exceptions import ImproperlyConfigured
+from django.template import loader
+from django.urls import reverse
+from django.utils.encoding import force_bytes, force_str
+from django.utils.translation import gettext
+
+import requests
+from django_statsd.clients import statsd
 
 import olympia.core.logger
-
-from olympia import amo
-from olympia.users.models import DeniedName, UserProfile
+from olympia import activity, amo, core
+from olympia.activity import log_create
 
 
 log = olympia.core.logger.getLogger('z.users')
 
 
-class UnsubscribeCode(object):
-
+class UnsubscribeCode:
     @classmethod
     def create(cls, email):
         """Encode+Hash an email for an unsubscribe code."""
@@ -34,20 +38,21 @@ class UnsubscribeCode(object):
         try:
             decoded = base64.urlsafe_b64decode(force_bytes(code))
             email = decoded
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as exc:
             # Data is broken
-            raise ValueError
+            raise ValueError from exc
 
         if cls.make_secret(decoded) != hash:
-            log.info(u"[Tampering] Unsubscribe link data does not match hash")
+            log.info('[Tampering] Unsubscribe link data does not match hash')
             raise ValueError
 
-        return force_text(email)
+        return force_str(email)
 
     @classmethod
     def make_secret(cls, token):
-        return hmac.new(force_bytes(settings.SECRET_KEY), msg=token,
-                        digestmod=hashlib.sha256).hexdigest()
+        return hmac.new(
+            force_bytes(settings.SECRET_KEY), msg=token, digestmod=hashlib.sha256
+        ).hexdigest()
 
 
 def get_task_user():
@@ -55,45 +60,415 @@ def get_task_user():
     Returns a user object. This user is suitable for assigning to
     cron jobs or long running tasks.
     """
+    from olympia.users.models import UserProfile
+
     return UserProfile.objects.get(pk=settings.TASK_USER_ID)
 
 
-def find_users(email):
+def mail_addon_author_changes(
+    author, title, template_part, recipients, action=None, extra_context=None
+):
+    from olympia.amo.utils import send_mail
+
+    context_data = {
+        'author': author,
+        'addon': author.addon,
+        'DOMAIN': settings.DOMAIN,
+        **(extra_context or {}),
+    }
+    template = loader.get_template(f'users/emails/{template_part}.ltxt')
+    send_mail(
+        title, template.render(context_data), None, recipients, use_deny_list=False
+    )
+    if action:
+        log_create(action, author.user, author.get_role_display(), author.addon)
+
+
+def send_addon_author_add_mail(addon_user, existing_authors_emails):
+    from olympia.amo.templatetags.jinja_helpers import absolutify
+
+    mail_addon_author_changes(
+        author=addon_user,
+        title=gettext('An author has been added to your add-on'),
+        template_part='author_added',
+        recipients=list(existing_authors_emails),
+        action=amo.LOG.ADD_USER_WITH_ROLE,
+    )
+    mail_addon_author_changes(
+        author=addon_user,
+        title=gettext('Author invitation for {addon_name}').format(
+            addon_name=str(addon_user.addon.name)
+        ),
+        template_part='author_added_confirmation',
+        recipients=[addon_user.user.email],
+        action=None,
+        extra_context={
+            'author_confirmation_link': absolutify(
+                reverse('devhub.addons.invitation', args=(addon_user.addon.slug,))
+            )
+        },
+    )
+
+
+def send_addon_author_change_mail(addon_user, existing_authors_emails):
+    mail_addon_author_changes(
+        author=addon_user,
+        title=gettext('An author role has been changed on your add-on'),
+        template_part='author_changed',
+        recipients=list({*existing_authors_emails, addon_user.user.email}),
+        action=amo.LOG.CHANGE_USER_WITH_ROLE,
+    )
+
+
+def send_addon_author_remove_mail(addon_user, existing_authors_emails):
+    mail_addon_author_changes(
+        author=addon_user,
+        title=gettext('An author has been removed from your add-on'),
+        template_part='author_removed',
+        recipients=list({*existing_authors_emails, addon_user.user.email}),
+        action=amo.LOG.REMOVE_USER_WITH_ROLE,
+    )
+
+
+class RestrictionChecker:
     """
-    Given an email find all the possible users, by looking in
-    users and in their history.
+    Wrapper around all our submission and approval restriction classes.
+
+    To use, instantiate it with the request and call is_submission_allowed(),
+    or with None as the request and is_auto_approval_allowed() for approval after
+    submission.
+    After this method has been called, the error message to show the user if
+    needed will be available through get_error_message()
     """
-    return UserProfile.objects.filter(Q(email=email) |
-                                      Q(history__email=email)).distinct()
+
+    def __init__(self, *, request=None, upload=None):
+        self.request = request
+        self.upload = upload
+        if self.request:
+            self.user = self.request.user
+            self.ip_address = self.request.META.get('REMOTE_ADDR', '')
+            self.request_metadata = core.select_request_metadata(request.headers)
+        elif self.upload:
+            self.user = self.upload.user
+            self.ip_address = self.upload.ip_address
+            self.request_metadata = self.upload.request_metadata
+        else:
+            raise ImproperlyConfigured('RestrictionChecker needs a request or upload')
+        self.failed_restrictions = []
+        # UserRestrictionHistory instances created by the checks, exposed so
+        # that callers can annotate them further (Version.from_upload() sets
+        # version on them after the version has been created).
+        self.history_entries = []
+
+    def _is_action_allowed(self, action_type, *, restriction_choices=None):
+        from olympia.users.models import RESTRICTION_TYPES, UserRestrictionHistory
+
+        # Maps the action to the restriction_type its allow_*() method checks
+        # against - allow_submission(), allow_auto_approval(), allow_rating()
+        # and allow_rating_without_moderation() respectively. Keep in sync
+        # with those methods. 'rating_without_moderation' deliberately maps
+        # to RATING_MODERATE: the action is phrased as an allow-check, but
+        # the restrictions it consults are the flag-for-moderation ones.
+        restriction_type = {
+            'submission': RESTRICTION_TYPES.ADDON_SUBMISSION,
+            'auto_approval': RESTRICTION_TYPES.ADDON_APPROVAL,
+            'rating': RESTRICTION_TYPES.RATING,
+            'rating_without_moderation': RESTRICTION_TYPES.RATING_MODERATE,
+        }[action_type]
+        if restriction_choices is None:
+            # We use UserRestrictionHistory.RESTRICTION_CLASSES_CHOICES because it
+            # currently matches the order we want to check things. If that ever
+            # changes, keep RESTRICTION_CLASSES_CHOICES current order (to keep existing
+            # records intact) but change the `restriction_choices` definition below.
+            restriction_choices = UserRestrictionHistory.RESTRICTION_CLASSES_CHOICES
+        # Default to self.request because most action_types expect it
+        argument = self.upload if action_type == 'auto_approval' else self.request
+        for restriction_number, cls in restriction_choices:
+            if not hasattr(cls, f'allow_{action_type}'):
+                continue
+            allowed_method = getattr(cls, f'allow_{action_type}', None)
+            if allowed_method is None:
+                continue
+            allowed = allowed_method(argument)
+            if not allowed:
+                self.failed_restrictions.append(cls)
+                name = cls.__name__
+                statsd.incr(
+                    f'RestrictionChecker.is_{action_type}_allowed.{name}.failure'
+                )
+                if self.user and self.user.is_authenticated:
+                    # Slow path: enumerate which restriction(s) matched, so
+                    # that each match gets its own history row pointing at
+                    # the instance. Only for authenticated users - nothing
+                    # is recorded otherwise. Stateless classes have no
+                    # get_matching_restrictions().
+                    is_db_backed = hasattr(cls, 'get_matching_restrictions')
+                    matched = (
+                        cls.get_matching_restrictions(
+                            argument, restriction_type=restriction_type
+                        )
+                        if is_db_backed
+                        else []
+                    )
+                    if is_db_backed and not matched:
+                        # Should never happen: either the fast and slow
+                        # predicates have drifted apart, the restriction was
+                        # deleted between the two checks, or the denial was
+                        # structural (input missing or invalid, e.g. an
+                        # unparseable IP, which the fast path fail-closes
+                        # on). All are worth investigating.
+                        log.error(
+                            'No matching restrictions found for failed %s check on %s',
+                            action_type,
+                            name,
+                        )
+                    with core.override_remote_addr_or_metadata(
+                        ip_address=self.ip_address, metadata=self.request_metadata
+                    ):
+                        activity.log_create(
+                            amo.LOG.RESTRICTED,
+                            user=self.user,
+                            details={
+                                'restriction': str(cls.__name__),
+                                'restriction_ids': [
+                                    restriction.pk for restriction in matched
+                                ],
+                            },
+                        )
+                    # A failure with nothing enumerable still gets a single
+                    # row, with the instance fields left NULL.
+                    for matched_instance in matched or [None]:
+                        self.history_entries.append(
+                            UserRestrictionHistory.objects.create(
+                                user=self.user,
+                                ip_address=self.ip_address,
+                                last_login_ip=self.user.last_login_ip or '',
+                                restriction=restriction_number,
+                                restriction_instance=matched_instance,
+                            )
+                        )
+        suffix = 'success' if not self.failed_restrictions else 'failure'
+        statsd.incr(f'RestrictionChecker.is_{action_type}_allowed.%s' % suffix)
+        return not self.failed_restrictions
+
+    def is_submission_allowed(self, check_dev_agreement=True):
+        """
+        Check whether the `request` passed to the instance is allowed to submit add-ons.
+        Will check all classes declared in self.restriction_classes, but ignore those
+        that don't have a allow_submission() method.
+
+        Pass check_dev_agreement=False to avoid checking
+        DeveloperAgreementRestriction class, which is useful only for the
+        developer agreement page itself, where the developer hasn't validated
+        the agreement yet but we want to do the other checks anyway.
+        """
+        from olympia.users.models import (
+            DeveloperAgreementRestriction,
+            UserRestrictionHistory,
+        )
+
+        if not self.request:
+            raise ImproperlyConfigured('Need a request to call is_submission_allowed()')
+
+        if self.user and self.user.bypass_upload_restrictions:
+            return True
+
+        if check_dev_agreement is False:
+            restriction_choices = filter(
+                lambda item: item[1] != DeveloperAgreementRestriction,
+                UserRestrictionHistory.RESTRICTION_CLASSES_CHOICES,
+            )
+        else:
+            restriction_choices = None
+        return self._is_action_allowed(
+            'submission', restriction_choices=restriction_choices
+        )
+
+    def is_auto_approval_allowed(self):
+        """
+        Check whether the `upload` passed to the instance is allowed auto-approval.
+        Will check all classes declared in self.restriction_classes, but ignore those
+        that don't have a allow_auto_approval() method.
+        """
+
+        if not self.upload:
+            raise ImproperlyConfigured(
+                'Need an upload to call is_auto_approval_allowed()'
+            )
+
+        return self._is_action_allowed('auto_approval')
+
+    def is_rating_allowed(self):
+        """
+        Check whether the `request` passed to the instance is allowed to submit a
+        rating. Will check all classes declared in self.restriction_classes, but ignore
+        those that don't have a allow_rating() method.
+        """
+        return self._is_action_allowed('rating')
+
+    def should_moderate_rating(self):
+        """
+        Check whether the `request` passed to the instance should have ratings
+        moderated. Will check all classes declared in self.restriction_classes, but
+        ignore those that don't have a allow_rating_without_moderation() method.
+        """
+        return not self._is_action_allowed('rating_without_moderation')
+
+    def get_error_message(self):
+        """
+        Return the error message to show to the user after a call to
+        is_submission_allowed_for_request() has been made. Will return the
+        message to be displayed to the user, or None if there is no specific
+        restriction applying.
+        """
+        try:
+            msg = self.failed_restrictions[0].get_error_message(
+                is_api=self.request and self.request.is_api
+            )
+        except IndexError:
+            msg = None
+        return msg
 
 
-def autocreate_username(candidate, tries=1):
-    """Returns a unique valid username."""
-    max_tries = settings.MAX_GEN_USERNAME_TRIES
-    from olympia.amo.utils import slugify, SLUG_OK
-    make_u = partial(slugify, ok=SLUG_OK, lower=True, spaces=False,
-                     delimiter='-')
-    adjusted_u = make_u(candidate)
-    if tries > 1:
-        adjusted_u = '%s%s' % (adjusted_u, tries)
-    if (DeniedName.blocked(adjusted_u) or adjusted_u == '' or
-            tries > max_tries or len(adjusted_u) > 255):
-        log.info('username blocked, empty, max tries reached, or too long;'
-                 ' username=%s; max=%s' % (adjusted_u, max_tries))
-        return autocreate_username(uuid.uuid4().hex[0:15])
-    if UserProfile.objects.filter(username=adjusted_u).count():
-        return autocreate_username(candidate, tries=tries + 1)
-    return adjusted_u
+def upload_picture(user, picture):
+    from olympia.users.tasks import resize_photo
+
+    original = user.picture_path_original
+
+    storage = amo.utils.SafeStorage(root_setting='MEDIA_ROOT', rel_location='userpics')
+    with storage.open(original, 'wb') as original_file:
+        for chunk in picture.chunks():
+            original_file.write(chunk)
+    user.update(picture_type=picture.content_type)
+    resize_photo.delay(
+        original,
+        user.picture_path,
+        set_modified_on=user.serializable_reference(),
+    )
 
 
-def system_addon_submission_allowed(user, parsed_addon_data):
-    guid = parsed_addon_data.get('guid') or ''
-    return (
-        not guid.lower().endswith(amo.SYSTEM_ADDON_GUIDS) or
-        user.email.endswith(u'@mozilla.com'))
+def assert_socket_labs_settings_defined():
+    if not settings.SOCKET_LABS_TOKEN:
+        raise ImproperlyConfigured('SOCKET_LABS_TOKEN is not defined')
+
+    if not settings.SOCKET_LABS_HOST:
+        raise ImproperlyConfigured('SOCKET_LABS_HOST is not defined')
+
+    if not settings.SOCKET_LABS_SERVER_ID:
+        raise ImproperlyConfigured('SOCKET_LABS_SERVER_ID is not defined')
 
 
-def mozilla_signed_extension_submission_allowed(user, parsed_addon_data):
-    return (
-        not parsed_addon_data.get('is_mozilla_signed_extension') or
-        user.email.endswith(u'@mozilla.com'))
+utils_log = olympia.core.logger.getLogger('z.users')
+
+
+def check_suppressed_email_confirmation(verification, page_size=5):
+    from olympia.users.models import SuppressedEmailVerification
+
+    assert_socket_labs_settings_defined()
+
+    assert isinstance(verification, SuppressedEmailVerification)
+
+    email = verification.suppressed_email.email
+
+    current_count = 0
+    total = 0
+
+    code_snippet = str(verification.confirmation_code)[-5:]
+    path = f'servers/{settings.SOCKET_LABS_SERVER_ID}/reports/recipient-search/'
+
+    # socketlabs might set the queued time any time of day
+    # so we need to check to midnight, one day before the verification was created
+    # and to midnight of tomorrow
+    before = verification.created - datetime.timedelta(days=1)
+    start_date = datetime.datetime(
+        year=before.year,
+        month=before.month,
+        day=before.day,
+    )
+    end_date = datetime.datetime.now() + datetime.timedelta(days=1)
+    date_format = '%Y-%m-%d'
+
+    params = {
+        'toEmailAddress': email,
+        'startDate': start_date.strftime(date_format),
+        'endDate': end_date.strftime(date_format),
+        'pageNumber': 0,
+        'pageSize': page_size,
+        'sortField': 'queuedTime',
+        'sortDirection': 'dsc',
+    }
+
+    is_first_page = True
+
+    found_emails = []
+
+    while current_count < total or is_first_page:
+        if not is_first_page:
+            params['pageNumber'] = params['pageNumber'] + 1
+
+        url = (
+            urllib.parse.urljoin(settings.SOCKET_LABS_HOST, path)
+            + '?'
+            + urllib.parse.urlencode(params)
+        )
+
+        headers = {
+            'authorization': f'Bearer {settings.SOCKET_LABS_TOKEN}',
+        }
+
+        utils_log.info(f'checking for {code_snippet} with params {params}')
+
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        json_data = response.json()
+
+        utils_log.info(f'recieved data {json_data} for {code_snippet}')
+
+        if is_first_page:
+            total = json_data['total']
+
+            if total == 0:
+                return found_emails
+
+            is_first_page = False
+
+        data = json_data['data']
+        current_count += len(data)
+
+        utils_log.info(f'found emails {data} for {code_snippet}')
+
+        ## TODO: check if we can set `customMessageId` to replace code snippet
+        for item in data:
+            found_emails.append(
+                {
+                    'from': item['from'],
+                    'to': item['to'],
+                    'subject': item['subject'],
+                    'status': item['status'],
+                    'statusDate': item['statusDate'],
+                }
+            )
+
+            if code_snippet in item['subject'] and item['status'] == 'Delivered':
+                verification.mark_as_delivered()
+
+    return found_emails
+
+
+def validate_user_name(value, *, error_message, can_use_denied_names=False):
+    from olympia.amo.utils import validate_name
+
+    from .models import DeniedName
+
+    # Check to see if a given name is in the deny list.
+    denied_names = list(DeniedName.objects.values_list('name', flat=True))
+
+    def check_function(normalized_name, variant):
+        if not can_use_denied_names and any(
+            denied in variant for denied in denied_names
+        ):
+            raise forms.ValidationError(error_message)
+
+    return validate_name(
+        value, check_function=check_function, error_message=error_message
+    )

@@ -1,227 +1,186 @@
-from django.conf import settings
-from django.core.management.base import BaseCommand, CommandError
-from django.db.models import Q
-
-from celery import chord, group
+from django.db.models import Exists, F, OuterRef, Q
 
 from olympia import amo
+from olympia.abuse.models import AbuseReport
 from olympia.addons.models import Addon
 from olympia.addons.tasks import (
-    add_dynamic_theme_tag,
-    add_firefox57_tag,
-    bump_appver_for_legacy_addons,
-    disable_legacy_files,
+    ERRONEOUSLY_ADDED_OVERGROWTH_DATE_RANGE,
+    delete_addons,
+    delete_erroneously_added_overgrowth_needshumanreview,
     extract_colors_from_static_themes,
     find_inconsistencies_between_es_and_db,
-    migrate_legacy_dictionaries_to_webextension,
-    migrate_lwts_to_static_themes,
-    migrate_webextensions_to_git_storage,
     recreate_theme_previews,
-    remove_amo_links_in_url_fields)
-from olympia.amo.utils import chunked
+)
+from olympia.amo.management import ProcessObjectsCommand
+from olympia.constants.base import (
+    _ADDON_LPADDON,
+    _ADDON_PERSONA,
+    _ADDON_PLUGIN,
+    _ADDON_THEME,
+    _ADDON_WEBAPP,
+    COSE_DATE_CUTOFF,
+)
 from olympia.devhub.tasks import get_preview_sizes, recreate_previews
-from olympia.lib.crypto.tasks import sign_addons
+from olympia.lib.crypto.tasks import bump_and_resign_addons
+from olympia.ratings.tasks import addon_rating_aggregates
+from olympia.reviewers.models import NeedsHumanReview
 from olympia.reviewers.tasks import recalculate_post_review_weight
-from olympia.versions.compare import version_int
+from olympia.versions.tasks import delete_list_theme_previews
 
 
-firefox_56_star = version_int('56.*')
-current_autoapprovalsummary = '_current_version__autoapprovalsummary__'
+class Command(ProcessObjectsCommand):
+    def get_model(self):
+        return Addon
 
-
-tasks = {
-    'find_inconsistencies_between_es_and_db': {
-        'method': find_inconsistencies_between_es_and_db, 'qs': []},
-    'get_preview_sizes': {'method': get_preview_sizes, 'qs': []},
-    'recalculate_post_review_weight': {
-        'method': recalculate_post_review_weight,
-        'qs': [
-            Q(**{current_autoapprovalsummary + 'verdict': amo.AUTO_APPROVED}) &
-            ~Q(**{current_autoapprovalsummary + 'confirmed': True})
-        ]},
-    'sign_addons': {
-        'method': sign_addons,
-        'qs': []},
-    'add_firefox57_tag_to_webextensions': {
-        'method': add_firefox57_tag,
-        'qs': [
-            Q(status=amo.STATUS_PUBLIC) & (
-                Q(_current_version__files__is_webextension=True) |
-                Q(_current_version__files__is_mozilla_signed_extension=True)
+    def get_tasks(self):
+        def get_recalc_needed_filters():
+            summary_modified_field = '_current_version__autoapprovalsummary__modified'
+            recent_abuse_reports_subquery = AbuseReport.objects.filter(
+                created__gte=OuterRef(summary_modified_field),
+                guid=OuterRef('guid'),
             )
-        ]},
-    'bump_appver_for_legacy_addons': {
-        'method': bump_appver_for_legacy_addons,
-        'qs': [
-            Q(
-                type__in=(amo.ADDON_EXTENSION, amo.ADDON_THEME),
-                _current_version__files__is_webextension=False,
-                _current_version__apps__max__version_int__lt=firefox_56_star,
-                _current_version__apps__application__in=(
-                    amo.FIREFOX.id, amo.ANDROID.id))
-        ],
-        'pre': lambda values_qs: values_qs.distinct(),
-    },
-    'migrate_lwt': {
-        'method': migrate_lwts_to_static_themes,
-        'qs': [
-            Q(type=amo.ADDON_PERSONA, status=amo.STATUS_PUBLIC)
-        ]
-    },
-    'recreate_previews': {
-        'method': recreate_previews,
-        'qs': [
-            ~Q(type=amo.ADDON_PERSONA)
-        ]
-    },
-    'recreate_theme_previews': {
-        'method': recreate_theme_previews,
-        'qs': [
-            Q(type=amo.ADDON_STATICTHEME, status__in=[
-                amo.STATUS_PUBLIC, amo.STATUS_AWAITING_REVIEW])
-        ],
-        'kwargs': {'only_missing': False},
-    },
-    'create_missing_theme_previews': {
-        'method': recreate_theme_previews,
-        'qs': [
-            Q(type=amo.ADDON_STATICTHEME, status__in=[
-                amo.STATUS_PUBLIC, amo.STATUS_AWAITING_REVIEW])
-        ],
-        'kwargs': {'only_missing': True},
-    },
-    'add_dynamic_theme_tag_for_theme_api': {
-        'method': add_dynamic_theme_tag,
-        'qs': [
-            Q(status=amo.STATUS_PUBLIC,
-              _current_version__files__is_webextension=True)
-        ]
-    },
-    'migrate_legacy_dictionaries_to_webextension': {
-        'method': migrate_legacy_dictionaries_to_webextension,
-        'qs': [
-            Q(type=amo.ADDON_DICT,
-              status=amo.STATUS_PUBLIC,
-              disabled_by_user=False,
-              _current_version__files__is_webextension=False),
-        ],
-    },
-    'extract_webextensions_to_git_storage': {
-        'method': migrate_webextensions_to_git_storage,
-        'qs': [
-            Q(_current_version__files__is_webextension=True,
-              type__in=(
-                  # Ignoring legacy add-ons and lightweight themes
-                  amo.ADDON_EXTENSION, amo.ADDON_STATICTHEME,
-                  amo.ADDON_DICT, amo.ADDON_LPAPP)) |
-            Q(type=amo.ADDON_SEARCH)
-        ]
-    },
-    'disable_legacy_files': {
-        'method': disable_legacy_files,
-        'qs': [
-            Q(type__in=(amo.ADDON_EXTENSION, amo.ADDON_THEME, amo.ADDON_LPAPP),
-              versions__files__is_webextension=False,
-              versions__files__is_mozilla_signed_extension=False)
-        ],
-        'pre': lambda values_qs: values_qs.distinct(),
-    },
-    'remove_amo_links_in_url_fields': {
-        'method': remove_amo_links_in_url_fields,
-        'qs': [
-            Q(homepage__localized_string__icontains=settings.DOMAIN) |
-            Q(support_url__localized_string__icontains=settings.DOMAIN) |
-            Q(contributions__icontains=settings.DOMAIN)
-        ],
-        'pre': lambda values_qs: values_qs.distinct(),
-    },
-    'extract_colors_from_static_themes': {
-        'method': extract_colors_from_static_themes,
-        'qs': [Q(type=amo.ADDON_STATICTHEME)]
-    }
-}
 
+            return [
+                # Only recalculate add-ons that received recent abuse reports
+                # possibly through their authors.
+                Q(
+                    Exists(recent_abuse_reports_subquery),
+                )
+                | Q(
+                    authors__abuse_reports__created__gte=F(summary_modified_field),
+                )
+                # And check ratings that have a rating of 3 or less
+                | Q(
+                    _current_version__ratings__deleted=False,
+                    _current_version__ratings__created__gte=F(summary_modified_field),
+                    _current_version__ratings__rating__lte=3,
+                )
+            ]
 
-class Command(BaseCommand):
-    """
-    A generic command to run a task on addons.
-    Add tasks to the tasks dictionary, providing a list of Q objects if you'd
-    like to filter the list down.
+        return {
+            'find_inconsistencies_between_es_and_db': {
+                'task': find_inconsistencies_between_es_and_db,
+                'queryset_filters': [],
+            },
+            'get_preview_sizes': {'task': get_preview_sizes, 'queryset_filters': []},
+            'recalculate_post_review_weight': {
+                'task': recalculate_post_review_weight,
+                'queryset_filters': [
+                    Q(_current_version__autoapprovalsummary__verdict=amo.AUTO_APPROVED)
+                    & ~Q(_current_version__autoapprovalsummary__confirmed=True)
+                ],
+            },
+            'constantly_recalculate_post_review_weight': {
+                'task': recalculate_post_review_weight,
+                'queryset_filters': get_recalc_needed_filters(),
+            },
+            'bump_and_resign_addons': {
+                'task': bump_and_resign_addons,
+                'queryset_filters': [
+                    # Only resign public add-ons where the latest version has been
+                    # created before the 5th of April
+                    Q(
+                        status=amo.STATUS_APPROVED,
+                        _current_version__created__lt=COSE_DATE_CUTOFF,
+                        disabled_by_user=False,
+                        type__in=(
+                            amo.ADDON_EXTENSION,
+                            amo.ADDON_STATICTHEME,
+                            amo.ADDON_DICT,
+                        ),
+                    )
+                ],
+            },
+            'recreate_previews': {
+                'task': recreate_previews,
+                'queryset_filters': [~Q(type=amo.ADDON_STATICTHEME)],
+            },
+            'recreate_theme_previews': {
+                'task': recreate_theme_previews,
+                'queryset_filters': [
+                    Q(
+                        type=amo.ADDON_STATICTHEME,
+                        status__in=amo.VALID_ADDON_STATUSES,
+                    )
+                ],
+                'kwargs': {'only_missing': False},
+            },
+            'create_missing_theme_previews': {
+                'task': recreate_theme_previews,
+                'queryset_filters': [
+                    Q(
+                        type=amo.ADDON_STATICTHEME,
+                        status__in=[amo.STATUS_APPROVED, amo.STATUS_AWAITING_REVIEW],
+                    )
+                ],
+                'kwargs': {'only_missing': True},
+            },
+            'delete_list_theme_previews': {
+                'task': delete_list_theme_previews,
+                'queryset_filters': [
+                    Q(
+                        type=amo.ADDON_STATICTHEME,
+                    )
+                ],
+            },
+            'extract_colors_from_static_themes': {
+                'task': extract_colors_from_static_themes,
+                'queryset_filters': [Q(type=amo.ADDON_STATICTHEME)],
+            },
+            'delete_obsolete_addons': {
+                'task': delete_addons,
+                'queryset_filters': [
+                    Q(
+                        type__in=(
+                            _ADDON_THEME,
+                            _ADDON_LPADDON,
+                            _ADDON_PLUGIN,
+                            _ADDON_PERSONA,
+                            _ADDON_WEBAPP,
+                        )
+                    )
+                ],
+                'allowed_kwargs': ('with_deleted',),
+            },
+            'update_rating_aggregates': {
+                'task': addon_rating_aggregates,
+                'queryset_filters': [Q(status=amo.STATUS_APPROVED)],
+            },
+            # https://github.com/mozilla/addons/issues/15141
+            'delete_erroneously_added_overgrowth_needshumanreview': {
+                'task': delete_erroneously_added_overgrowth_needshumanreview,
+                'queryset_filters': [
+                    Q(
+                        versions__needshumanreview__reason=(
+                            NeedsHumanReview.REASONS.HOTNESS_THRESHOLD
+                        ),
+                        versions__needshumanreview__created__range=(
+                            ERRONEOUSLY_ADDED_OVERGROWTH_DATE_RANGE
+                        ),
+                        versions__needshumanreview__is_active=True,
+                    )
+                ],
+            },
+        }
 
-    method: the method to delay
-    pre: a method to further pre process the pks, must return the pks (opt.)
-    qs: a list of Q objects to apply to the method
-    kwargs: any extra kwargs you want to apply to the delay method (optional)
-    allowed_kwargs: any extra boolean kwargs that can be applied via
-        additional arguments. Make sure to add it to `add_arguments` too.
-    """
     def add_arguments(self, parser):
-        """Handle command arguments."""
+        super().add_arguments(parser)
+
         parser.add_argument(
-            '--task',
+            '--channel',
             action='store',
-            dest='task',
+            dest='channel',
             type=str,
-            help='Run task on the addons.')
+            choices=amo.CHANNEL_CHOICES_API.values(),
+            help=(
+                'Only select add-ons who have versions in a specific channel. '
+                'Add-ons that have multiple will be returned too.'
+            ),
+        )
 
-        parser.add_argument(
-            '--with-deleted',
-            action='store_true',
-            dest='with_deleted',
-            help='Include deleted add-ons when determining which '
-                 'add-ons to process.')
-
-        parser.add_argument(
-            '--ids',
-            action='store',
-            dest='ids',
-            help='Only apply task to specific addon ids (comma-separated).')
-
-        parser.add_argument(
-            '--limit',
-            action='store',
-            dest='limit',
-            type=int,
-            help='Only apply task to the first X addon ids.')
-
-    def handle(self, *args, **options):
-        task = tasks.get(options.get('task'))
-        if not task:
-            raise CommandError('Unknown task provided. Options are: %s'
-                               % ', '.join(tasks.keys()))
-        if options.get('with_deleted'):
-            addon_manager = Addon.unfiltered
-        else:
-            addon_manager = Addon.objects
-        if options.get('ids'):
-            ids_list = options.get('ids').split(',')
-            addon_manager = addon_manager.filter(id__in=ids_list)
-        pks = (addon_manager.filter(*task['qs'])
-                            .values_list('pk', flat=True)
-                            .order_by('id'))
-        if options.get('limit'):
-            pks = pks[:options.get('limit')]
-        if 'pre' in task:
-            # This is run in process to ensure its run before the tasks.
-            pks = task['pre'](pks)
-        if pks:
-            kwargs = task.get('kwargs', {})
-            if task.get('allowed_kwargs'):
-                kwargs.update({
-                    arg: options.get(arg, None)
-                    for arg in task['allowed_kwargs']})
-            # All the remaining tasks go in one group.
-            grouping = []
-            for chunk in chunked(pks, 100):
-                grouping.append(
-                    task['method'].subtask(args=[chunk], kwargs=kwargs))
-
-            # Add the post task on to the end.
-            post = None
-            if 'post' in task:
-                post = task['post'].subtask(
-                    args=[], kwargs=kwargs, immutable=True)
-                ts = chord(grouping, post)
-            else:
-                ts = group(grouping)
-            ts.apply_async()
+    def get_base_queryset(self, options):
+        base_qs = super().get_base_queryset(options)
+        if options.get('channel'):
+            channel = amo.CHANNEL_CHOICES_LOOKUP[options['channel']]
+            base_qs = base_qs.filter(versions__channel=channel)
+        return base_qs

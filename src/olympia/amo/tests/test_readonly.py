@@ -2,25 +2,27 @@ from django.db import models
 
 import MySQLdb as mysql
 import pytest
-
 from pyquery import PyQuery as pq
 
 from olympia.addons.models import Addon
 from olympia.amo.tests import reverse_ns
 
 
-@pytest.yield_fixture
+@pytest.fixture
 def read_only_mode(client, settings, db):
     def _db_error(*args, **kwargs):
         raise mysql.OperationalError("You can't do this in read-only mode.")
 
-    settings.SLAVE_DATABASES = ['default']
+    settings.REPLICA_DATABASES = ['default']
     models.signals.pre_save.connect(_db_error)
     models.signals.pre_delete.connect(_db_error)
 
     from olympia.lib.settings_base import read_only_mode
 
-    env = {key: getattr(settings, key) for key in settings._explicit_settings}
+    env = {
+        'REPLICA_DATABASES': settings.REPLICA_DATABASES,
+        'DATABASES': settings.DATABASES,
+    }
 
     read_only_mode(env)
 
@@ -41,7 +43,7 @@ def test_db_error(read_only_mode):
 
 
 def test_bail_on_post(read_only_mode, client):
-    response = client.post('/en-US/firefox/')
+    response = client.post('/en-US/developers/')
     assert response.status_code == 503
     title = pq(response.content)('title').text()
     assert title.startswith('Maintenance in progress'), title

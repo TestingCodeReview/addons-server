@@ -1,0 +1,69 @@
+{% extends "reviewers/base.html" %}
+
+{% block bodyclass %}{{ super() }} inverse{% endblock %}
+
+{% block title %}
+{{ 'User #{user_id} – Reviewer Tools – Add-ons for Firefox'.format(user_id=developer.id) }}
+{% endblock %}
+
+{% block content %}
+<hgroup>
+  <h2 class="addon_developer">
+    {{ 'Developer profile for User:'}} <a href="{{ developer.get_url_path() }}">{{ developer.id }} {{ developer.name
+      }}</a>
+    &lt;{{ developer.email }}&gt;
+  </h2>
+</hgroup>
+<div class="primary">
+  <h3>
+    {{ 'Addons' }}
+  </h3>
+  <div>
+    <table class="addons-list data-grid">
+      <thead>
+        <tr class="listing-header">
+          {% include 'reviewers/includes/table_headers.html' %}
+          <th colspan="2">Review links</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in page.object_list %}
+        <tr data-addon="{{ row.record.id }}">
+          {% for value in row %}
+            <td>{{ value }}</td>
+          {% endfor %}
+          {% with addon = row.record %}
+          <td>
+            {% if addon._listed_versions_exists %}
+              <a href="{{ url('reviewers.review', 'listed', addon.id)}}">Listed Review</a>
+            {% endif %}
+          </td>
+          <td>
+            {% if addon._unlisted_versions_exists %}
+              <a href="{{ url('reviewers.review', 'unlisted', addon.id)}}">Unlisted Review</a>
+            {% endif %}
+          </td>
+          <td>
+            {% if addon._enterprise_versions_exists %}
+              <a href="{{ url('reviewers.review', 'enterprise', addon.id)}}">Enterprise Review</a>
+            {% endif %}
+          </td>
+          {% endwith %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {{ page|paginator }}
+  </div>
+</div>
+<div class="secondary scroll_sidebar_parent">
+  <div id="scroll_sidebar">
+    {% if is_user_admin %}
+    <strong>Actions</strong>
+    <ul>
+      <li><a href="{{ url('admin:users_userprofile_change', developer.id) }}">User Admin Page</a> <em>(admin)</em></li>
+    </ul>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

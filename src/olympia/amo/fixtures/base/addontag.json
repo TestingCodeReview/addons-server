@@ -47,7 +47,6 @@
         "model": "tags.tag",
         "fields": {
             "tag_text": "SEO",
-            "denied": 0,
             "modified": "2010-01-02 12:34:56",
             "created": "2009-07-16 07:03:03"
         }
@@ -60,8 +59,6 @@
             "eula": null,
             "_current_version": 86740,
             "last_updated": "2010-01-14 14:15:28",
-            "view_source": 0,
-            "total_downloads": 86000,
             "developer_comments": 558043,
             "disabled_by_user": 0,
             "guid": "toolbar@sape.ru",
@@ -71,7 +68,6 @@
             "bayesian_rating": 4.7745699999999998,
             "homepage": null,
             "support_email": null,
-            "public_stats": 1,
             "status": 4,
             "privacy_policy": null,
             "default_locale": "ru",
@@ -122,10 +118,10 @@
             "hash": "sha256:fa8934ccfacc78cd35944ae1a1fd0b398f5644698e2f362358c711726e81737e",
             "created": "2009-12-06 06:47:22",
             "modified": "2010-01-14 14:15:29",
-            "filename": "webmaster_sape-1.32-fx.xpi",
-            "platform": 1,
+            "file": "80/8680/8680/webmaster_sape-1.32.xpi",
             "version": 86740,
             "size": 112640,
+            "manifest_version": 2,
             "datestatuschanged": "2010-01-14 14:15:28"
         }
     }

@@ -1,193 +1,185 @@
 import re
 from collections import namedtuple
+from datetime import date
 
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 
 
 # Add-on and File statuses.
 STATUS_NULL = 0  # No review type chosen yet, add-on is incomplete.
 STATUS_AWAITING_REVIEW = 1  # File waiting for review.
-STATUS_PENDING = 2  # Personas (lightweight themes) waiting for review.
+_STATUS_PENDING = 2  # Deprecated. Was Personas waiting for review.
 STATUS_NOMINATED = 3  # Waiting for review.
-STATUS_PUBLIC = 4  # Approved.
+STATUS_APPROVED = 4  # Approved.
 STATUS_DISABLED = 5  # Rejected (single files) or disabled by Mozilla (addons).
 _STATUS_LISTED = 6  # Deprecated. See bug 616242
 _STATUS_BETA = 7  # Deprecated, see addons-server/issues/7163
 _STATUS_LITE = 8  # Deprecated, preliminary reviewed.
 _STATUS_LITE_AND_NOMINATED = 9  # Deprecated, prelim & waiting for full review.
 STATUS_DELETED = 11  # Add-on has been deleted.
-STATUS_REJECTED = 12  # This applies only to rejected personas.
-STATUS_REVIEW_PENDING = 14  # personas, needing further action.
+_STATUS_LWT_REJECTED = 12  # Deprecated. Applied only to rejected personas.
+_STATUS_REVIEW_PENDING = 14  # Deprecated. Was personas, needing further action
+STATUS_REJECTED = 15  # Add-on listing rejected after failed content review.
 
 STATUS_CHOICES_ADDON = {
-    STATUS_NULL: _(u'Incomplete'),
-    STATUS_NOMINATED: _(u'Awaiting Review'),
-    STATUS_PUBLIC: _(u'Approved'),
-    STATUS_DISABLED: _(u'Disabled by Mozilla'),
-    STATUS_DELETED: _(u'Deleted'),
-}
-
-STATUS_CHOICES_PERSONA = {
-    STATUS_NULL: STATUS_CHOICES_ADDON[STATUS_NULL],
-    STATUS_PENDING: _(u'Pending approval'),
-    STATUS_PUBLIC: STATUS_CHOICES_ADDON[STATUS_PUBLIC],
-    STATUS_DISABLED: STATUS_CHOICES_ADDON[STATUS_DISABLED],
-    STATUS_DELETED: STATUS_CHOICES_ADDON[STATUS_DELETED],
-    STATUS_REJECTED: _(u'Rejected'),
-    # Approved, but the developer would like to put it public when they want.
-    STATUS_REVIEW_PENDING: _(u'Flagged for further review'),
+    STATUS_NULL: _('Incomplete'),
+    STATUS_NOMINATED: _('Awaiting Review'),
+    STATUS_APPROVED: _('Approved'),
+    STATUS_REJECTED: _('Listing Content Rejected'),
+    STATUS_DISABLED: _('Disabled by Mozilla'),
+    STATUS_DELETED: _('Deleted'),
 }
 
 STATUS_CHOICES_FILE = {
-    STATUS_AWAITING_REVIEW: _(u'Awaiting Review'),
-    STATUS_PUBLIC: _(u'Approved'),
-    STATUS_DISABLED: _(u'Disabled by Mozilla'),
+    STATUS_AWAITING_REVIEW: _('Awaiting Review'),
+    STATUS_APPROVED: _('Approved'),
+    STATUS_DISABLED: _('Disabled by Mozilla'),
 }
 
 # We need to expose nice values that aren't localisable.
 STATUS_CHOICES_API = {
     STATUS_NULL: 'incomplete',
     STATUS_AWAITING_REVIEW: 'unreviewed',
-    STATUS_PENDING: 'pending',
     STATUS_NOMINATED: 'nominated',
-    STATUS_PUBLIC: 'public',
+    STATUS_APPROVED: 'public',
     STATUS_DISABLED: 'disabled',
     STATUS_DELETED: 'deleted',
     STATUS_REJECTED: 'rejected',
-    STATUS_REVIEW_PENDING: 'review-pending',
 }
 
 STATUS_CHOICES_API_LOOKUP = {
     'incomplete': STATUS_NULL,
     'unreviewed': STATUS_AWAITING_REVIEW,
-    'pending': STATUS_PENDING,
     'nominated': STATUS_NOMINATED,
-    'public': STATUS_PUBLIC,
+    'public': STATUS_APPROVED,
     'disabled': STATUS_DISABLED,
     'deleted': STATUS_DELETED,
     'rejected': STATUS_REJECTED,
-    'review-pending': STATUS_REVIEW_PENDING,
 }
 
-REVIEWED_STATUSES = (STATUS_PUBLIC,)
-UNREVIEWED_ADDON_STATUSES = (STATUS_NOMINATED,)
-UNREVIEWED_FILE_STATUSES = (STATUS_AWAITING_REVIEW, STATUS_PENDING)
-VALID_ADDON_STATUSES = (STATUS_NOMINATED, STATUS_PUBLIC)
-VALID_FILE_STATUSES = (STATUS_AWAITING_REVIEW, STATUS_PUBLIC)
+APPROVED_STATUSES = (STATUS_APPROVED,)
+UNREVIEWED_FILE_STATUSES = (STATUS_AWAITING_REVIEW,)
+VALID_ADDON_STATUSES = (STATUS_NOMINATED, STATUS_APPROVED, STATUS_REJECTED)
+VALID_FILE_STATUSES = (STATUS_AWAITING_REVIEW, STATUS_APPROVED)
 
 # Version channels
-RELEASE_CHANNEL_UNLISTED = 1
-RELEASE_CHANNEL_LISTED = 2
+CHANNEL_UNLISTED = 1
+CHANNEL_LISTED = 2
+CHANNEL_ENTERPRISE = 3
 
-RELEASE_CHANNEL_CHOICES = (
-    (RELEASE_CHANNEL_UNLISTED, _(u'Unlisted')),
-    (RELEASE_CHANNEL_LISTED, _(u'Listed')),
-)
+CHANNEL_CHOICES = {
+    CHANNEL_UNLISTED: _('Unlisted'),
+    CHANNEL_LISTED: _('Listed'),
+    CHANNEL_ENTERPRISE: _('Enterprise'),
+}
 
 CHANNEL_CHOICES_API = {
-    RELEASE_CHANNEL_UNLISTED: 'unlisted',
-    RELEASE_CHANNEL_LISTED: 'listed',
+    CHANNEL_UNLISTED: 'unlisted',
+    CHANNEL_LISTED: 'listed',
+    CHANNEL_ENTERPRISE: 'enterprise',
 }
 
 CHANNEL_CHOICES_LOOKUP = {
-    'unlisted': RELEASE_CHANNEL_UNLISTED,
-    'listed': RELEASE_CHANNEL_LISTED,
+    'unlisted': CHANNEL_UNLISTED,
+    'listed': CHANNEL_LISTED,
+    'enterprise': CHANNEL_ENTERPRISE,
 }
+
+UPLOAD_SOURCE_DEVHUB = 1
+UPLOAD_SOURCE_SIGNING_API = 2
+UPLOAD_SOURCE_ADDON_API = 3
+UPLOAD_SOURCE_GENERATED = 4
+UPLOAD_SOURCE_CHOICES = (
+    (UPLOAD_SOURCE_DEVHUB, _('Developer Hub')),
+    (UPLOAD_SOURCE_SIGNING_API, _('Signing API')),
+    (UPLOAD_SOURCE_ADDON_API, _('Add-on API')),
+    (UPLOAD_SOURCE_GENERATED, _('Automatically generated by AMO')),
+)
 
 # Add-on author roles.
 AUTHOR_ROLE_DEV = 4
 AUTHOR_ROLE_OWNER = 5
+AUTHOR_ROLE_DELETED = 6
 
 AUTHOR_CHOICES = (
-    (AUTHOR_ROLE_OWNER, _(u'Owner')),
-    (AUTHOR_ROLE_DEV, _(u'Developer')),
+    (AUTHOR_ROLE_OWNER, _('Owner')),
+    (AUTHOR_ROLE_DEV, _('Developer')),
 )
+
+AUTHOR_CHOICES_API = {
+    AUTHOR_ROLE_OWNER: 'owner',
+    AUTHOR_ROLE_DEV: 'developer',
+}
+
+AUTHOR_CHOICES_UNFILTERED = AUTHOR_CHOICES + ((AUTHOR_ROLE_DELETED, _('(Deleted)')),)
 
 # Addon types
 ADDON_ANY = 0
 ADDON_EXTENSION = 1
-ADDON_THEME = 2
+_ADDON_THEME = 2  # Obsolete.  XUL Theme.
 ADDON_DICT = 3
-ADDON_SEARCH = 4
+_ADDON_SEARCH = 4  # Obsolete.  Opensearch.
 ADDON_LPAPP = 5
-ADDON_LPADDON = 6
-ADDON_PLUGIN = 7
+_ADDON_LPADDON = 6  # Obsolete.  A langpack for a specific extension.
+_ADDON_PLUGIN = 7  # Obsolete.  Binary plugin, e.g. Flash.
 ADDON_API = 8  # not actually a type but used to identify extensions + themes
-ADDON_PERSONA = 9
+_ADDON_PERSONA = 9  # Obsolete.  Aka Lightweight Themes.
 ADDON_STATICTHEME = 10
+_ADDON_WEBAPP = 11  # Obsolete.  Marketplace cruft.
+_ADDON_SITE_PERMISSION = 12  # Obsolete.  Never used in production.
 
-# Addon type groupings.
-GROUP_TYPE_ADDON = [ADDON_EXTENSION, ADDON_DICT, ADDON_SEARCH, ADDON_LPAPP,
-                    ADDON_LPADDON, ADDON_PLUGIN, ADDON_API]
-GROUP_TYPE_THEME = [ADDON_THEME, ADDON_PERSONA, ADDON_STATICTHEME]
+# Addon type groupings
+
+GROUP_TYPE_ADDON = (ADDON_EXTENSION, ADDON_DICT, ADDON_LPAPP)
+GROUP_TYPE_THEME = (ADDON_STATICTHEME,)
 
 # Singular
 ADDON_TYPE = {
-    ADDON_EXTENSION: _(u'Extension'),
-    ADDON_THEME: _(u'Complete Theme'),
-    ADDON_DICT: _(u'Dictionary'),
-    ADDON_SEARCH: _(u'Search Engine'),
-    ADDON_LPAPP: _(u'Language Pack (Application)'),
-    ADDON_LPADDON: _(u'Language Pack (Add-on)'),
-    ADDON_PLUGIN: _(u'Plugin'),
-    ADDON_PERSONA: _(u'Theme'),
-    ADDON_STATICTHEME: _(u'Theme (Static)'),
+    ADDON_EXTENSION: _('Extension'),
+    _ADDON_THEME: _('Deprecated Complete Theme'),
+    ADDON_DICT: _('Dictionary'),
+    _ADDON_SEARCH: _('Deprecated Search Engine'),
+    ADDON_LPAPP: _('Language Pack'),
+    _ADDON_LPADDON: _('Deprecated Language Pack (Add-on)'),
+    _ADDON_PLUGIN: _('Deprecated Plugin'),
+    _ADDON_PERSONA: _('Deprecated LWT'),
+    ADDON_STATICTHEME: _('Theme'),
+    _ADDON_SITE_PERMISSION: _('Deprecated Site Permission'),
 }
 
 # Plural
 ADDON_TYPES = {
-    ADDON_EXTENSION: _(u'Extensions'),
-    ADDON_THEME: _(u'Complete Themes'),
-    ADDON_DICT: _(u'Dictionaries'),
-    ADDON_SEARCH: _(u'Search Tools'),
-    ADDON_LPAPP: _(u'Language Packs (Application)'),
-    ADDON_LPADDON: _(u'Language Packs (Add-on)'),
-    ADDON_PLUGIN: _(u'Plugins'),
-    ADDON_PERSONA: _(u'Themes'),
-    ADDON_STATICTHEME: _(u'Themes (Static)'),
+    ADDON_EXTENSION: _('Extensions'),
+    _ADDON_THEME: _('Deprecated Complete Themes'),
+    ADDON_DICT: _('Dictionaries'),
+    _ADDON_SEARCH: _('Deprecated Search Tools'),
+    ADDON_LPAPP: _('Language Packs'),
+    _ADDON_LPADDON: _('Deprecated Language Packs (Add-on)'),
+    _ADDON_PLUGIN: _('Deprecated Plugins'),
+    _ADDON_PERSONA: _('Deprecated LWTs'),
+    ADDON_STATICTHEME: _('Themes'),
+    _ADDON_SITE_PERMISSION: _('Deprecated Site Permissions'),
 }
 
 # Searchable Add-on Types
-ADDON_SEARCH_TYPES = [
+ADDON_SEARCH_TYPES = (
     ADDON_ANY,
     ADDON_EXTENSION,
-    ADDON_THEME,
+    _ADDON_THEME,
     ADDON_DICT,
-    ADDON_SEARCH,
+    _ADDON_SEARCH,
     ADDON_LPAPP,
-    ADDON_PERSONA,
+    _ADDON_PERSONA,
     ADDON_STATICTHEME,
-]
-
-# Icons
-ADDON_ICONS = {
-    ADDON_ANY: 'default-addon.png',
-    ADDON_THEME: 'default-theme.png',
-    ADDON_STATICTHEME: 'default-theme.png',
-}
+)
 
 # We use these slugs in browse page urls.
 ADDON_SLUGS = {
     ADDON_EXTENSION: 'extensions',
-    ADDON_THEME: 'themes',
     ADDON_DICT: 'language-tools',
     ADDON_LPAPP: 'language-tools',
-    ADDON_PERSONA: 'personas',
-    ADDON_SEARCH: 'search-tools',
-    ADDON_STATICTHEME: 'static-themes',
-}
-
-# These are used in the update API.
-ADDON_SLUGS_UPDATE = {
-    ADDON_EXTENSION: 'extension',
-    ADDON_THEME: 'theme',
-    ADDON_DICT: 'extension',
-    ADDON_SEARCH: 'search',
-    ADDON_LPAPP: 'item',
-    ADDON_LPADDON: 'extension',
-    ADDON_PERSONA: 'background-theme',
-    ADDON_PLUGIN: 'plugin',
-    ADDON_STATICTHEME: 'static-theme',
+    _ADDON_SEARCH: 'search-tools',
+    ADDON_STATICTHEME: 'themes',
 }
 
 # A slug to ID map for the search API. Included are all ADDON_TYPES that are
@@ -195,175 +187,157 @@ ADDON_SLUGS_UPDATE = {
 ADDON_SEARCH_SLUGS = {
     'any': ADDON_ANY,
     'extension': ADDON_EXTENSION,
-    'theme': ADDON_THEME,
+    'theme': _ADDON_THEME,
     'dictionary': ADDON_DICT,
-    'search': ADDON_SEARCH,
+    'search': _ADDON_SEARCH,
     'language': ADDON_LPAPP,
-    'persona': ADDON_PERSONA,
+    'persona': _ADDON_PERSONA,
     'statictheme': ADDON_STATICTHEME,
 }
 
 ADDON_TYPE_CHOICES_API = {
     ADDON_EXTENSION: 'extension',
-    ADDON_THEME: 'theme',
+    _ADDON_THEME: 'theme',
     ADDON_DICT: 'dictionary',
-    ADDON_SEARCH: 'search',
+    _ADDON_SEARCH: 'search',
     ADDON_LPAPP: 'language',
-    ADDON_PERSONA: 'persona',
+    _ADDON_PERSONA: 'persona',
     ADDON_STATICTHEME: 'statictheme',
 }
 
-# Edit addon information
-MAX_TAGS = 20
-MIN_TAG_LENGTH = 2
-MAX_CATEGORIES = 2
-VALID_CONTRIBUTION_DOMAINS = (
-    'donate.mozilla.org',
-    'liberapay.com',
-    'micropayment.de',
-    'opencollective.com',
-    'patreon.com',
-    'paypal.com',
-    'paypal.me'
+ADDON_TYPES_WITH_STATS = (
+    ADDON_EXTENSION,
+    ADDON_STATICTHEME,
+    ADDON_DICT,
+    ADDON_LPAPP,
 )
 
+# Only content review extensions and dictionaries. See
+# https://github.com/mozilla/addons-server/issues/11796 &
+# https://github.com/mozilla/addons-server/issues/12065
+ADDON_CONTENT_REVIEW_TYPES = (ADDON_EXTENSION, ADDON_DICT)
+
+# Edit addon information
+MAX_TAGS = 10
+MAX_CATEGORIES = 3
+CONTRIBUTE_UTM_PARAMS = {
+    'utm_content': 'product-page-contribute',
+    'utm_medium': 'referral',
+    'utm_source': 'addons.mozilla.org',
+}
+VALID_CONTRIBUTION_DOMAINS = (
+    'buymeacoffee.com',
+    'donate.mozilla.org',
+    'flattr.com',
+    'github.com',
+    'ko-fi.com',
+    'liberapay.com',
+    'www.micropayment.de',
+    'opencollective.com',
+    'www.patreon.com',
+    'www.paypal.com',
+    'paypal.me',
+)
+
+# Formats we're willing to manipulate in addons-server through Pillow.
+VALID_IMAGE_FORMATS = ('PNG', 'JPEG', 'GIF')
+
+# Accepted types for add-on images/icons & user avatars.
+# Has to be types that match a format we support in VALID_IMAGE_FORMATS.
+VALID_IMAGE_TYPES = ('image/png', 'image/jpeg')
+
 # Icon upload sizes
-ADDON_ICON_SIZES = [32, 64, 128]
+ADDON_ICON_SIZES = (32, 64, 128)
+ADDON_ICON_FORMAT = 'png'
 
-_size_tuple = namedtuple('SizeTuple', 'width height')
-# Preview upload sizes - see mozilla/addons-server#9487 for background.
+_dimensions = namedtuple('SizeTuple', 'width height')
+# Preview upload sizes - see mozilla/addons-server#9487 & #16717 for background.
 ADDON_PREVIEW_SIZES = {
-    'thumb': _size_tuple(640, 480),
-    'min': _size_tuple(1000, 750),
-    'full': _size_tuple(2400, 1800)
+    'thumbnail': _dimensions(533, 400),
+    'min': _dimensions(1000, 750),
+    'full': _dimensions(2400, 1800),
+    'image_format': 'png',
+    'thumbnail_format': 'jpg',
 }
 
-# Static theme preview sizes
-THEME_PREVIEW_SIZES = {
-    'header': {
-        'thumbnail': _size_tuple(473, 64),
-        'full': _size_tuple(680, 92),
-        'position': 0},
-    'list': {
-        'thumbnail': _size_tuple(529, 64),
-        'full': _size_tuple(760, 92),
-        'position': 1},
-    # single is planned to be the new default size in 2019 Q1.
-    'single': {
-        'thumbnail': _size_tuple(501, 64),
-        'full': _size_tuple(720, 92),
-        'position': 2},
+# Static theme preview renderings, with different dimensions
+THEME_PREVIEW_RENDERINGS = {
+    'firefox': {
+        'thumbnail': _dimensions(473, 64),
+        'full': _dimensions(680, 92),
+        'position': 0,
+        'image_format': 'png',
+        'thumbnail_format': 'png',
+    },
+    'amo': {
+        'thumbnail': _dimensions(720, 92),
+        'full': _dimensions(720, 92),
+        'position': 2,
+        'image_format': 'svg',
+        'thumbnail_format': 'jpg',
+    },
 }
-THEME_ACCENTCOLOR_DEFAULT = 'rgba(229,230,232,1)'
+THEME_FRAME_COLOR_DEFAULT = 'rgba(229,230,232,1)'
 THEME_PREVIEW_TOOLBAR_HEIGHT = 92  # The template toolbar is this height.
 
-# Persona image sizes [preview, full]
-PERSONA_IMAGE_SIZES = {
-    'header': [(680, 100), (3000, 200)],
-    'footer': [None, (3000, 100)],
-    'icon': [None, (32, 32)],
-}
-
-# Accepted image extensions and MIME-types
+# Accepted image extensions for theme backgrounds.
+# Has to be extensions that match a format in IMG_VALID_FORMATS, plus .svg
+# which has its own special handling (PNG covers both .png and .apng)
 THEME_BACKGROUND_EXTS = ('.jpg', '.jpeg', '.png', '.apng', '.svg', '.gif')
-IMG_TYPES = ('image/png', 'image/jpeg')
-VIDEO_TYPES = ('video/webm',)
-
-# The string concatinating all accepted image MIME-types with '|'
-SUPPORTED_IMAGE_TYPES = '|'.join(IMG_TYPES)
 
 # Acceptable Add-on file extensions.
 # This is being used by `parse_addon` so please make sure we don't have
 # to touch add-ons before removing anything from this list.
-VALID_ADDON_FILE_EXTENSIONS = ('.crx', '.xpi', '.jar', '.xml', '.json', '.zip')
+VALID_ADDON_FILE_EXTENSIONS = ('.crx', '.xpi', '.zip')
 
-# These types don't maintain app compatibility in the db.  Instead, we look at
-# APP.types and APP_TYPE_SUPPORT to figure out where they are compatible.
-NO_COMPAT = (ADDON_SEARCH, ADDON_DICT, ADDON_PERSONA)
-HAS_COMPAT = {t: t not in NO_COMPAT for t in ADDON_TYPES}
-
-# Personas
-PERSONAS_ADDON_ID = 10900  # Add-on ID of the Personas Plus Add-on
-PERSONAS_FIREFOX_MIN = '3.6'  # First Firefox version to support Personas
-
-# Collections.
-COLLECTION_NORMAL = 0
-COLLECTION_SYNCHRONIZED = 1
-COLLECTION_FEATURED = 2
-COLLECTION_RECOMMENDED = 3
-COLLECTION_FAVORITES = 4
-COLLECTION_MOBILE = 5
-COLLECTION_ANONYMOUS = 6
-
-COLLECTIONS_NO_CONTRIB = (COLLECTION_SYNCHRONIZED, COLLECTION_FAVORITES)
-
-COLLECTION_SPECIAL_SLUGS = {
-    COLLECTION_MOBILE: 'mobile',
-    COLLECTION_FAVORITES: 'favorites',
-}
-
-COLLECTION_CHOICES = {
-    COLLECTION_NORMAL: 'Normal',
-    COLLECTION_SYNCHRONIZED: 'Synchronized',
-    COLLECTION_FEATURED: 'Featured',
-    COLLECTION_RECOMMENDED: 'Generated Recommendations',
-    COLLECTION_FAVORITES: 'Favorites',
-    COLLECTION_MOBILE: 'Mobile',
-    COLLECTION_ANONYMOUS: 'Anonymous',
-}
-
-COLLECTION_SEARCH_CHOICES = [
-    COLLECTION_NORMAL,
-    COLLECTION_FEATURED,
-    COLLECTION_RECOMMENDED,
-    COLLECTION_MOBILE,
-    COLLECTION_ANONYMOUS,
-]
+# These types don't allow developer defined compatibility.
+NO_COMPAT_CHANGES = (ADDON_DICT,)
 
 # Validation.
 
 # A skeleton set of passing validation results.
 VALIDATOR_SKELETON_RESULTS = {
-    "errors": 0,
-    "warnings": 0,
-    "notices": 0,
-    "success": True,
-    "compatibility_summary": {"notices": 0, "errors": 0, "warnings": 0},
-    "metadata": {"requires_chrome": False, "listed": True},
-    "messages": [],
-    "message_tree": {},
-    "ending_tier": 5,
+    'errors': 0,
+    'warnings': 0,
+    'notices': 0,
+    'success': True,
+    'compatibility_summary': {'notices': 0, 'errors': 0, 'warnings': 0},
+    'metadata': {
+        'listed': True,
+    },
+    'messages': [],
+    'message_tree': {},
+    'ending_tier': 5,
 }
 
 # A skeleton set of validation results for a system error.
 VALIDATOR_SKELETON_EXCEPTION_WEBEXT = {
-    "errors": 1,
-    "warnings": 0,
-    "notices": 0,
-    "success": False,
-    "compatibility_summary": {"notices": 0, "errors": 0, "warnings": 0},
-    "metadata": {
-        "requires_chrome": False,
-        "listed": True,
-        "is_webextension": True
-    },
-    "messages": [
-        {"id": ["validator", "unexpected_exception"],
-         "message": "Sorry, we couldn't load your WebExtension.",
-         "description": [
-            "Validation was unable to complete successfully due to an "
-            "unexpected error.",
-            "Check https://developer.mozilla.org/en-US/Add-ons/WebExtensions "
-            "to ensure your webextension is valid or file a bug at "
-            "http://bit.ly/1POrYYU"],
-         "type": "error",
-         "fatal": True,
-         "tier": 1,
-         "for_appversions": None,
-         "uid": "35432f419340461897aa8362398339c4"}
+    'errors': 1,
+    'warnings': 0,
+    'notices': 0,
+    'success': False,
+    'compatibility_summary': {'notices': 0, 'errors': 0, 'warnings': 0},
+    'metadata': {'listed': True},
+    'messages': [
+        {
+            'id': ['validator', 'unexpected_exception'],
+            'message': "Sorry, we couldn't load your WebExtension.",
+            'description': [
+                'Validation was unable to complete successfully due to an '
+                'unexpected error.',
+                'Check https://developer.mozilla.org/en-US/Add-ons/WebExtensions '
+                'to ensure your webextension is valid or file a bug at '
+                'http://bit.ly/1POrYYU',
+            ],
+            'type': 'error',
+            'fatal': True,
+            'tier': 1,
+            'for_appversions': None,
+            'uid': '35432f419340461897aa8362398339c4',
+        }
     ],
-    "message_tree": {},
-    "ending_tier": 5,
+    'message_tree': {},
+    'ending_tier': 5,
 }
 
 VERSION_SEARCH = re.compile(r'\.(\d+)$')
@@ -373,73 +347,97 @@ ADDON_ID = r"""(?P<addon_id>[^/<>"']+)"""
 ADDON_UUID = r'(?P<uuid>[\w]{8}-[\w]{4}-[\w]{4}-[\w]{4}-[\w]{12})'
 
 # Default strict_min_version and strict_max_version for WebExtensions
-DEFAULT_WEBEXT_MIN_VERSION = '42.0'
+# We're signing with SHA256 nowadays, which is only supported in 58.0 or higher
+DEFAULT_WEBEXT_MIN_VERSION = '58.0'
 DEFAULT_WEBEXT_MAX_VERSION = '*'
 
-# Android only started to support WebExtensions with version 48
-DEFAULT_WEBEXT_MIN_VERSION_ANDROID = '48.0'
+# Android only started to support WebExtensions with version 48,
+# but because we're now signing with SHA256 (see above), the minimum
+# version has to be 58.0.
+DEFAULT_WEBEXT_MIN_VERSION_ANDROID = '58.0'
 
-# The default version of Firefox that supports WebExtensions without an id
-DEFAULT_WEBEXT_MIN_VERSION_NO_ID = '48.0'
+# The version of desktop Firefox that first supported static themes is 53.0,
+# but as above because we're now signing with SHA256, the minimum version has
+# to be 58.0.
+DEFAULT_STATIC_THEME_MIN_VERSION_FIREFOX = '58.0'
 
-# The default version of Firefox that supported `browser_specific_settings`
-DEFAULT_WEBEXT_MIN_VERSION_BROWSER_SPECIFIC = '48.0'
-
-# The version of desktop Firefox that first supported static themes.
-DEFAULT_STATIC_THEME_MIN_VERSION_FIREFOX = '53.0'
-
-# The version of Android that first minimally supported static themes.
-DEFAULT_STATIC_THEME_MIN_VERSION_ANDROID = '65.0'
-
-# The version of Firefox that first supported webext dictionaries. Note that
-# on AMO at the moment, dicts have no compatibility exposed - ADDON_DICT is in
-# NO_COMPAT. But this allows the compat information to be saved to the database
-# to change our mind later.
+# The version of Firefox that first supported webext dictionaries.
 # Dicts are not compatible with Firefox for Android, only desktop is relevant.
 DEFAULT_WEBEXT_DICT_MIN_VERSION_FIREFOX = '61.0'
 
+# The version of Firefox that first supported manifest version 3 (MV3)
+DEFAULT_WEBEXT_MIN_VERSION_MV3_FIREFOX = '109.0a1'
+
+# We don't know if the Android min version will be different, but assume it might be.
+DEFAULT_WEBEXT_MIN_VERSION_MV3_ANDROID = DEFAULT_WEBEXT_MIN_VERSION_MV3_FIREFOX
+
+# The version of Firefox for Android that first supported `gecko_android` key.
+DEFAULT_WEBEXT_MIN_VERSION_GECKO_ANDROID = '113.0'
+
+# First version we consider as "Fenix".
+MIN_VERSION_FENIX = '79.0a1'
+
+# Last version we consider as "Fennec"
+MAX_VERSION_FENNEC = '68.*'
+
+# The minimum version of Fenix where extensions are all available.
+MIN_VERSION_FENIX_GENERAL_AVAILABILITY = '120.0'
 
 ADDON_GUID_PATTERN = re.compile(
     # Match {uuid} or something@host.tld ("something" being optional)
     # guids. Copied from mozilla-central XPIProvider.jsm.
     r'^(\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}'
-    r'|[a-z0-9-\._]*\@[a-z0-9-\._]+)$', re.IGNORECASE)
-
-SYSTEM_ADDON_GUIDS = (
-    u'@mozilla.org', u'@shield.mozilla.org', u'@pioneer.mozilla.org',
-    u'@mozilla.com')
-
-MOZILLA_TRADEMARK_SYMBOLS = (
-    'mozilla', 'firefox')
-
-ALLOWED_TRADEMARK_SUBMITTING_EMAILS = (
-    '@mozilla.com', '@mozilla.org')
-
-# If you add/remove any sources, update the docs: /api/download_sources.html
-# Note there are some additional sources here for historical/backwards compat.
-DOWNLOAD_SOURCES_FULL = (
-    'addondetail', 'addon-detail-version', 'api', 'category', 'collection',
-    'creatured', 'developers', 'discovery-dependencies', 'discovery-upsell',
-    'discovery-video', 'email', 'find-replacement', 'fxcustomization',
-    'fxfirstrun', 'fxwhatsnew', 'homepagebrowse', 'homepagepromo',
-    'installservice', 'mostshared', 'oftenusedwith', 'prerelease-banner',
-    'recommended', 'rockyourfirefox', 'search', 'sharingapi',
-    'similarcollections', 'ss', 'userprofile', 'version-history',
-
-    'co-hc-sidebar', 'co-dp-sidebar',
-
-    'cb-hc-featured', 'cb-dl-featured', 'cb-hc-toprated', 'cb-dl-toprated',
-    'cb-hc-mostpopular', 'cb-dl-mostpopular', 'cb-hc-recentlyadded',
-    'cb-dl-recentlyadded',
-
-    'hp-btn-promo', 'hp-dl-promo', 'hp-hc-featured', 'hp-dl-featured',
-    'hp-hc-upandcoming', 'hp-dl-upandcoming', 'hp-hc-mostpopular',
-    'hp-dl-mostpopular', 'hp-contest-winners',
-
-    'dp-hc-oftenusedwith', 'dp-dl-oftenusedwith', 'dp-hc-othersby',
-    'dp-dl-othersby', 'dp-btn-primary', 'dp-btn-version', 'dp-btn-devchannel',
-    'dp-hc-dependencies', 'dp-dl-dependencies', 'dp-hc-upsell', 'dp-dl-upsell',
+    r'|[a-z0-9-\._]*\@[a-z0-9-\._]+)$',
+    re.IGNORECASE,
 )
 
-DOWNLOAD_SOURCES_PREFIX = (
-    'external-', 'mozcom-', 'discovery-', 'cb-btn-', 'cb-dl-')
+# Changes to this list need to be coordinated with the Operations team to make
+# sure other systems like the privileged add-ons signing pipeline are in sync.
+# Please reach out to them before making changes.
+RESERVED_ADDON_GUIDS = (
+    '@mozilla.com',
+    '@mozilla.org',
+    '@pioneer.mozilla.org',
+    '@search.mozilla.org',
+    '@shield.mozilla.com',
+    '@shield.mozilla.org',
+    '@mozillaonline.com',
+    '@mozillafoundation.org',
+    '@rally.mozilla.org',
+    # A temporary special case for aboutsync, which has a "legacy" ID.
+    'aboutsync@mhammond.github.com',
+    # Temporary add-ons as defined in Firefox. Should not be submitted to AMO.
+    '@temporary-addon',
+    # Android Components/Fenix built-in extensions.
+    '@mozac.org',
+    # Internal IDs used by Firefox
+    '@modelhub.mozilla.org',
+    '@siteperms.mozilla.org',
+    # Test privileged add-ons for mozilla-central.
+    '@tests.mozilla.org',
+)
+
+# Names we don't allow unless you have permission. Need to be lowercase,
+# see validate_addon_name()
+MOZILLA_TRADEMARK_SYMBOLS = ('mozilla', 'firefox')
+
+# Regexp for Firefox client IDs passed to our APIs, just to avoid sending
+# garbage to underlying services.
+VALID_CLIENT_ID = re.compile('^[a-zA-Z0-9]{64}$')
+
+APPVERSIONS_ORIGINATED_FROM_UNKNOWN = 0
+APPVERSIONS_ORIGINATED_FROM_AUTOMATIC = 1
+APPVERSIONS_ORIGINATED_FROM_DEVELOPER = 2
+APPVERSIONS_ORIGINATED_FROM_MANIFEST = 3
+APPVERSIONS_ORIGINATED_FROM_MANIFEST_GECKO_ANDROID = 4
+APPVERSIONS_ORIGINATED_FROM_MIGRATION = 5
+
+DEV_EXP_SURVEY_ALCHEMER_ID = 7953020
+ACTIVE_SURVEYS = {DEV_EXP_SURVEY_ALCHEMER_ID}
+
+SURVEY_LINK = {
+    DEV_EXP_SURVEY_ALCHEMER_ID: 'https://survey.alchemer.com/s3/7953020/MV3-Developer-Sentiment-2024'
+}
+
+# Date we started to sign add-ons with COSE signature.
+COSE_DATE_CUTOFF = date(2019, 4, 5)

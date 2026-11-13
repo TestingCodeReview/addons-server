@@ -1,4 +1,4 @@
-{% extends "impala/base_shared.html" %}
+{% extends "devhub/base.html" %}
 
 {% set range = view.range %}
 
@@ -7,23 +7,23 @@
 {% block bodyclass %}statistics{% endblock %}
 
 {% block extrahead %}
-  {{ css('zamboni/stats') }}
-  <link rel="stylesheet"
-        href="{{ static('css/zamboni/jquery-ui/custom-1.7.2.css') }}">
+  {{ vite_asset('css/stats.less') }}
+  {{ vite_asset('css/jquery-ui.less') }}
 {% endblock %}
 
 {% block title %}
       {# L10n: {0} is an add-on name, {1} is an app name (like Firefox) #}
       {% if addon %}
-        {{ _('{0} :: Statistics Dashboard :: Add-ons for {1}')|format_html(addon.name, request.APP.pretty) }}
+        {{ _('{0} :: Statistics Dashboard :: Add-ons for {1}')|format_html(addon.name, amo.FIREFOX.pretty) }}
       {% elif c %}
         {{ _('{0} :: Statistics Dashboard')|format_html(c.name) }}
       {% else %}
-        {{ _('Statistics Dashboard :: Add-ons for {0}')|format_html(request.APP.pretty) }}
+        {{ _('Statistics Dashboard :: Add-ons for {0}')|format_html(amo.FIREFOX.pretty) }}
       {% endif %}
 {% endblock %}
 
-{% block navbar %}
+{% block outer_content %}
+{{ super() }}
 <header>
   <hgroup>
     {% if addon %}
@@ -89,14 +89,14 @@
 {% endblock %}
 
 {% block content %}
-  {% if not waffle.switch('local-statistics-processing') %}
-  <div class="notification-box warning">
-    {% trans %}
-      Statistics processing is currently disabled, so recent data is unavailable.
-      The statistics are still being collected and this page will be updated soon with the missing data.
-    {% endtrans %}
-  </div>
+  {% if waffle.switch('disable-bigquery') %}
+    <div class="notification-box info">
+      {% trans %}
+        Sorry, the statistics are temporarily unavailable.
+      {% endtrans %}
+    </div>
   {% endif %}
+
   <div id="lm" class="loadmessage"><span>{{ _('Loading the latest data&hellip;') }}</span></div>
   <div class="secondary">
     {% if addon %}
@@ -161,18 +161,9 @@
         </div>
       </div>
     {% endblock %}
-    {% if addon %}
-      <div id="stats-permissions">
-        {% if addon.public_stats %}
-          <p>{{ _('This dashboard is currently <b>public</b>.') }}</p>
-        {% else %}
-          <p>{{ _('This dashboard is currently <b>private</b>.') }}</p>
-        {% endif %}
-        {% if request.check_ownership(addon) %}
-          <p><a href="{{ addon.get_dev_url() }}#edit-addon-technical">{{ _('Change settings.') }}</a></p>
-        {% endif %}
-      </div>
-    {% endif %}
+    <div id="stats-permissions">
+      <p>{{ _('This dashboard is <b>private</b>.') }}</p>
+    </div>
     <div class="hidden">
       <div id="fieldMenuPopup" class="popup">
         <form id="fieldMenu" data-no-csrf>
@@ -193,5 +184,5 @@
 {% endblock %}
 
 {% block js %}
-{{ js('zamboni/stats') }}
+{{ vite_asset('js/stats.js') }}
 {% endblock %}

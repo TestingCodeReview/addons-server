@@ -1,5 +1,4 @@
-[
-    {
+[{
         "pk": 638212,
         "model": "translations.translation",
         "fields": {
@@ -8,51 +7,6 @@
             "localized_string": "Lady Gaga",
             "modified": "2009-10-20 21:58:25",
             "id": 590910
-        }
-    },
-    {
-        "pk": 15679,
-        "model": "addons.addon",
-        "fields": {
-            "slug": "15679",
-            "_current_version": 15679,
-            "last_updated": "2009-03-30 23:18:20",
-            "total_downloads": 0,
-            "disabled_by_user": 0,
-            "view_source": 0,
-            "guid": null,
-            "weekly_downloads": 8381,
-            "average_daily_users": 3661,
-            "bayesian_rating": 0.0,
-            "type": 9,
-            "public_stats": 0,
-            "status": 4,
-            "default_locale": "en-US",
-            "name": 590910,
-            "description": 590910,
-            "created": "2009-03-30 23:18:20",
-            "icon_type": "",
-            "modified": "2009-03-30 23:18:20",
-            "summary": null,
-            "total_ratings": 0
-        }
-    },
-    {
-        "pk": 575,
-        "model": "addons.persona",
-        "fields": {
-            "display_username": "ladygaga",
-            "popularity": 8381,
-            "footer": "Persona_Footer_UNI_GAGA_FINAL.jpg",
-            "movers": -0.11117283254862,
-            "author": "ladygaga",
-            "submit": "2009-03-30 21:26:59",
-            "accentcolor": "000000",
-            "header": "Persona_Header_UNI_GAGA_FINAL_2.jpg",
-            "textcolor": "ffffff",
-            "approve": "2009-03-30 23:18:20",
-            "persona_id": 830,
-            "addon": 15679
         }
     },
     {
@@ -105,15 +59,12 @@
         "fields": {
             "slug": "6912",
             "last_updated": "2009-05-29 21:25:25",
-            "view_source": 1,
-            "total_downloads": 446919,
             "disabled_by_user": 0,
             "guid": "quickdrag@mozilla.ktechcomputing.com",
             "weekly_downloads": 16683,
             "average_rating": "4.75",
             "average_daily_users": 63492,
             "bayesian_rating": 4.6195899999999996,
-            "public_stats": 0,
             "status": 4,
             "default_locale": "en-US",
             "target_locale": null,
@@ -132,8 +83,6 @@
             "slug": "7661",
             "_current_version": 88798,
             "last_updated": "2009-12-24 18:30:00",
-            "view_source": 0,
-            "total_downloads": 2069199,
             "developer_comments": null,
             "disabled_by_user": 0,
             "guid": "isreaditlater@ideashower.com",
@@ -141,7 +90,6 @@
             "average_rating": "4.46",
             "average_daily_users": 229702,
             "bayesian_rating": 4.41995,
-            "public_stats": 0,
             "status": 4,
             "default_locale": "en-US",
             "target_locale": null,
@@ -161,8 +109,6 @@
             "slug": "2464",
             "_current_version": 90952,
             "last_updated": "2010-01-12 20:50:11",
-            "view_source": 0,
-            "total_downloads": 6536054,
             "disabled_by_user": 0,
             "guid": "foxyproxy@eric.h.jung",
             "weekly_downloads": 98872,
@@ -170,7 +116,6 @@
             "average_daily_users": 335767,
             "bayesian_rating": 4.1992000000000003,
             "support_email": null,
-            "public_stats": 0,
             "status": 4,
             "default_locale": "en-US",
             "target_locale": null,
@@ -190,15 +135,12 @@
             "slug": "3481",
             "_current_version": 91189,
             "last_updated": "2010-01-14 11:39:32",
-            "view_source": 0,
-            "total_downloads": 2142245,
             "disabled_by_user": 0,
             "guid": "{D2A6A719-7CBC-4594-85FD-C36AD881424F}",
             "weekly_downloads": 11066,
             "average_rating": "4.57",
             "average_daily_users": 81063,
             "bayesian_rating": 4.5274599999999996,
-            "public_stats": 0,
             "status": 4,
             "default_locale": "en-US",
             "target_locale": null,
@@ -288,8 +230,6 @@
             "eula": null,
             "_current_version": 68019,
             "last_updated": "2009-05-08 05:26:22",
-            "view_source": 0,
-            "total_downloads": 563,
             "developer_comments": null,
             "disabled_by_user": 0,
             "guid": "limon@mbd",
@@ -299,7 +239,6 @@
             "average_daily_users": 40,
             "bayesian_rating": 0.0,
             "support_email": null,
-            "public_stats": 0,
             "status": 3,
             "description": null,
             "default_locale": "en-US",
@@ -311,16 +250,6 @@
             "modified": "2009-05-13 18:19:30",
             "summary": null,
             "total_ratings": 0
-        }
-    },
-    {
-        "pk": 15679,
-        "model": "versions.version",
-        "fields": {
-            "created": "2010-01-14 11:39:40",
-            "modified": "2010-01-14 11:40:45",
-            "version": "0",
-            "addon": 15679
         }
     },
     {
@@ -389,7 +318,7 @@
             "license": 6,
             "created": "2009-05-08 05:26:21",
             "release_notes": null,
-            "approval_notes": null,
+            "approval_notes": "",
             "modified": "2009-05-08 05:26:21",
             "version": "0.5.3",
             "addon": 11870
@@ -403,10 +332,10 @@
             "hash": "sha256:f153612e10edab9f14267909f4aaa179ce368d47c128a1d3090d7bb4ff44c153",
             "created": "2010-01-14 11:39:41",
             "modified": "2010-01-14 11:40:45",
-            "filename": "glue-4.5.16-fx.xpi",
-            "platform": 1,
+            "file": "81/3481/3481/glue-4.5.16.xpi",
             "version": 91189,
             "datestatuschanged": "2010-01-14 11:39:32",
+            "manifest_version": 2,
             "size": 164864
         }
     },
@@ -418,10 +347,10 @@
             "hash": "sha256:63296bbbc92c47c53052459c14a4b60b77bb31e0b85ebab2e0e3e68c5afe3369",
             "created": "2010-01-12 20:50:21",
             "modified": "2010-01-13 08:21:42",
-            "filename": "foxyproxy_standard-2.17-fx+sm+tb.xpi",
-            "platform": 1,
+            "file": "64/2464/2464/foxyproxy_standard-2.17-fx+sm+tb.xpi",
             "version": 90952,
             "datestatuschanged": "2010-01-12 20:50:11",
+            "manifest_version": 2,
             "size": 592896
         }
     },
@@ -433,10 +362,10 @@
             "hash": "sha256:a0de832991d6cd499373e6181e62e18989213a22b31e2febe01cd641ba6193cd",
             "created": "2009-12-24 18:30:11",
             "modified": "2009-12-24 18:31:24",
-            "filename": "read_it_later-2.0.3-fx.xpi",
-            "platform": 1,
+            "file": "61/7661/7661/read_it_later-2.0.3.xpi",
             "version": 88798,
             "datestatuschanged": "2009-12-24 18:30:00",
+            "manifest_version": 2,
             "size": 173056
         }
     },
@@ -448,41 +377,11 @@
             "hash": "sha256:daa986b10ca0b72aabd1bfa07dbc2aa445a1bf1c887b74c883719348b074d6a7",
             "created": "2009-05-08 05:26:22",
             "modified": "2009-05-08 05:26:22",
-            "filename": "limon_free_english-hebrew_dictionary-0.5.3-fx.xpi",
-            "platform": 1,
+            "file": "70/1870/11870/limon_free_english-hebrew_dictionary-0.5.3.xpi",
             "version": 68019,
             "datestatuschanged": "2009-05-08 05:26:20",
+            "manifest_version": 2,
             "size": 3072
-        }
-    },
-    {
-        "pk": 1043,
-        "model": "addons.appsupport",
-        "fields": {
-            "app": 1,
-            "addon": 15679,
-            "modified": "2010-10-01 22:09:39",
-            "created": "2010-10-01 22:09:39"
-        }
-    },
-    {
-        "pk": 1042,
-        "model": "addons.appsupport",
-        "fields": {
-            "app": 1,
-            "addon": 7661,
-            "modified": "2010-10-01 22:09:39",
-            "created": "2010-10-01 22:09:39"
-        }
-    },
-    {
-        "pk": 1041,
-        "model": "addons.appsupport",
-        "fields": {
-            "app": 1,
-            "addon": 2464,
-            "modified": "2010-10-01 22:09:39",
-            "created": "2010-10-01 22:09:39"
         }
     }
 ]

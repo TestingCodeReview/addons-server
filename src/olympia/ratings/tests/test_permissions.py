@@ -1,7 +1,7 @@
+from unittest import mock
+
 from django.contrib.auth.models import AnonymousUser
 from django.test import RequestFactory
-
-from mock import mock
 
 from olympia.amo.tests import TestCase
 from olympia.ratings.permissions import CanDeleteRatingPermission
@@ -29,5 +29,4 @@ class TestCanDeleteRatingPermission(TestCase):
     @mock.patch('olympia.ratings.permissions.user_can_delete_rating')
     def test_has_object_permission_false(self, user_can_delete_rating_mock):
         user_can_delete_rating_mock.return_value = False
-        assert not self.perm.has_object_permission(
-            self.request, None, object())
+        assert not self.perm.has_object_permission(self.request, None, object())

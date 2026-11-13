@@ -1,0 +1,142 @@
+// The name of the default rule used for some default values in the form.
+const DEFAULT_RULE_NAME = 'your_rule_name';
+
+const selectedScannerIsYara = (select) => {
+  return select.options[select.selectedIndex].label === 'yara';
+};
+
+const selectedScannerIsNarc = (select) => {
+  return select.options[select.selectedIndex].label === 'narc';
+};
+
+const selectedScannerIsNone = (select) => {
+  return select.options[select.selectedIndex].value === '';
+};
+
+// This function changes the visibility of the `definition` field depending on
+// the scanner that has been selected. Only "yara" and "narc" rules have
+// definitions for now, so it is restricted to that. It also sets a default
+// value when there is no value yet and the scanner is "yara".
+const showOrHideDefinition = (select) => {
+  const definition = document.querySelector('.field-definition');
+  const isYara = selectedScannerIsYara(select);
+  const isNarc = selectedScannerIsNarc(select);
+
+  definition.style.display = isYara || isNarc ? 'block' : 'none';
+
+  if (isYara) {
+    const textarea = definition.querySelector('#id_definition');
+
+    if (textarea.value.trim().length === 0) {
+      textarea.value = `rule ${DEFAULT_RULE_NAME}
+{
+  // This is a stub definition that will never match.
+  // See: https://yara.readthedocs.io/en/latest/
+  condition: false
+  // The following special variables are always available:
+  // filename (string)
+  // is_json_file (true for filenames ending with .json)
+  // is_manifest_file (true for manifest.json file at the root)
+  // is_locale_file (true for messages.json files in _locales/ folder at the root)
+}`;
+    }
+  }
+};
+
+// Similar to `showOrHideDefinition()` but for the `configuration` field.
+const showOrHideConfiguration = (select) => {
+  const configuration = document.querySelector('.field-configuration');
+  const isNarc = selectedScannerIsNarc(select);
+
+  configuration.style.display = isNarc ? 'block' : 'none';
+};
+
+// This function changes the visibility of the `name` field in the "change
+// form". We only want to show this field when a scanner is selected and this
+// scanner is not "yara" (because we will infer the name of the rule using the
+// Yara definition). It also sets a default value when there is no value yet
+// and the scanner is "yara".
+const showOrHideName = (select) => {
+  const name = document.querySelector('.field-name');
+  const isNone = selectedScannerIsNone(select);
+  const isYara = selectedScannerIsYara(select);
+
+  name.style.display = isNone || isYara ? 'none' : 'block';
+
+  if (isYara) {
+    const nameInput = document.querySelector('#id_name');
+
+    if (nameInput.value.trim().length === 0) {
+      nameInput.value = DEFAULT_RULE_NAME;
+    }
+  }
+};
+
+const setInitialConfiguration = (select) => {
+  const selectedScanner = select.options[select.selectedIndex].value;
+  if (
+    selectedScanner &&
+    typeof scannersConfigurationSchemas[selectedScanner] !== 'undefined'
+  ) {
+    // We're changing scanner and we know the default configuration schema for
+    // this scanner, so re-initialize jsonForm, overriding the data and schema
+    // attributes.
+    // See https://github.com/bhch/django-jsonform/blob/master/django_jsonform/static/django_jsonform/index.js
+    const jsonFormConfig = JSON.parse(
+      configurationTextarea.dataset['djangoJsonform'],
+    );
+    jsonFormConfig.dataInputId = configurationTextarea.id;
+    jsonFormConfig.containerId = configurationTextarea.id + '_jsonform';
+    jsonFormConfig.schema =
+      scannersConfigurationSchemas[selectedScanner].schema;
+    jsonFormConfig.data = scannersConfigurationSchemas[selectedScanner].default;
+    /* global reactJsonForm */
+    const jsonForm = reactJsonForm.createForm(jsonFormConfig);
+    jsonForm.render();
+  }
+};
+
+const scannerSelect = document.querySelector('#id_scanner');
+const definitionTextarea = document.querySelector('#id_definition');
+const configurationTextarea = document.querySelector('#id_configuration');
+const scannersConfigurationSchemas = JSON.parse(
+  document.querySelector('#scanners-configuration-schemas').textContent,
+);
+
+// Update name field value on definition change. This is needed because the
+// field is hidden. We parse the name of the rule and, if successful, we update
+// the value of the name.
+definitionTextarea.addEventListener('input', (event) => {
+  const { value } = event.target;
+
+  const nameInput = document.querySelector('#id_name');
+  // This pattern matches strings like `rule some_rule_name {`.
+  const matches = value.match(/rule\s+(.+?)\s+{/);
+
+  if (matches && matches.length === 2) {
+    // The name of the rule is validated by the django app anyway so we only
+    // need to pass the "raw" rule name to the input.
+    nameInput.value = matches[1];
+  }
+});
+
+// We listen to `scanner` changes to update the visibility of some fields in
+// the form. For instance, when the "yara" scanner is selected, we want to show
+// the `definition` field and hide the `name` field.
+if (scannerSelect) {
+  scannerSelect.addEventListener('change', (event) => {
+    const select = event.target;
+
+    showOrHideDefinition(select);
+    showOrHideConfiguration(select);
+    showOrHideName(select);
+    setInitialConfiguration(select);
+  });
+
+  // It is likely that these fields will be hidden by default because the
+  // form does not have a pre-selected value for the `scanner` select.
+  showOrHideName(scannerSelect);
+  showOrHideDefinition(scannerSelect);
+  showOrHideConfiguration(scannerSelect);
+  setInitialConfiguration(scannerSelect);
+}

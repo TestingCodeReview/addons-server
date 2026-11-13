@@ -1,60 +1,86 @@
-# -*- coding: utf-8 -*-
 import csv
-import datetime
 import json
+from datetime import date
+from unittest import mock
 
 from django.http import Http404
 from django.test.client import RequestFactory
-from django.utils.encoding import force_text
+from django.urls import reverse
+from django.utils.encoding import force_bytes, force_str
 
-import mock
-import six
-
-from pyquery import PyQuery as pq
+from waffle.testutils import override_switch
 
 from olympia import amo
 from olympia.access.models import Group, GroupUser
 from olympia.addons.models import Addon, AddonUser
-from olympia.amo.tests import TestCase, version_factory
-from olympia.amo.urlresolvers import reverse
-from olympia.stats import tasks, views
-from olympia.stats.models import (
-    DownloadCount, GlobalStat, ThemeUserCount, UpdateCount)
+from olympia.amo.tests import (
+    TestCase,
+    addon_factory,
+    user_factory,
+    version_factory,
+)
+from olympia.constants.applications import FIREFOX
+from olympia.stats import views
 from olympia.users.models import UserProfile
 
 
-class StatsTest(TestCase):
-    fixtures = ['stats/test_views.json', 'stats/test_models.json']
+class StatsTestCase(TestCase):
+    fixtures = [
+        # Create two configured users:
+        #
+        #   - admin: jbalogh@mozilla.com
+        #   - simple user: nobodyspecial@mozilla.com
+        'stats/users.json',
+    ]
 
     def setUp(self):
-        """Setup some reasonable testing defaults."""
-        super(StatsTest, self).setUp()
+        super().setUp()
+
+        self.addon_4 = Addon.objects.create(pk=4, slug='4')
+        version_factory(addon=self.addon_4)
+        self.addon_5 = Addon.objects.create(pk=5, slug='5')
+        version_factory(addon=self.addon_5)
+
         # Default url_args to an addon and range with data.
-        self.url_args = {'start': '20090601', 'end': '20090930', 'addon_id': 4}
-        self.url_args_theme = {'start': '20090601', 'end': '20090930',
-                               'addon_id': 6}
-        # We use fixtures with fixed add-on pks. That causes the add-ons to be
-        # in a weird state that we have to fix.
-        # For the persona (pk=6) the current_version needs to be set manually
-        # because otherwise the version can't be found, as it has no files.
-        # For the rest we simply add a version and it will automatically be
-        # picked up as the current_version.
-        persona_addon = Addon.objects.get(pk=6)
-        version_factory(addon=Addon.objects.get(pk=4))
-        version_factory(addon=Addon.objects.get(pk=5))
-        persona_version = version_factory(addon=persona_addon)
-        persona_addon.update(_current_version=persona_version)
-        Addon.objects.filter(id__in=(4, 5, 6)).update(status=amo.STATUS_PUBLIC)
+        self.url_args = {
+            'addon_id': self.addon_4.pk,
+            'start': '20090601',
+            'end': '20090930',
+        }
+
+        Addon.objects.filter(id__in=(self.addon_4.pk, self.addon_5.pk)).update(
+            status=amo.STATUS_APPROVED
+        )
         # Most tests don't care about permissions.
         self.login_as_admin()
 
+        self.get_updates_series_patcher = mock.patch(
+            'olympia.stats.views.get_updates_series'
+        )
+        self.get_updates_series_mock = self.get_updates_series_patcher.start()
+        self.get_updates_series_mock.return_value = []
+
+        self.get_download_series_patcher = mock.patch(
+            'olympia.stats.views.get_download_series'
+        )
+        self.get_download_series_mock = self.get_download_series_patcher.start()
+        self.get_download_series_mock.return_value = []
+
+    def tearDown(self):
+        super().setUp()
+
+        self.get_updates_series_patcher.stop()
+        self.get_download_series_patcher.stop()
+
     def login_as_admin(self):
         self.client.logout()
-        self.client.login(email='jbalogh@mozilla.com')
+        self.client.force_login(UserProfile.objects.get(email='jbalogh@mozilla.com'))
 
     def login_as_visitor(self):
         self.client.logout()
-        self.client.login(email='nobodyspecial@mozilla.com')
+        self.client.force_login(
+            UserProfile.objects.get(email='nobodyspecial@mozilla.com')
+        )
 
     def get_view_response(self, view, **kwargs):
         view_args = self.url_args.copy()
@@ -76,8 +102,7 @@ class StatsTest(TestCase):
 
     def public_views_gen(self, **kwargs):
         # all views are potentially public
-        for view, args in self.views_gen(**kwargs):
-            yield (view, args)
+        yield from self.views_gen(**kwargs)
 
     def _check_it(self, views, status):
         for view, kwargs in views:
@@ -85,54 +110,63 @@ class StatsTest(TestCase):
             assert response.status_code == status
 
 
-class TestUnlistedAddons(StatsTest):
-
+class TestUnlistedAddons(StatsTestCase):
     def setUp(self):
-        super(TestUnlistedAddons, self).setUp()
-        addon = Addon.objects.get(pk=4)
-        addon.update(public_stats=True)
-        self.make_addon_unlisted(addon)
+        super().setUp()
 
-    def test_no_stats_for_unlisted_addon(self):
+        self.author = user_factory(email='user@example.com')
+        self.addon = addon_factory(users=[self.author])
+        self.url_args = {
+            'addon_id': self.addon.pk,
+            'start': '20090601',
+            'end': '20090930',
+        }
+        self.change_channel_for_addon(self.addon, amo.CHANNEL_UNLISTED)
+
+    def test_no_public_stats_for_unlisted_addon(self):
         """All the views for the stats return 404 for unlisted addons."""
         self.login_as_visitor()
-
         self._check_it(self.public_views_gen(format='json'), 404)
 
     def test_stats_available_for_admins(self):
         """
-        All the views for the stats are available to admins for
-        unlisted addons.
+        All the views for the stats are available to admins for unlisted
+        addons.
         """
         self.login_as_admin()
         self._check_it(self.public_views_gen(format='json'), 200)
 
+    def test_stats_available_for_authors(self):
+        self.client.logout()
+        self.client.force_login(self.author)
+        self._check_it(self.public_views_gen(format='json'), 200)
 
-class TestListedAddons(StatsTest):
 
+class TestListedAddons(StatsTestCase):
     def setUp(self):
-        super(TestListedAddons, self).setUp()
-        self.addon = Addon.objects.get(pk=4)
-        self.someuser = UserProfile.objects.get(
-            email='nobodyspecial@mozilla.com')
+        super().setUp()
+
+        self.someuser = UserProfile.objects.get(email='nobodyspecial@mozilla.com')
+        AddonUser.objects.create(user=self.someuser, addon=self.addon_4)
 
     def test_private_stats_for_listed_addon(self):
-        self.addon.update(public_stats=False)
-        self.login_as_visitor()
+        self.client.logout()
         self._check_it(self.public_views_gen(format='json'), 403)
 
-        AddonUser.objects.create(user=self.someuser, addon=self.addon)
+        self.client.force_login(self.someuser)
         self._check_it(self.public_views_gen(format='json'), 200)
 
     def test_stats_for_mozilla_disabled_addon(self):
-        self.addon.update(status=amo.STATUS_DISABLED)
+        self.addon_4.update(status=amo.STATUS_DISABLED)
 
         # Public users should not see stats
         self.client.logout()
+        # It is a 404 (and not a 403) before the decorator first tries to
+        # retrieve the add-on.
         self._check_it(self.public_views_gen(format='json'), 404)
 
         # Developers should not see stats
-        AddonUser.objects.create(user=self.someuser, addon=self.addon)
+        self.client.force_login(self.someuser)
         self._check_it(self.public_views_gen(format='json'), 404)
 
         # Admins should see stats
@@ -140,14 +174,31 @@ class TestListedAddons(StatsTest):
         self._check_it(self.public_views_gen(format='json'), 200)
 
     def test_stats_for_user_disabled_addon(self):
-        self.addon.update(disabled_by_user=True)
+        self.addon_4.update(disabled_by_user=True)
 
         # Public users should not see stats
         self.client.logout()
+        self._check_it(self.public_views_gen(format='json'), 403)
+
+        # Developers should see stats
+        self.client.force_login(self.someuser)
+        self._check_it(self.public_views_gen(format='json'), 200)
+
+        # Admins should see stats
+        self.login_as_admin()
+        self._check_it(self.public_views_gen(format='json'), 200)
+
+    def test_stats_for_deleted_addon(self):
+        self.addon_4.update(status=amo.STATUS_DELETED)
+
+        # Public users should not see stats
+        self.client.logout()
+        # It is a 404 (and not a 403) before the decorator first tries to
+        # retrieve the add-on.
         self._check_it(self.public_views_gen(format='json'), 404)
 
         # Developers should not see stats
-        AddonUser.objects.create(user=self.someuser, addon=self.addon)
+        self.client.force_login(self.someuser)
         self._check_it(self.public_views_gen(format='json'), 404)
 
         # Admins should see stats
@@ -155,56 +206,7 @@ class TestListedAddons(StatsTest):
         self._check_it(self.public_views_gen(format='json'), 200)
 
 
-if six.PY2:
-    # In Python 2, the csv module deals with bytes all the way. This is
-    # taken from https://docs.python.org/2/library/csv.html#csv-examples to
-    # deal with utf-8, allowing our tests to be a bit saner - they can pass
-    # unicode strings instead of bytes transparently.
-    def utf_8_encoder(unicode_csv_data):
-        for line in unicode_csv_data:
-            yield line.encode('utf-8')
-
-    def CSVDictReaderClass(data, **kwargs):
-        """csv.DictReader that deals with unicode data for Python 2."""
-        csv_reader = csv.DictReader(utf_8_encoder(data), **kwargs)
-        for row in csv_reader:
-            yield {
-                six.text_type(key, 'utf-8'): six.text_type(value, 'utf-8')
-                for key, value in row.iteritems()}
-else:
-    CSVDictReaderClass = csv.DictReader
-
-
-class ESStatsTest(StatsTest, amo.tests.ESTestCase):
-    """Test class with some ES setup."""
-
-    def setUp(self):
-        super(ESStatsTest, self).setUp()
-        self.empty_index('stats')
-        self.index()
-
-    def index(self):
-        updates = UpdateCount.objects.values_list('id', flat=True)
-        tasks.index_update_counts(list(updates))
-        downloads = DownloadCount.objects.values_list('id', flat=True)
-        tasks.index_download_counts(list(downloads))
-        user_counts = ThemeUserCount.objects.values_list('id', flat=True)
-        tasks.index_theme_user_counts(list(user_counts))
-        self.refresh('stats')
-
-    def csv_eq(self, response, expected):
-        content = force_text(response.content)
-        content_csv = CSVDictReaderClass(
-            # Drop lines that are comments.
-            filter(lambda row: row[0] != '#', content.splitlines()))
-        expected = force_text(expected)
-        expected_csv = CSVDictReaderClass(
-            # Strip any extra spaces from the expected content.
-            line.strip() for line in expected.splitlines())
-        assert tuple(content_csv) == tuple(expected_csv)
-
-
-class TestSeriesSecurity(StatsTest):
+class TestSeriesSecurity(StatsTestCase):
     """Tests to make sure all restricted data remains restricted."""
 
     def test_private_addon_no_groups(self):
@@ -226,12 +228,12 @@ class TestSeriesSecurity(StatsTest):
         self.client.logout()
         self._check_it(self.views_gen(format='json'), 403)
 
-    def test_public_addon_no_groups(self):
+    def test_addon_no_groups(self):
         # Logged in but no groups
         self.login_as_visitor()
-        self._check_it(self.public_views_gen(addon_id=5, format='json'), 200)
+        self._check_it(self.public_views_gen(addon_id=5, format='json'), 403)
 
-    def test_public_addon_stats_group(self):
+    def test_addon_stats_group(self):
         # Logged in with stats group.
         user = UserProfile.objects.get(email='nobodyspecial@mozilla.com')
         group = Group.objects.create(name='Stats', rules='Stats:View')
@@ -240,561 +242,719 @@ class TestSeriesSecurity(StatsTest):
 
         self._check_it(self.public_views_gen(addon_id=5, format='json'), 200)
 
-    def test_public_addon_anonymous(self):
+    def test_addon_anonymous(self):
         # Not logged in
         self.client.logout()
-        self._check_it(self.public_views_gen(addon_id=5, format='json'), 200)
+        self._check_it(self.public_views_gen(addon_id=5, format='json'), 403)
 
 
-class TestCSVs(ESStatsTest):
-    """Tests for CSV output of all known series views."""
+class TestCacheControl(StatsTestCase):
+    """Tests we set cache control headers"""
 
-    def test_downloads_series(self):
-        response = self.get_view_response('stats.downloads_series',
-                                          group='month', format='csv')
+    def test_cache_control(self):
+        response = self.get_view_response(
+            'stats.downloads_series', head=True, group='month', format='json'
+        )
+        assert response.get('cache-control', '').startswith('max-age='), (
+            'Bad or no cache-control: %r' % response.get('cache-control', '')
+        )
 
-        assert response.status_code == 200
-        self.csv_eq(response, """date,count
-                                 2009-09-03,10
-                                 2009-08-03,10
-                                 2009-07-03,10
-                                 2009-06-28,10
-                                 2009-06-20,10
-                                 2009-06-12,10
-                                 2009-06-07,10
-                                 2009-06-01,10""")
 
-    def test_usage_series(self):
-        for url_args in [self.url_args, self.url_args_theme]:
-            self.url_args = url_args
+class TestLayout(StatsTestCase):
+    def test_no_public_stats(self):
+        self.login_as_visitor()
+        response = self.client.get(reverse('stats.downloads', args=[self.addon_4.slug]))
+        assert response.status_code == 403
 
-            response = self.get_view_response('stats.usage_series',
-                                              group='month', format='csv')
 
-            assert response.status_code == 200
-            self.csv_eq(response, """date,count
-                                     2009-06-02,1500
-                                     2009-06-01,1000""")
+class TestCsvAndJsonViews(StatsTestCase):
+    def csv_eq(self, response, expected):
+        content = force_str(response.content)
+        content_csv = csv.DictReader(
+            # Drop lines that are comments.
+            filter(lambda row: row[0] != '#', content.splitlines())
+        )
+        expected = force_str(expected)
+        expected_csv = csv.DictReader(
+            # Strip any extra spaces from the expected content.
+            line.strip()
+            for line in expected.splitlines()
+        )
+        assert tuple(content_csv) == tuple(expected_csv)
 
-    def test_sources_series(self):
-        response = self.get_view_response('stats.sources_series',
-                                          group='month', format='csv')
+    def test_usage_series_no_data_json(self):
+        self.get_updates_series_mock.return_value = []
 
-        assert response.status_code == 200
-        self.csv_eq(response, """date,count,api,search
-                                 2009-09-03,10,2,3
-                                 2009-08-03,10,2,3
-                                 2009-07-03,10,2,3
-                                 2009-06-28,10,2,3
-                                 2009-06-20,10,2,3
-                                 2009-06-12,10,2,3
-                                 2009-06-07,10,2,3
-                                 2009-06-01,10,2,3""")
-
-    def test_os_series(self):
-        response = self.get_view_response('stats.os_series',
-                                          group='month', format='csv')
+        response = self.get_view_response(
+            'stats.usage_series', group='day', format='json'
+        )
 
         assert response.status_code == 200
-        self.csv_eq(response, """date,count,Linux,Windows
-                                 2009-06-02,1500,400,500
-                                 2009-06-01,1000,300,400""")
+        self.assertListEqual(json.loads(force_str(response.content)), [])
 
-    def test_locales_series(self):
-        response = self.get_view_response('stats.locales_series',
-                                          group='month', format='csv')
+    def test_usage_series_no_data_csv(self):
+        self.get_updates_series_mock.return_value = []
+
+        response = self.get_view_response(
+            'stats.usage_series', group='day', format='csv'
+        )
+
+        assert response.status_code == 200
+        self.csv_eq(response, """date,count""")
+
+    def test_usage_json(self):
+        self.get_updates_series_mock.return_value = [
+            {'date': date(2009, 6, 2), 'end': date(2009, 6, 2), 'count': 1500},
+            {'date': date(2009, 6, 1), 'end': date(2009, 6, 1), 'count': 1000},
+        ]
+
+        response = self.get_view_response(
+            'stats.usage_series', group='day', format='json'
+        )
+
+        assert response.status_code == 200
+        self.assertListEqual(
+            json.loads(force_str(response.content)),
+            [
+                {'count': 1500, 'date': '2009-06-02', 'end': '2009-06-02'},
+                {'count': 1000, 'date': '2009-06-01', 'end': '2009-06-01'},
+            ],
+        )
+
+    def test_usage_csv(self):
+        self.get_updates_series_mock.return_value = [
+            {'date': date(2009, 6, 2), 'end': date(2009, 6, 2), 'count': 1500},
+            {'date': date(2009, 6, 1), 'end': date(2009, 6, 1), 'count': 1000},
+        ]
+
+        response = self.get_view_response(
+            'stats.usage_series', group='day', format='csv'
+        )
 
         assert response.status_code == 200
         self.csv_eq(
             response,
-            u"""date,count,English (US) (en-us),Ελληνικά (el)
-               2009-06-02,1500,300,400
-               2009-06-01,1000,300,400""")
-
-    def test_statuses_series(self):
-        response = self.get_view_response('stats.statuses_series',
-                                          group='month', format='csv')
-
-        assert response.status_code == 200
-        self.csv_eq(response, """date,count,userDisabled,userEnabled
-                                 2009-06-02,1500,130,1370
-                                 2009-06-01,1000,50,950""")
-
-    def test_versions_series(self):
-        response = self.get_view_response('stats.versions_series',
-                                          group='month', format='csv')
-
-        assert response.status_code == 200
-        self.csv_eq(response, """date,count,1.0,2.0
-                                 2009-06-02,1500,550,950
-                                 2009-06-01,1000,200,800""")
-
-    def test_apps_series(self):
-        response = self.get_view_response('stats.apps_series',
-                                          group='month', format='csv')
-
-        assert response.status_code == 200
-        self.csv_eq(response, """date,count,Firefox 4.0
-                                 2009-06-02,1500,1500
-                                 2009-06-01,1000,1000""")
-
-    def test_no_cache(self):
-        """Test that the csv or json is not caching, due to lack of data."""
-        self.url_args = {'start': '20200101', 'end': '20200130', 'addon_id': 4}
-        response = self.get_view_response('stats.versions_series', head=True,
-                                          group='day', format='csv')
-        assert response.status_code == 200
-        assert set(response['cache-control'].split(', ')) == (
-            {'max-age=0', 'no-cache', 'no-store', 'must-revalidate'})
-
-        self.url_args = {'start': '20200101', 'end': '20200130', 'addon_id': 4}
-        response = self.get_view_response('stats.versions_series', head=True,
-                                          group='day', format='json')
-        assert response.status_code == 200
-        assert set(response['cache-control'].split(', ')) == (
-            {'max-age=0', 'no-cache', 'no-store', 'must-revalidate'})
-
-    def test_usage_series_no_data(self):
-        url_args = [
-            {'start': '20010101', 'end': '20010130', 'addon_id': 4},
-            # Also test for themes.
-            {'start': '20010101', 'end': '20010130', 'addon_id': 6}
-        ]
-        for url_arg in url_args:
-            self.url_args = url_arg
-            response = self.get_view_response('stats.usage_series',
-                                              group='day', format='csv')
-
-            assert response.status_code == 200
-            self.csv_eq(response, """date,count""")
-
-
-class TestCacheControl(StatsTest):
-    """Tests we set cache control headers"""
-
-    def _test_cache_control(self):
-        response = self.get_view_response('stats.downloads_series', head=True,
-                                          group='month', format='json')
-        assert response.get('cache-control', '').startswith('max-age='), (
-            'Bad or no cache-control: %r' % response.get('cache-control', ''))
-
-
-class TestLayout(StatsTest):
-
-    def test_not_public_stats(self):
-        self.login_as_visitor()
-        addon = amo.tests.addon_factory(public_stats=False)
-        response = self.client.get(self.get_public_url(addon))
-        assert response.status_code == 403
-
-    def get_public_url(self, addon):
-        return reverse('stats.downloads', args=[addon.slug])
-
-    def test_public_stats_page_loads(self):
-        addon = amo.tests.addon_factory(public_stats=True)
-        response = self.client.get(self.get_public_url(addon))
-        assert response.status_code == 200
-
-    def test_public_stats_stats_notes(self):
-        addon = amo.tests.addon_factory(public_stats=True)
-        response = self.client.get(self.get_public_url(addon))
-        assert pq(response.content)('#stats-note h2').length == 1
-
-
-class TestResponses(ESStatsTest):
-
-    def test_usage_json(self):
-        for url_args in [self.url_args, self.url_args_theme]:
-            self.url_args = url_args
-
-            response = self.get_view_response(
-                'stats.usage_series', group='day', format='json')
-            assert response.status_code == 200
-            self.assertListEqual(json.loads(force_text(response.content)), [
-                {'count': 1500, 'date': '2009-06-02', 'end': '2009-06-02'},
-                {'count': 1000, 'date': '2009-06-01', 'end': '2009-06-01'},
-            ])
-
-    def test_usage_csv(self):
-        for url_args in [self.url_args, self.url_args_theme]:
-            self.url_args = url_args
-
-            response = self.get_view_response(
-                'stats.usage_series', group='day', format='csv')
-            assert response.status_code == 200
-            self.csv_eq(response,
-                        """date,count
-                           2009-06-02,1500
-                           2009-06-01,1000""")
+            """date,count
+            2009-06-02,1500
+            2009-06-01,1000""",
+        )
 
     def test_usage_by_app_json(self):
-        response = self.get_view_response(
-            'stats.apps_series', group='day', format='json')
-        assert response.status_code == 200
-        self.assertListEqual(json.loads(force_text(response.content)), [
+        self.get_updates_series_mock.return_value = [
             {
-                "data": {
-                    "{ec8030f7-c20a-464f-9b0e-13a3a9e97384}": {"4.0": 1500}
-                },
-                "count": 1500,
-                "date": "2009-06-02",
-                "end": "2009-06-02"
+                'date': date(2009, 6, 2),
+                'end': date(2009, 6, 2),
+                'count': 1500,
+                'data': {FIREFOX.guid: {'4.0': 1500}},
             },
             {
-                "data": {
-                    "{ec8030f7-c20a-464f-9b0e-13a3a9e97384}": {"4.0": 1000}
+                'date': date(2009, 6, 1),
+                'end': date(2009, 6, 1),
+                'count': 1000,
+                'data': {FIREFOX.guid: {'4.0': 1000}},
+            },
+        ]
+
+        response = self.get_view_response(
+            'stats.apps_series', group='day', format='json'
+        )
+
+        assert response.status_code == 200
+        self.assertListEqual(
+            json.loads(force_str(response.content)),
+            [
+                {
+                    'data': {'{ec8030f7-c20a-464f-9b0e-13a3a9e97384}': {'4.0': 1500}},
+                    'count': 1500,
+                    'date': '2009-06-02',
+                    'end': '2009-06-02',
                 },
-                "count": 1000,
-                "date": "2009-06-01",
-                "end": "2009-06-01"
-            }
-        ])
+                {
+                    'data': {'{ec8030f7-c20a-464f-9b0e-13a3a9e97384}': {'4.0': 1000}},
+                    'count': 1000,
+                    'date': '2009-06-01',
+                    'end': '2009-06-01',
+                },
+            ],
+        )
 
     def test_usage_by_app_csv(self):
+        self.get_updates_series_mock.return_value = [
+            {
+                'date': date(2009, 6, 2),
+                'end': date(2009, 6, 2),
+                'count': 1500,
+                'data': {FIREFOX.guid: {'4.0': 1500}},
+            },
+            {
+                'date': date(2009, 6, 1),
+                'end': date(2009, 6, 1),
+                'count': 1000,
+                'data': {FIREFOX.guid: {'4.0': 1000}},
+            },
+        ]
+
         response = self.get_view_response(
-            'stats.apps_series', group='day', format='csv')
+            'stats.apps_series', group='day', format='csv'
+        )
+
         assert response.status_code == 200
-        self.csv_eq(response, """date,count,Firefox 4.0
-                                 2009-06-02,1500,1500
-                                 2009-06-01,1000,1000""")
+        self.csv_eq(
+            response,
+            """date,count,Firefox 4.0
+            2009-06-02,1500,1500
+            2009-06-01,1000,1000""",
+        )
 
     def test_usage_by_locale_json(self):
-        response = self.get_view_response(
-            'stats.locales_series', group='day', format='json')
-        assert response.status_code == 200
-        self.assertListEqual(json.loads(force_text(response.content)), [
+        self.get_updates_series_mock.return_value = [
             {
-                "count": 1500,
-                "date": "2009-06-02",
-                "end": "2009-06-02",
-                "data": {
-                    u"Ελληνικά (el)": 400,
-                    u"English (US) (en-us)": 300
-                }
+                'date': date(2009, 6, 2),
+                'end': date(2009, 6, 2),
+                'count': 1500,
+                'data': {'el': 800, 'es-mx': 400, 'en-us': 300},
             },
             {
-                "count": 1000,
-                "date": "2009-06-01",
-                "end": "2009-06-01",
-                "data": {
-                    u"Ελληνικά (el)": 400,
-                    u"English (US) (en-us)": 300
-                }
-            }
-        ])
+                'date': date(2009, 6, 1),
+                'end': date(2009, 6, 1),
+                'count': 1000,
+                'data': {'el': 400, 'es-mx': 300, 'en-us': 300},
+            },
+        ]
+
+        response = self.get_view_response(
+            'stats.locales_series', group='day', format='json'
+        )
+
+        assert response.status_code == 200
+        self.assertListEqual(
+            json.loads(force_str(response.content)),
+            [
+                {
+                    'count': 1500,
+                    'date': '2009-06-02',
+                    'end': '2009-06-02',
+                    'data': {
+                        'Ελληνικά (el)': 800,
+                        'Espa\xf1ol (de M\xe9xico) (es-mx)': 400,
+                        'English (US) (en-us)': 300,
+                    },
+                },
+                {
+                    'count': 1000,
+                    'date': '2009-06-01',
+                    'end': '2009-06-01',
+                    'data': {
+                        'Ελληνικά (el)': 400,
+                        'Espa\xf1ol (de M\xe9xico) (es-mx)': 300,
+                        'English (US) (en-us)': 300,
+                    },
+                },
+            ],
+        )
 
     def test_usage_by_locale_csv(self):
+        self.get_updates_series_mock.return_value = [
+            {
+                'date': date(2009, 6, 2),
+                'end': date(2009, 6, 2),
+                'count': 1500,
+                'data': {'el': 800, 'es-mx': 400, 'en-us': 300},
+            },
+            {
+                'date': date(2009, 6, 1),
+                'end': date(2009, 6, 1),
+                'count': 1000,
+                'data': {'el': 400, 'es-mx': 300, 'en-us': 300},
+            },
+        ]
+
         response = self.get_view_response(
-            'stats.locales_series', group='day', format='csv')
+            'stats.locales_series', group='day', format='csv'
+        )
+
         assert response.status_code == 200
-        self.csv_eq(response, """date,count,English (US) (en-us),Ελληνικά (el)
-                                 2009-06-02,1500,300,400
-                                 2009-06-01,1000,300,400""")
+        self.csv_eq(
+            response,
+            """date,count,English (US) (en-us),Espa\xf1ol (de M\xe9xico) (es-mx),Ελληνικά (el)
+            2009-06-02,1500,300,400,800
+            2009-06-01,1000,300,300,400""",  # noqa
+        )
 
     def test_usage_by_os_json(self):
-        response = self.get_view_response(
-            'stats.os_series', group='day', format='json')
-        assert response.status_code == 200
-        self.assertListEqual(json.loads(force_text(response.content)), [
+        self.get_updates_series_mock.return_value = [
             {
-                "count": 1500,
-                "date": "2009-06-02",
-                "end": "2009-06-02",
-                "data": {
-                    "Linux": 400,
-                    "Windows": 500
-                }
+                'date': date(2009, 6, 2),
+                'end': date(2009, 6, 2),
+                'count': 1500,
+                'data': {'Linux': 400, 'Windows': 500},
             },
             {
-                "count": 1000,
-                "date": "2009-06-01",
-                "end": "2009-06-01",
-                "data": {
-                    "Linux": 300,
-                    "Windows": 400
-                }
-            }
-        ])
+                'date': date(2009, 6, 1),
+                'end': date(2009, 6, 1),
+                'count': 1000,
+                'data': {'Linux': 300, 'Windows': 400},
+            },
+        ]
+
+        response = self.get_view_response('stats.os_series', group='day', format='json')
+
+        assert response.status_code == 200
+        self.assertListEqual(
+            json.loads(force_str(response.content)),
+            [
+                {
+                    'count': 1500,
+                    'date': '2009-06-02',
+                    'end': '2009-06-02',
+                    'data': {'Linux': 400, 'Windows': 500},
+                },
+                {
+                    'count': 1000,
+                    'date': '2009-06-01',
+                    'end': '2009-06-01',
+                    'data': {'Linux': 300, 'Windows': 400},
+                },
+            ],
+        )
 
     def test_usage_by_os_csv(self):
-        response = self.get_view_response(
-            'stats.os_series', head=True, group='day', format='csv')
+        self.get_updates_series_mock.return_value = [
+            {
+                'date': date(2009, 6, 2),
+                'end': date(2009, 6, 2),
+                'count': 1500,
+                'data': {'Linux': 400, 'Windows': 500},
+            },
+            {
+                'date': date(2009, 6, 1),
+                'end': date(2009, 6, 1),
+                'count': 1000,
+                'data': {'Linux': 300, 'Windows': 400},
+            },
+        ]
+
+        response = self.get_view_response('stats.os_series', group='day', format='csv')
+
         assert response.status_code == 200
+        self.csv_eq(
+            response,
+            """date,count,Linux,Windows
+            2009-06-02,1500,400,500
+            2009-06-01,1000,300,400""",
+        )
 
     def test_usage_by_version_json(self):
-        response = self.get_view_response(
-            'stats.versions_series', group='day', format='json')
-        assert response.status_code == 200
-        self.assertListEqual(json.loads(force_text(response.content)), [
+        self.get_updates_series_mock.return_value = [
             {
-                "count": 1500,
-                "date": "2009-06-02",
-                "end": "2009-06-02",
-                "data": {
-                    "1.0": 550,
-                    "2.0": 950
-                }
+                'date': date(2009, 6, 2),
+                'end': date(2009, 6, 2),
+                'count': 1500,
+                'data': {'1.0': 550, '2.0': 950},
             },
             {
-                "count": 1000,
-                "date": "2009-06-01",
-                "end": "2009-06-01",
-                "data": {
-                    "1.0": 200,
-                    "2.0": 800
-                }
-            }
-        ])
+                'date': date(2009, 6, 1),
+                'end': date(2009, 6, 1),
+                'count': 1000,
+                'data': {'1.0': 200, '2.0': 800},
+            },
+        ]
+
+        response = self.get_view_response(
+            'stats.versions_series', group='day', format='json'
+        )
+
+        assert response.status_code == 200
+        self.assertListEqual(
+            json.loads(force_str(response.content)),
+            [
+                {
+                    'count': 1500,
+                    'date': '2009-06-02',
+                    'end': '2009-06-02',
+                    'data': {'1.0': 550, '2.0': 950},
+                },
+                {
+                    'count': 1000,
+                    'date': '2009-06-01',
+                    'end': '2009-06-01',
+                    'data': {'1.0': 200, '2.0': 800},
+                },
+            ],
+        )
 
     def test_usage_by_version_csv(self):
-        response = self.get_view_response(
-            'stats.versions_series', group='day', format='csv')
-        assert response.status_code == 200
-        self.csv_eq(response, """date,count,1.0,2.0
-                                 2009-06-02,1500,550,950
-                                 2009-06-01,1000,200,800""")
-
-    def test_usage_by_status_json(self):
-        response = self.get_view_response(
-            'stats.statuses_series', group='day', format='json')
-        assert response.status_code == 200
-        self.assertListEqual(json.loads(force_text(response.content)), [
+        self.get_updates_series_mock.return_value = [
             {
-                "count": 1500,
-                "date": "2009-06-02",
-                "end": "2009-06-02",
-                "data": {
-                    "userDisabled": 130,
-                    "userEnabled": 1370
-                }
+                'date': date(2009, 6, 2),
+                'end': date(2009, 6, 2),
+                'count': 1500,
+                'data': {'1.0': 550, '2.0': 950},
             },
             {
-                "count": 1000,
-                "date": "2009-06-01",
-                "end": "2009-06-01",
-                "data": {
-                    "userDisabled": 50,
-                    "userEnabled": 950
-                }
-            }
-        ])
-
-    def test_usage_by_status_csv(self):
-        response = self.get_view_response(
-            'stats.statuses_series', group='day', format='csv')
-        assert response.status_code == 200
-        self.csv_eq(response, """date,count,userDisabled,userEnabled
-                                 2009-06-02,1500,130,1370
-                                 2009-06-01,1000,50,950""")
-
-    def test_overview(self):
-        response = self.get_view_response(
-            'stats.overview_series', group='day', format='json')
-        assert response.status_code == 200
-        # These are the dates from the fixtures. The return value will have
-        # dates in between filled with zeroes.
-        expected_data = [
-            {"date": "2009-09-03",
-             "data": {"downloads": 10, "updates": 0}},
-            {"date": "2009-08-03",
-             "data": {"downloads": 10, "updates": 0}},
-            {"date": "2009-07-03",
-             "data": {"downloads": 10, "updates": 0}},
-            {"date": "2009-06-28",
-             "data": {"downloads": 10, "updates": 0}},
-            {"date": "2009-06-20",
-             "data": {"downloads": 10, "updates": 0}},
-            {"date": "2009-06-12",
-             "data": {"downloads": 10, "updates": 0}},
-            {"date": "2009-06-07",
-             "data": {"downloads": 10, "updates": 0}},
-            {"date": "2009-06-02",
-             "data": {"downloads": 0, "updates": 1500}},
-            {"date": "2009-06-01",
-             "data": {"downloads": 10, "updates": 1000}}
+                'date': date(2009, 6, 1),
+                'end': date(2009, 6, 1),
+                'count': 1000,
+                'data': {'1.0': 200, '2.0': 800},
+            },
         ]
-        actual_data = json.loads(force_text(response.content))
-        # Make sure they match up at the front and back.
-        assert actual_data[0]['date'] == expected_data[0]['date']
-        assert actual_data[-1]['date'] == expected_data[-1]['date']
-        end_date = expected_data[-1]['date']
 
-        expected, actual = iter(expected_data), iter(actual_data)
-        next_expected, next_actual = next(expected), next(actual)
-        while True:
-            if next_expected['date'] == next_actual['date']:
-                # If they match it's a date we have data for.
-                self.assertDictEqual(next_expected, next_actual)
-                if next_expected['date'] == end_date:
-                    break
-                next_expected, next_actual = next(expected), next(actual)
-            else:
-                # Otherwise just check that the data is zeroes.
-                self.assertDictEqual(next_actual['data'],
-                                     {'downloads': 0, 'updates': 0})
-                next_actual = next(actual)
+        response = self.get_view_response(
+            'stats.versions_series', group='day', format='csv'
+        )
+
+        assert response.status_code == 200
+        self.csv_eq(
+            response,
+            """date,count,1.0,2.0
+            2009-06-02,1500,550,950
+            2009-06-01,1000,200,800""",
+        )
 
     def test_downloads_json(self):
+        self.get_download_series_mock.return_value = [
+            {
+                'date': date(2009, 6, 2),
+                'end': date(2009, 6, 2),
+                'count': 1500,
+            },
+            {
+                'date': date(2009, 6, 1),
+                'end': date(2009, 6, 1),
+                'count': 1000,
+            },
+        ]
+
         response = self.get_view_response(
-            'stats.downloads_series', group='day', format='json')
+            'stats.downloads_series', group='day', format='json'
+        )
+
         assert response.status_code == 200
-        self.assertListEqual(json.loads(force_text(response.content)), [
-            {"count": 10, "date": "2009-09-03", "end": "2009-09-03"},
-            {"count": 10, "date": "2009-08-03", "end": "2009-08-03"},
-            {"count": 10, "date": "2009-07-03", "end": "2009-07-03"},
-            {"count": 10, "date": "2009-06-28", "end": "2009-06-28"},
-            {"count": 10, "date": "2009-06-20", "end": "2009-06-20"},
-            {"count": 10, "date": "2009-06-12", "end": "2009-06-12"},
-            {"count": 10, "date": "2009-06-07", "end": "2009-06-07"},
-            {"count": 10, "date": "2009-06-01", "end": "2009-06-01"},
-        ])
+        self.assertListEqual(
+            json.loads(force_str(response.content)),
+            [
+                {'date': '2009-06-02', 'end': '2009-06-02', 'count': 1500},
+                {'date': '2009-06-01', 'end': '2009-06-01', 'count': 1000},
+            ],
+        )
 
     def test_downloads_csv(self):
+        self.get_download_series_mock.return_value = [
+            {
+                'date': date(2009, 6, 2),
+                'end': date(2009, 6, 2),
+                'count': 1500,
+            },
+            {
+                'date': date(2009, 6, 1),
+                'end': date(2009, 6, 1),
+                'count': 1000,
+            },
+        ]
+
         response = self.get_view_response(
-            'stats.downloads_series', group='day', format='csv')
-        assert response.status_code == 200
-        self.csv_eq(response, """date,count
-                                 2009-09-03,10
-                                 2009-08-03,10
-                                 2009-07-03,10
-                                 2009-06-28,10
-                                 2009-06-20,10
-                                 2009-06-12,10
-                                 2009-06-07,10
-                                 2009-06-01,10""")
+            'stats.downloads_series', group='day', format='csv'
+        )
 
-    def test_downloads_sources_json(self):
+        assert response.status_code == 200
+        self.csv_eq(
+            response,
+            """date,count
+            2009-06-02,1500
+            2009-06-01,1000""",
+        )
+
+    def test_download_by_source_json(self):
+        self.get_download_series_mock.return_value = [
+            {
+                'date': date(2009, 6, 2),
+                'end': date(2009, 6, 2),
+                'count': 1500,
+                'data': {'api': 550, 'search': 950},
+            },
+            {
+                'date': date(2009, 6, 1),
+                'end': date(2009, 6, 1),
+                'count': 1000,
+                'data': {'api': 550, 'search': 450},
+            },
+        ]
+
         response = self.get_view_response(
-            'stats.sources_series', group='day', format='json')
-        assert response.status_code == 200
-        self.assertListEqual(json.loads(force_text(response.content)), [
-            {"count": 10,
-             "date": "2009-09-03",
-             "end": "2009-09-03",
-             "data": {"api": 2, "search": 3}},
-            {"count": 10,
-             "date": "2009-08-03",
-             "end": "2009-08-03",
-             "data": {"api": 2, "search": 3}},
-            {"count": 10,
-             "date": "2009-07-03",
-             "end": "2009-07-03",
-             "data": {"api": 2, "search": 3}},
-            {"count": 10,
-             "date": "2009-06-28",
-             "end": "2009-06-28",
-             "data": {"api": 2, "search": 3}},
-            {"count": 10,
-             "date": "2009-06-20",
-             "end": "2009-06-20",
-             "data": {"api": 2, "search": 3}},
-            {"count": 10,
-             "date": "2009-06-12",
-             "end": "2009-06-12",
-             "data": {"api": 2, "search": 3}},
-            {"count": 10,
-             "date": "2009-06-07",
-             "end": "2009-06-07",
-             "data": {"api": 2, "search": 3}},
-            {"count": 10,
-             "date": "2009-06-01",
-             "end": "2009-06-01",
-             "data": {"api": 2, "search": 3}}
-        ])
+            'stats.sources_series', group='day', format='json'
+        )
 
-    def test_downloads_sources_csv(self):
+        assert response.status_code == 200
+        self.assertListEqual(
+            json.loads(force_str(response.content)),
+            [
+                {
+                    'date': '2009-06-02',
+                    'end': '2009-06-02',
+                    'count': 1500,
+                    'data': {'api': 550, 'search': 950},
+                },
+                {
+                    'date': '2009-06-01',
+                    'end': '2009-06-01',
+                    'count': 1000,
+                    'data': {'api': 550, 'search': 450},
+                },
+            ],
+        )
+
+    def test_download_by_source_csv(self):
+        self.get_download_series_mock.return_value = [
+            {
+                'date': date(2009, 6, 2),
+                'end': date(2009, 6, 2),
+                'count': 1500,
+                'data': {'api': 550, 'search': 950},
+            },
+            {
+                'date': date(2009, 6, 1),
+                'end': date(2009, 6, 1),
+                'count': 1000,
+                'data': {'api': 550, 'search': 450},
+            },
+        ]
+
         response = self.get_view_response(
-            'stats.sources_series', group='day', format='csv')
+            'stats.sources_series', group='day', format='csv'
+        )
+
         assert response.status_code == 200
-        self.csv_eq(response, """date,count,api,search
-                                 2009-09-03,10,2,3
-                                 2009-08-03,10,2,3
-                                 2009-07-03,10,2,3
-                                 2009-06-28,10,2,3
-                                 2009-06-20,10,2,3
-                                 2009-06-12,10,2,3
-                                 2009-06-07,10,2,3
-                                 2009-06-01,10,2,3""")
+        self.csv_eq(
+            response,
+            """date,count,api,search
+            2009-06-02,1500,550,950
+            2009-06-01,1000,550,450""",
+        )
 
+    def test_download_by_content_json(self):
+        self.get_download_series_mock.return_value = [
+            {
+                'date': date(2009, 6, 2),
+                'end': date(2009, 6, 2),
+                'count': 1500,
+                'data': {'content-1': 550, 'content-2': 950},
+            },
+            {
+                'date': date(2009, 6, 1),
+                'end': date(2009, 6, 1),
+                'count': 1000,
+                'data': {'content-1': 550, 'content-3': 450},
+            },
+        ]
 
-# Test the SQL query by using known dates, for weeks and months etc.
-class TestSiteQuery(TestCase):
+        response = self.get_view_response(
+            'stats.contents_series', group='day', format='json'
+        )
 
-    def setUp(self):
-        super(TestSiteQuery, self).setUp()
-        self.start = datetime.date(2012, 1, 1)
-        self.end = datetime.date(2012, 1, 31)
-        for k in range(0, 15):
-            for name in ['addon_count_new', 'version_count_new']:
-                date_ = self.start + datetime.timedelta(days=k)
-                GlobalStat.objects.create(date=date_, name=name, count=k)
+        assert response.status_code == 200
+        self.assertListEqual(
+            json.loads(force_str(response.content)),
+            [
+                {
+                    'data': {'content-1': 550, 'content-2': 950},
+                    'date': '2009-06-02',
+                    'end': '2009-06-02',
+                    'count': 1500,
+                },
+                {
+                    'data': {'content-1': 550, 'content-3': 450},
+                    'date': '2009-06-01',
+                    'end': '2009-06-01',
+                    'count': 1000,
+                },
+            ],
+        )
 
-    def test_day_grouping(self):
-        res = views._site_query('date', self.start, self.end)[0]
-        assert len(res) == 14
-        assert res[0]['data']['addons_created'] == 14
-        # Make sure we are returning counts as integers, otherwise
-        # DjangoJSONSerializer will map them to strings.
-        assert type(res[0]['data']['addons_created']) == int
-        assert res[0]['date'] == '2012-01-15'
+    def test_download_by_content_csv(self):
+        self.get_download_series_mock.return_value = [
+            {
+                'date': date(2009, 6, 2),
+                'end': date(2009, 6, 2),
+                'count': 1500,
+                'data': {'content-1': 550, 'content-2': 950},
+            },
+            {
+                'date': date(2009, 6, 1),
+                'end': date(2009, 6, 1),
+                'count': 1000,
+                'data': {'content-1': 550, 'content-3': 450},
+            },
+        ]
 
-    def test_week_grouping(self):
-        res = views._site_query('week', self.start, self.end)[0]
-        assert len(res) == 3
-        assert res[1]['data']['addons_created'] == 70
-        assert res[1]['date'] == '2012-01-08'
+        response = self.get_view_response(
+            'stats.contents_series', group='day', format='csv'
+        )
 
-    def test_month_grouping(self):
-        res = views._site_query('month', self.start, self.end)[0]
-        assert len(res) == 1
-        assert res[0]['data']['addons_created'] == (14 * (14 + 1)) / 2
-        assert res[0]['date'] == '2012-01-02'
+        assert response.status_code == 200
+        self.csv_eq(
+            response,
+            """date,count,content-1,content-2,content-3
+            2009-06-02,1500,550,950,0
+            2009-06-01,1000,550,0,450""",
+        )
 
-    def test_period(self):
-        self.assertRaises(AssertionError, views._site_query, 'not_period',
-                          self.start, self.end)
+    def test_download_by_medium_json(self):
+        self.get_download_series_mock.return_value = [
+            {
+                'date': date(2009, 6, 2),
+                'end': date(2009, 6, 2),
+                'count': 1500,
+                'data': {'medium-1': 550, 'medium-2': 950},
+            },
+            {
+                'date': date(2009, 6, 1),
+                'end': date(2009, 6, 1),
+                'count': 1000,
+                'data': {'medium-1': 550, 'medium-3': 450},
+            },
+        ]
 
+        response = self.get_view_response(
+            'stats.mediums_series', group='day', format='json'
+        )
 
-@mock.patch('olympia.stats.views._site_query')
-class TestSite(TestCase):
+        assert response.status_code == 200
+        self.assertListEqual(
+            json.loads(force_str(response.content)),
+            [
+                {
+                    'data': {'medium-1': 550, 'medium-2': 950},
+                    'date': '2009-06-02',
+                    'end': '2009-06-02',
+                    'count': 1500,
+                },
+                {
+                    'data': {'medium-1': 550, 'medium-3': 450},
+                    'date': '2009-06-01',
+                    'end': '2009-06-01',
+                    'count': 1000,
+                },
+            ],
+        )
 
-    def tests_period(self, _site_query):
-        _site_query.return_value = ['.', '.']
-        for period in ['date', 'week', 'month']:
-            self.client.get(reverse('stats.site', args=['json', period]))
-            assert _site_query.call_args[0][0] == period
+    def test_download_by_medium_csv(self):
+        self.get_download_series_mock.return_value = [
+            {
+                'date': date(2009, 6, 2),
+                'end': date(2009, 6, 2),
+                'count': 1500,
+                'data': {'medium-1': 550, 'medium-2': 950},
+            },
+            {
+                'date': date(2009, 6, 1),
+                'end': date(2009, 6, 1),
+                'count': 1000,
+                'data': {'medium-1': 550, 'medium-3': 450},
+            },
+        ]
 
-    def tests_period_day(self, _site_query):
-        _site_query.return_value = ['.', '.']
-        start = (datetime.date.today() - datetime.timedelta(days=3))
-        end = datetime.date.today()
-        self.client.get(reverse('stats.site.new',
-                        args=['day', start.strftime('%Y%m%d'),
-                              end.strftime('%Y%m%d'), 'json']))
-        assert _site_query.call_args[0][0] == 'date'
-        assert _site_query.call_args[0][1] == start
-        assert _site_query.call_args[0][2] == end
+        response = self.get_view_response(
+            'stats.mediums_series', group='day', format='csv'
+        )
 
-    def test_csv(self, _site_query):
-        _site_query.return_value = [[], []]
-        res = self.client.get(reverse('stats.site', args=['csv', 'date']))
-        assert res._headers['content-type'][1].startswith('text/csv')
+        assert response.status_code == 200
+        self.csv_eq(
+            response,
+            """date,count,medium-1,medium-2,medium-3
+            2009-06-02,1500,550,950,0
+            2009-06-01,1000,550,0,450""",
+        )
 
-    def test_json(self, _site_query):
-        _site_query.return_value = [[], []]
-        res = self.client.get(reverse('stats.site', args=['json', 'date']))
-        assert res._headers['content-type'][1].startswith('application/json')
+    def test_download_by_campaign_json(self):
+        self.get_download_series_mock.return_value = [
+            {
+                'date': date(2009, 6, 2),
+                'end': date(2009, 6, 2),
+                'count': 1500,
+                'data': {'campaign-1': 550, 'campaign-2': 950},
+            },
+            {
+                'date': date(2009, 6, 1),
+                'end': date(2009, 6, 1),
+                'count': 1000,
+                'data': {'campaign-1': 550, 'campaign-3': 450},
+            },
+        ]
 
-    def tests_no_date(self, _site_query):
-        _site_query.return_value = ['.', '.']
-        self.client.get(reverse('stats.site', args=['json', 'date']))
-        assert _site_query.call_args[0][1] == (
-            datetime.date.today() - datetime.timedelta(days=365))
-        assert _site_query.call_args[0][2] == datetime.date.today()
+        response = self.get_view_response(
+            'stats.campaigns_series', group='day', format='json'
+        )
+
+        assert response.status_code == 200
+        self.assertListEqual(
+            json.loads(force_str(response.content)),
+            [
+                {
+                    'data': {'campaign-1': 550, 'campaign-2': 950},
+                    'date': '2009-06-02',
+                    'end': '2009-06-02',
+                    'count': 1500,
+                },
+                {
+                    'data': {'campaign-1': 550, 'campaign-3': 450},
+                    'date': '2009-06-01',
+                    'end': '2009-06-01',
+                    'count': 1000,
+                },
+            ],
+        )
+
+    def test_download_by_campaign_csv(self):
+        self.get_download_series_mock.return_value = [
+            {
+                'date': date(2009, 6, 2),
+                'end': date(2009, 6, 2),
+                'count': 1500,
+                'data': {'campaign-1': 550, 'campaign-2': 950},
+            },
+            {
+                'date': date(2009, 6, 1),
+                'end': date(2009, 6, 1),
+                'count': 1000,
+                'data': {'campaign-1': 550, 'campaign-3': 450},
+            },
+        ]
+
+        response = self.get_view_response(
+            'stats.campaigns_series', group='day', format='csv'
+        )
+
+        assert response.status_code == 200
+        self.csv_eq(
+            response,
+            """date,count,campaign-1,campaign-2,campaign-3
+            2009-06-02,1500,550,950,0
+            2009-06-01,1000,550,0,450""",
+        )
+
+    def test_unknown_download_values_are_renamed(self):
+        self.get_download_series_mock.return_value = [
+            {
+                'date': date(2009, 6, 2),
+                'end': date(2009, 6, 2),
+                'count': 1500,
+                'data': {'campaign-1': 550, 'Unknown': 950},
+            },
+        ]
+
+        response = self.get_view_response(
+            'stats.campaigns_series', group='day', format='csv'
+        )
+
+        assert response.status_code == 200
+        self.csv_eq(
+            response,
+            """date,count,campaign-1,(none)
+            2009-06-02,1500,550,950""",
+        )
 
 
 class TestXss(amo.tests.TestXss):
-
     def test_stats_page(self):
         url = reverse('stats.overview', args=[self.addon.slug])
         self.assertNameAndNoXSS(url)
@@ -809,3 +969,297 @@ class TestXss(amo.tests.TestXss):
 
         req = RequestFactory().get('/', last='<alert>')
         assert views.get_report_view(req) == {}
+
+
+class TestStatsWithBigQuery(TestCase):
+    def setUp(self):
+        super().setUp()
+
+        self.user = user_factory(email='staff@mozilla.com')
+        self.addon = addon_factory(users=[self.user])
+        self.start_date = date(2020, 1, 1)
+        self.end_date = date(2020, 1, 5)
+        self.series_args = [
+            self.addon.slug,
+            'day',
+            self.start_date.strftime('%Y%m%d'),
+            self.end_date.strftime('%Y%m%d'),
+            'json',
+        ]
+        self.client.force_login(self.user)
+
+    def test_overview_shows_link_to_stats_by_country(self):
+        url = reverse('stats.overview', args=[self.addon.slug])
+
+        response = self.client.get(url)
+
+        assert b'by Country' in response.content
+
+    @mock.patch('olympia.stats.views.get_updates_series')
+    def test_usage_series(self, get_updates_series_mock):
+        get_updates_series_mock.return_value = []
+        url = reverse('stats.usage_series', args=self.series_args)
+
+        self.client.get(url)
+
+        get_updates_series_mock.assert_called_once_with(
+            addon=self.addon,
+            start_date=self.start_date,
+            end_date=self.end_date,
+        )
+
+    @override_switch('disable-bigquery', active=True)
+    @mock.patch('olympia.stats.views.get_updates_series')
+    def test_usage_series_disabled(self, get_updates_series_mock):
+        url = reverse('stats.usage_series', args=self.series_args)
+
+        response = self.client.get(url)
+
+        get_updates_series_mock.assert_not_called()
+        assert response.status_code == 503
+
+    def test_usage_breakdown_series(self):
+        for url_name, source in [
+            ('stats.apps_series', 'apps'),
+            ('stats.countries_series', 'countries'),
+            ('stats.locales_series', 'locales'),
+            ('stats.os_series', 'os'),
+            ('stats.versions_series', 'versions'),
+        ]:
+            url = reverse(url_name, args=self.series_args)
+
+            with mock.patch(
+                'olympia.stats.views.get_updates_series'
+            ) as get_updates_series_mock:
+                get_updates_series_mock.return_value = []
+                self.client.get(url)
+
+                get_updates_series_mock.assert_called_once_with(
+                    addon=self.addon,
+                    start_date=self.start_date,
+                    end_date=self.end_date,
+                    source=source,
+                )
+
+    @override_switch('disable-bigquery', active=True)
+    def test_usage_breakdown_series_disabled(self):
+        for url_name, _source in [
+            ('stats.apps_series', 'apps'),
+            ('stats.countries_series', 'countries'),
+            ('stats.locales_series', 'locales'),
+            ('stats.os_series', 'os'),
+            ('stats.versions_series', 'versions'),
+        ]:
+            url = reverse(url_name, args=self.series_args)
+
+            with mock.patch(
+                'olympia.stats.views.get_updates_series'
+            ) as get_updates_series_mock:
+                response = self.client.get(url)
+
+                get_updates_series_mock.assert_not_called()
+                assert response.status_code == 503
+                assert 'json' in response.get('content-type')
+
+    @override_switch('disable-bigquery', active=True)
+    def test_usage_breakdown_series_csv_disabled(self):
+        self.series_args[4] = 'csv'
+
+        for url_name, _source in [
+            ('stats.apps_series', 'apps'),
+            ('stats.countries_series', 'countries'),
+            ('stats.locales_series', 'locales'),
+            ('stats.os_series', 'os'),
+            ('stats.versions_series', 'versions'),
+        ]:
+            url = reverse(url_name, args=self.series_args)
+
+            with mock.patch(
+                'olympia.stats.views.get_updates_series'
+            ) as get_updates_series_mock:
+                response = self.client.get(url)
+
+                get_updates_series_mock.assert_not_called()
+                assert response.status_code == 503
+                assert 'csv' in response.get('content-type')
+
+    def test_stats_by_country(self):
+        url = reverse('stats.countries', args=[self.addon.slug])
+
+        response = self.client.get(url)
+
+        assert b'User countries by Date' in response.content
+
+    def test_stats_for_langpacks(self):
+        self.addon.update(type=amo.ADDON_LPAPP)
+        url = reverse('stats.overview', args=[self.addon.slug])
+
+        response = self.client.get(url)
+
+        assert response.status_code == 200
+
+    def test_stats_for_dictionaries(self):
+        self.addon.update(type=amo.ADDON_DICT)
+        url = reverse('stats.overview', args=[self.addon.slug])
+
+        response = self.client.get(url)
+
+        assert response.status_code == 200
+
+    @mock.patch('olympia.stats.views.get_updates_series')
+    @mock.patch('olympia.stats.views.get_download_series')
+    def test_overview_series_with_bigquery_download_stats(
+        self, get_download_series_mock, get_updates_series_mock
+    ):
+        get_download_series_mock.return_value = []
+        get_updates_series_mock.return_value = []
+        url = reverse('stats.overview_series', args=self.series_args)
+
+        self.client.get(url)
+
+        get_download_series_mock.assert_called_once_with(
+            addon=self.addon,
+            start_date=self.start_date,
+            end_date=self.end_date,
+        )
+
+    @override_switch('disable-bigquery', active=True)
+    @mock.patch('olympia.stats.views.get_updates_series')
+    @mock.patch('olympia.stats.views.get_download_series')
+    def test_overview_series_with_bigquery_download_stats_disabled(
+        self, get_download_series_mock, get_updates_series_mock
+    ):
+        url = reverse('stats.overview_series', args=self.series_args)
+
+        self.client.get(url)
+
+        get_download_series_mock.assert_not_called()
+        get_updates_series_mock.assert_not_called()
+
+    def test_overview_shows_links_to_bigquery_download_stats(self):
+        url = reverse('stats.overview', args=[self.addon.slug])
+
+        response = self.client.get(url)
+
+        assert b'Weekly Downloads' in response.content
+        assert b'by Source' in response.content
+        assert b'by Medium' in response.content
+        assert b'by Content' in response.content
+        assert b'by Campaign' in response.content
+        assert (
+            force_bytes(reverse('stats.downloads', args=[self.addon.id]))
+            not in response.content
+        )
+        assert (
+            force_bytes(reverse('stats.downloads', args=[self.addon.slug]))
+            in response.content
+        )
+
+    def test_links_for_deleted_addon(self):
+        self.addon.delete()
+        url = reverse('stats.overview', args=[self.addon.id])
+        # Login as privileged user to be able to access the stats for a deleted add-on.
+        self.client.logout()
+        self.grant_permission(self.user, amo.permissions.SUPERPOWERS)
+        self.client.force_login(self.user)
+
+        response = self.client.get(url)
+
+        assert (
+            force_bytes(reverse('stats.downloads', args=[self.addon.id]))
+            in response.content
+        )
+
+    def test_no_download_stats_for_purely_unlisted_addons(self):
+        self.change_channel_for_addon(self.addon, amo.CHANNEL_UNLISTED)
+        assert not self.addon.has_version_in_channel(amo.CHANNEL_LISTED)
+
+        url = reverse('stats.overview', args=[self.addon.slug])
+        response = self.client.get(url)
+
+        assert b'by Source' not in response.content
+        assert b'by Medium' not in response.content
+        assert b'by Content' not in response.content
+        assert b'by Campaign' not in response.content
+
+    def test_download_stats(self):
+        url = reverse('stats.downloads', args=[self.addon.slug])
+
+        response = self.client.get(url)
+
+        assert b'How are downloads counted' not in response.content
+
+    @override_switch('disable-bigquery', active=True)
+    def test_download_stats_disabled(self):
+        url = reverse('stats.downloads', args=[self.addon.slug])
+
+        response = self.client.get(url)
+
+        assert b'statistics are temporarily unavailable' in response.content
+
+    def test_download_stats_by_source(self):
+        url = reverse('stats.sources', args=[self.addon.slug])
+
+        response = self.client.get(url)
+
+        assert b'Download sources by Date' in response.content
+        assert b'About tracking external sources' in response.content
+
+    def test_download_stats_by_medium(self):
+        url = reverse('stats.mediums', args=[self.addon.slug])
+
+        response = self.client.get(url)
+
+        assert b'Download mediums by Date' in response.content
+        assert b'About tracking external sources' in response.content
+
+    def test_download_stats_by_content(self):
+        url = reverse('stats.contents', args=[self.addon.slug])
+
+        response = self.client.get(url)
+
+        assert b'Download contents by Date' in response.content
+        assert b'About tracking external sources' in response.content
+
+    def test_download_stats_by_campaign(self):
+        url = reverse('stats.campaigns', args=[self.addon.slug])
+
+        response = self.client.get(url)
+
+        assert b'Download campaigns by Date' in response.content
+        assert b'About tracking external sources' in response.content
+
+
+class TestProcessLocales(TestCase):
+    def test_performs_lowercase_lookup(self):
+        series = [{'data': {'en-US': 123}}]
+
+        series = views.process_locales(series)
+
+        assert len(next(series)['data']) == 1
+
+    def test_skips_none_key(self):
+        series = [{'data': {None: 123}}]
+
+        series = views.process_locales(series)
+
+        assert len(next(series)['data']) == 0
+
+
+class TestRenderCSV(TestCase):
+    def test_handles_null_keys(self):
+        series = [
+            {'data': {None: 1, 'a': 2}, 'count': 3, 'date': '2020-01-01'},
+            {'data': {'a': 4}, 'count': 4, 'date': '2020-01-02'},
+        ]
+
+        # Simulates how other views are rendering CSV content.
+        stats, fields = views.csv_fields(series)
+        response = views.render_csv(
+            request=RequestFactory().get('/'),
+            addon=addon_factory(),
+            stats=stats,
+            fields=fields,
+        )
+
+        assert ',a\r\n1,2\r\n0,4' in force_str(response.content)

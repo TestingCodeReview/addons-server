@@ -1,33 +1,37 @@
 import json
 import time
-
 from calendar import timegm
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from unittest import mock
 
 from django.conf import settings
-from django.core import signing
+from django.contrib.auth import SESSION_KEY
 from django.test import RequestFactory
 from django.urls import reverse
-from django.utils.encoding import force_bytes
 
 import jwt
-import mock
-import six
-
-from freezegun import freeze_time
+import time_machine
 from rest_framework.exceptions import AuthenticationFailed
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework_jwt.views import refresh_jwt_token
 
-from olympia import core
+from olympia import amo, core
+from olympia.accounts.verify import IdentificationError
+from olympia.activity.models import ActivityLog
 from olympia.amo.templatetags.jinja_helpers import absolutify
 from olympia.amo.tests import (
-    APITestClient, TestCase, WithDynamicEndpoints, user_factory)
+    APITestClientJWT,
+    APITestClientSessionID,
+    TestCase,
+    WithDynamicEndpoints,
+    user_factory,
+)
 from olympia.api.authentication import (
-    JWTKeyAuthentication, WebTokenAuthentication)
-from olympia.api.tests.test_jwt_auth import JWTAuthKeyTester
+    JWTKeyAuthentication,
+    SessionIDAuthentication,
+)
+from olympia.api.tests import JWTAuthKeyTester
 
 
 class JWTKeyAuthTestView(APIView):
@@ -35,6 +39,7 @@ class JWTKeyAuthTestView(APIView):
     This is an example of a view that would be protected by
     JWTKeyAuthentication, used in TestJWTKeyAuthProtectedView below.
     """
+
     permission_classes = [IsAuthenticated]
     authentication_classes = [JWTKeyAuthentication]
 
@@ -46,22 +51,21 @@ class JWTKeyAuthTestView(APIView):
 
 
 class TestJWTKeyAuthentication(JWTAuthKeyTester, TestCase):
-    client_class = APITestClient
+    client_class = APITestClientJWT
 
     def setUp(self):
-        super(TestJWTKeyAuthentication, self).setUp()
+        super().setUp()
         self.factory = RequestFactory()
         self.auth = JWTKeyAuthentication()
         self.user = user_factory(read_dev_agreement=datetime.now())
 
     def request(self, token):
-        return self.factory.get('/', HTTP_AUTHORIZATION='JWT {}'.format(token))
+        return self.factory.get('/', HTTP_AUTHORIZATION=f'JWT {token}')
 
     def _create_token(self, api_key=None):
         if api_key is None:
             api_key = self.create_api_key(self.user)
-        return self.create_auth_token(api_key.user, api_key.key,
-                                      api_key.secret)
+        return self.create_auth_token(api_key.user, api_key.key, api_key.secret)
 
     def test_get_user(self):
         core.set_remote_addr('15.16.23.42')
@@ -69,25 +73,36 @@ class TestJWTKeyAuthentication(JWTAuthKeyTester, TestCase):
         assert user == self.user
         assert user.last_login_ip == '15.16.23.42'
         self.assertCloseToNow(user.last_login)
+        assert (
+            ActivityLog.objects.filter(
+                action=amo.LOG.LOG_IN_API_TOKEN.id, user=user
+            ).count()
+            == 1
+        )
+
+    def test_authenticate_header(self):
+        request = self.factory.post('/api/v4/whatever/')
+        assert (
+            self.auth.authenticate_header(request)
+            == 'JWT realm="Access to addons.mozilla.org external API"'
+        )
 
     def test_wrong_type_for_iat(self):
         api_key = self.create_api_key(self.user)
         # Manually create a broken payload where 'iat' is a string containing
         # a timestamp..
-        issued_at = int(time.mktime(datetime.utcnow().timetuple()))
+        issued_at = int(time.mktime(datetime.now(UTC).timetuple()))
         payload = {
             'iss': api_key.key,
-            'iat': six.text_type(issued_at),
-            'exp': six.text_type(
-                issued_at + settings.MAX_APIKEY_JWT_AUTH_TOKEN_LIFETIME),
+            'iat': str(issued_at),
+            'exp': str(issued_at + settings.MAX_APIKEY_JWT_AUTH_TOKEN_LIFETIME),
         }
         token = self.encode_token_payload(payload, api_key.secret)
         core.set_remote_addr('1.2.3.4')
 
         with self.assertRaises(AuthenticationFailed) as ctx:
             self.auth.authenticate(self.request(token))
-        assert ctx.exception.detail == (
-            'Wrong type for one or more keys in payload')
+        assert ctx.exception.detail == ('Wrong type for one or more keys in payload')
 
     def test_unknown_issuer(self):
         api_key = self.create_api_key(self.user)
@@ -102,7 +117,8 @@ class TestJWTKeyAuthentication(JWTAuthKeyTester, TestCase):
     def test_deleted_user(self):
         in_the_past = self.days_ago(42)
         self.user.update(
-            last_login_ip='48.15.16.23', last_login=in_the_past, deleted=True)
+            last_login_ip='48.15.16.23', last_login=in_the_past, deleted=True
+        )
 
         with self.assertRaises(AuthenticationFailed) as ctx:
             self.auth.authenticate(self.request(self._create_token()))
@@ -129,7 +145,7 @@ class TestJWTKeyAuthentication(JWTAuthKeyTester, TestCase):
 
     @mock.patch('olympia.api.jwt_auth.jwt_decode_handler')
     def test_decode_expired_signature(self, jwt_decode_handler):
-        jwt_decode_handler.side_effect = jwt.ExpiredSignature
+        jwt_decode_handler.side_effect = jwt.ExpiredSignatureError
 
         with self.assertRaises(AuthenticationFailed) as ctx:
             self.auth.authenticate(self.request('whatever'))
@@ -163,30 +179,15 @@ class TestJWTKeyAuthentication(JWTAuthKeyTester, TestCase):
             self.auth.authenticate(self.request(token))
         assert ctx.exception.detail == (
             "API key based tokens are not refreshable, don't include "
-            "`orig_iat` in their payload.")
-
-    def test_cant_refresh_token(self):
-        # Developers generate tokens, not us, they should not be refreshable,
-        # the refresh implementation does not even know how to decode them.
-        api_key = self.create_api_key(self.user)
-        payload = self.auth_token_payload(self.user, api_key.key)
-        payload['orig_iat'] = timegm(payload['iat'].utctimetuple())
-        token = self.encode_token_payload(payload, api_key.secret)
-
-        request = self.factory.post('/lol-refresh', {'token': token})
-        response = refresh_jwt_token(request)
-        response.render()
-        assert response.status_code == 400
-        data = json.loads(response.content)
-        assert data == {'non_field_errors': ['Error decoding signature.']}
+            '`orig_iat` in their payload.'
+        )
 
 
-class TestJWTKeyAuthProtectedView(
-        WithDynamicEndpoints, JWTAuthKeyTester, TestCase):
-    client_class = APITestClient
+class TestJWTKeyAuthProtectedView(WithDynamicEndpoints, JWTAuthKeyTester, TestCase):
+    client_class = APITestClientJWT
 
     def setUp(self):
-        super(TestJWTKeyAuthProtectedView, self).setUp()
+        super().setUp()
         self.endpoint(JWTKeyAuthTestView)
         self.client.logout_api()  # just to be sure!
         self.user = user_factory(read_dev_agreement=datetime.now())
@@ -196,9 +197,9 @@ class TestJWTKeyAuthProtectedView(
         return handler(reverse('test-dynamic-endpoint'), *args, **kw)
 
     def jwt_request(self, token, method, *args, **kw):
-        return self.request(method,
-                            HTTP_AUTHORIZATION='JWT {}'.format(token),
-                            *args, **kw)
+        return self.request(
+            method, *args, **{'HTTP_AUTHORIZATION': f'JWT {token}', **kw}
+        )
 
     def test_get_requires_auth(self):
         res = self.request('get')
@@ -210,8 +211,7 @@ class TestJWTKeyAuthProtectedView(
 
     def test_can_post_with_jwt_header(self):
         api_key = self.create_api_key(self.user)
-        token = self.create_auth_token(api_key.user, api_key.key,
-                                       api_key.secret)
+        token = self.create_auth_token(api_key.user, api_key.key, api_key.secret)
         res = self.jwt_request(token, 'post', {})
 
         assert res.status_code == 200, res.content
@@ -220,140 +220,212 @@ class TestJWTKeyAuthProtectedView(
 
     def test_api_key_must_be_active(self):
         api_key = self.create_api_key(self.user, is_active=None)
-        token = self.create_auth_token(api_key.user, api_key.key,
-                                       api_key.secret)
+        token = self.create_auth_token(api_key.user, api_key.key, api_key.secret)
         res = self.jwt_request(token, 'post', {})
         assert res.status_code == 401, res.content
 
 
-class TestWebTokenAuthentication(TestCase):
-    client_class = APITestClient
+class TestSessionIDAuthentication(TestCase):
+    client_class = APITestClientSessionID
 
     def setUp(self):
-        super(TestWebTokenAuthentication, self).setUp()
-        self.auth = WebTokenAuthentication()
+        super().setUp()
+        self.auth = SessionIDAuthentication()
         self.factory = RequestFactory()
         self.user = user_factory(read_dev_agreement=datetime.now())
+        self.update_token_mock = self.patch(
+            'olympia.api.authentication.check_and_update_fxa_access_token'
+        )
+        self.create_switch('enable-session-anomaly-recording', active=True)
 
-    def _authenticate(self, token):
-        url = absolutify('/api/v3/whatever/')
-        prefix = WebTokenAuthentication.auth_header_prefix
+    def _authenticate(self, token, *, headers=None):
+        url = absolutify('/api/v4/whatever/')
         request = self.factory.post(
-            url, HTTP_HOST='testserver',
-            HTTP_AUTHORIZATION='{0} {1}'.format(prefix, token))
+            url,
+            HTTP_HOST='testserver',
+            HTTP_AUTHORIZATION=f'Session {token}',
+            headers=headers,
+        )
+        self.initialize_session({}, request=request)
 
         return self.auth.authenticate(request)
 
     def test_success(self):
-        token = self.client.generate_api_token(self.user)
+        token = self.client.create_session(self.user)
         user, _ = self._authenticate(token)
         assert user == self.user
+        self.update_token_mock.assert_called()
+        session = self.get_session(token)
+        assert 'client_ja4' not in session
+
+        # Not a new log in, and no session anomaly, so no activity log.
+        assert ActivityLog.objects.count() == 0
+
+    def test_success_storing_headers_in_session(self):
+        token = self.client.create_session(self.user)
+        user, _ = self._authenticate(token, headers={'Client-JA4': 'some-ja4'})
+        assert user == self.user
+        session = self.get_session(token)
+        assert session['request_headers']['client-ja4'] == 'some-ja4'
+
+        # No anomalies yet (first time going through anomalies check)
+        assert ActivityLog.objects.count() == 0
+
+        return token
+
+    def test_with_session_anomaly(self):
+        # Authenticate with the session once with a JA4...
+        token = self.test_success_storing_headers_in_session()
+
+        # ... and authenticate again with a different JA4.
+        user, _ = self._authenticate(token, headers={'Client-JA4': 'different-ja4'})
+
+        # We are currently not preventing auth when an anomaly is detected,
+        # just logging.
+        assert user == self.user
+
+        assert ActivityLog.objects.count() == 1
+        activity = ActivityLog.objects.get()
+        assert activity.action == amo.LOG.SESSION_ANOMALY.id
+        assert activity.user == self.user
+        assert activity.details == {
+            'anomalies': [
+                {
+                    'header': 'client-ja4',
+                    'expected': 'some-ja4',
+                    'received': 'different-ja4',
+                }
+            ]
+        }
 
     def test_authenticate_header(self):
-        request = self.factory.post('/api/v3/whatever/')
-        assert (self.auth.authenticate_header(request) ==
-                'bearer realm="api"')
+        request = self.factory.post('/api/v4/whatever/')
+        assert self.auth.authenticate_header(request) == (
+            'Session realm="Access to addons.mozilla.org internal API with session key"'
+        )
 
     def test_wrong_header_only_prefix(self):
         request = self.factory.post(
-            '/api/v3/whatever/',
-            HTTP_AUTHORIZATION=WebTokenAuthentication.auth_header_prefix)
+            '/api/v4/whatever/',
+            HTTP_AUTHORIZATION=SessionIDAuthentication.auth_header_prefix,
+        )
         with self.assertRaises(AuthenticationFailed) as exp:
             self.auth.authenticate(request)
         assert exp.exception.detail['code'] == 'ERROR_INVALID_HEADER'
         assert exp.exception.detail['detail'] == (
-            'Invalid Authorization header. No credentials provided.')
+            'Invalid Authorization header. No credentials provided.'
+        )
+        assert 'url' not in exp.exception.detail
 
     def test_wrong_header_too_many_spaces(self):
         request = self.factory.post(
-            '/api/v3/whatever/',
-            HTTP_AUTHORIZATION='{} foo bar'.format(
-                WebTokenAuthentication.auth_header_prefix))
+            '/api/v4/whatever/',
+            HTTP_AUTHORIZATION=f'{SessionIDAuthentication.auth_header_prefix} foo bar',
+        )
         with self.assertRaises(AuthenticationFailed) as exp:
             self.auth.authenticate(request)
         assert exp.exception.detail['code'] == 'ERROR_INVALID_HEADER'
         assert exp.exception.detail['detail'] == (
             'Invalid Authorization header. '
-            'Credentials string should not contain spaces.')
+            'Credentials string should not contain spaces.'
+        )
+        assert 'url' not in exp.exception.detail
 
     def test_no_token(self):
-        request = self.factory.post('/api/v3/whatever/')
-        self.auth.authenticate(request) is None
-
-    def test_expired_token(self):
-        old_date = datetime.now() - timedelta(
-            seconds=settings.SESSION_COOKIE_AGE + 1)
-        with freeze_time(old_date):
-            token = self.client.generate_api_token(self.user)
-        with self.assertRaises(AuthenticationFailed) as exp:
-            self._authenticate(token)
-        assert exp.exception.detail['code'] == 'ERROR_SIGNATURE_EXPIRED'
-        assert exp.exception.detail['detail'] == 'Signature has expired.'
+        request = self.factory.post('/api/v4/whatever/')
+        assert self.auth.authenticate(request) is None
+        self.update_token_mock.assert_not_called()
 
     def test_still_valid_token(self):
         not_so_old_date = datetime.now() - timedelta(
-            seconds=settings.SESSION_COOKIE_AGE - 30)
-        with freeze_time(not_so_old_date):
-            token = self.client.generate_api_token(self.user)
+            seconds=settings.SESSION_COOKIE_AGE - 30
+        )
+        with time_machine.travel(not_so_old_date, tick=False):
+            token = self.client.create_session(self.user)
         assert self._authenticate(token)[0] == self.user
+        self.update_token_mock.assert_called()
 
     def test_bad_token(self):
         token = 'garbage'
         with self.assertRaises(AuthenticationFailed) as exp:
             self._authenticate(token)
-        assert exp.exception.detail['code'] == 'ERROR_DECODING_SIGNATURE'
-        assert exp.exception.detail['detail'] == 'Error decoding signature.'
+        assert exp.exception.detail['code'] == 'ERROR_AUTHENTICATION_EXPIRED'
+        assert exp.exception.detail['detail'] == (
+            'Valid user session not found matching the provided session key.'
+        )
+        assert 'url' not in exp.exception.detail
+        self.update_token_mock.assert_not_called()
 
     def test_user_id_is_none(self):
-        token = self.client.generate_api_token(self.user, user_id=None)
-        with self.assertRaises(AuthenticationFailed):
+        token = self.client.create_session(self.user, **{SESSION_KEY: None})
+        with self.assertRaises(AuthenticationFailed) as exp:
             self._authenticate(token)
-
-    def test_no_user_id_in_payload(self):
-        data = {
-            'auth_hash': self.user.get_session_auth_hash(),
-        }
-        token = signing.dumps(data, salt=WebTokenAuthentication.salt)
-        with self.assertRaises(AuthenticationFailed):
-            self._authenticate(token)
-
-    def test_no_auth_hash_in_payload(self):
-        data = {
-            'user_id': self.user.pk,
-        }
-        token = signing.dumps(data, salt=WebTokenAuthentication.salt)
-        with self.assertRaises(AuthenticationFailed):
-            self._authenticate(token)
+        assert exp.exception.detail['code'] == 'ERROR_AUTHENTICATION_EXPIRED'
+        assert exp.exception.detail['detail'] == (
+            'Valid user session not found matching the provided session key.'
+        )
+        assert 'url' not in exp.exception.detail
+        self.update_token_mock.assert_not_called()
 
     def test_user_deleted(self):
         self.user.delete()
-        token = self.client.generate_api_token(self.user)
-        with self.assertRaises(AuthenticationFailed):
+        token = self.client.create_session(self.user)
+        with self.assertRaises(AuthenticationFailed) as exp:
             self._authenticate(token)
+        assert exp.exception.detail['code'] == 'ERROR_AUTHENTICATION_EXPIRED'
+        assert exp.exception.detail['detail'] == (
+            'Valid user session not found matching the provided session key.'
+        )
+        assert 'url' not in exp.exception.detail
+        self.update_token_mock.assert_not_called()
 
     def test_invalid_user_not_found(self):
-        token = self.client.generate_api_token(self.user, user_id=-1)
-        with self.assertRaises(AuthenticationFailed):
+        token = self.client.create_session(self.user, **{SESSION_KEY: -1})
+        with self.assertRaises(AuthenticationFailed) as exp:
             self._authenticate(token)
+        assert exp.exception.detail['code'] == 'ERROR_AUTHENTICATION_EXPIRED'
+        assert exp.exception.detail['detail'] == (
+            'Valid user session not found matching the provided session key.'
+        )
+        assert 'url' not in exp.exception.detail
+        self.update_token_mock.assert_not_called()
 
     def test_invalid_user_other_user(self):
-        user2 = user_factory(read_dev_agreement=datetime.now())
-        token = self.client.generate_api_token(self.user, user_id=user2.pk)
-        with self.assertRaises(AuthenticationFailed):
+        user2 = user_factory(
+            read_dev_agreement=datetime.now(), auth_id=self.user.auth_id + 42
+        )
+        # That token should be invalid: it's a session generated for self.user,
+        # but we have overridden the SESSION_KEY to point to user2 instead, so
+        # it shouldn't work, because the auth_id hash will differ.
+        token = self.client.create_session(self.user, **{SESSION_KEY: user2.pk})
+        with self.assertRaises(AuthenticationFailed) as exp:
             self._authenticate(token)
+        assert exp.exception.detail['code'] == 'ERROR_AUTHENTICATION_EXPIRED'
+        assert exp.exception.detail['detail'] == (
+            'Valid user session not found matching the provided session key.'
+        )
+        assert 'url' not in exp.exception.detail
+        self.update_token_mock.assert_not_called()
 
     def test_wrong_auth_id(self):
-        token = self.client.generate_api_token(self.user)
+        token = self.client.create_session(self.user)
         self.user.update(auth_id=self.user.auth_id + 42)
-        with self.assertRaises(AuthenticationFailed):
+        with self.assertRaises(AuthenticationFailed) as exp:
             self._authenticate(token)
+        assert exp.exception.detail['code'] == 'ERROR_AUTHENTICATION_EXPIRED'
+        assert exp.exception.detail['detail'] == (
+            'Valid user session not found matching the provided session key.'
+        )
+        assert 'url' not in exp.exception.detail
+        self.update_token_mock.assert_not_called()
 
-    def test_make_sure_token_is_decodable(self):
-        token = self.client.generate_api_token(self.user)
-        # A token is really a string containing the json dict,
-        # a timestamp and a signature, separated by ':'. The base64 encoding
-        # lacks padding, which is why we need to use signing.b64_decode() which
-        # handles that for us.
-        data = json.loads(signing.b64_decode(force_bytes(token.split(':')[0])))
-        assert data['user_id'] == self.user.pk
-        assert data['auth_hash'] == self.user.get_session_auth_hash()
+    def test_fxa_access_token_validity_token_invalid(self):
+        self.update_token_mock.side_effect = IdentificationError
+        token = self.client.create_session(self.user)
+        with self.assertRaises(AuthenticationFailed) as exp:
+            assert self.user == self._authenticate(token)[0]
+        assert exp.exception.detail['code'] == 'ERROR_AUTHENTICATION_EXPIRED'
+        assert exp.exception.detail['detail'] == (
+            'Access token refresh failed; user needs to login to FxA again.'
+        )
+        assert 'url' not in exp.exception.detail

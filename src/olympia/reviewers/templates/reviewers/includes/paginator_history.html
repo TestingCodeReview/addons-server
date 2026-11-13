@@ -3,21 +3,21 @@
     {% if pager.has_next() %}
       <li>
         <a rel="prev" href="{{ pager.url|urlparams(page=pager.next_page_number()) }}#history">
-          {{ _('Older') }}
+          Older
         </a>
       </li>
     {% endif %}
     <li>
-      {% trans begin=pager.start_index(), end=pager.end_index(),
+      {% with  begin=pager.start_index(), end=pager.end_index(),
                count=count|numberfmt %}
         Results <strong>{{ begin }}</strong>&ndash;<strong>{{ end }}</strong>
         of <strong>{{ count }}</strong>
-      {% endtrans %}
+      {% endwith %}
     </li>
     {% if pager.has_previous() %}
       <li>
         <a rel="next" href="{{ pager.url|urlparams(page=pager.previous_page_number()) }}#history">
-          {{ _('Newer') }}
+          Newer
         </a>
       </li>
     {% endif %}
@@ -27,4 +27,10 @@
     </li>
     {% endfor %}
   </ol>
+  {% if versions_with_a_due_date_other %}
+    <strong class="other-with-due-date risk-high">{{ versions_with_a_due_date_other }} versions with a due date on other pages.</strong>
+  {% endif %}
+  {% if versions_pending_rejection_other %}
+    <strong class="other-pending-rejection risk-high">{{ versions_pending_rejection_other }} versions pending rejection on other pages.</strong>
+  {% endif %}
 {% endif %}

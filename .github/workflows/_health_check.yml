@@ -1,0 +1,177 @@
+name: Health check
+
+run-name: |
+  ref: ${{ github.ref_name }} |
+  environment: ${{ inputs.environment }} |
+
+permissions: {}
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: The environment to run the health check in
+        type: string
+        required: false
+      notify:
+        description: Whether to notify the user of the health check outcome
+        type: boolean
+        required: false
+      slack_channel:
+        description: The Slack channel to send notifications to
+        type: string
+        required: false
+    secrets:
+      SLACK_TOKEN:
+        description: The Slack token to use for notifications
+        required: false
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: The environment to run the health check in
+        type: choice
+        required: true
+        options:
+          - prod
+          - stage
+          - dev
+          - host
+      notify:
+        description: Whether to notify the user of the health check outcome
+        type: boolean
+        required: false
+      slack_channel:
+        description: The Slack channel to send notifications to
+        type: string
+        required: false
+
+env:
+  health_check_file: health_check.json
+  health_check_blocks_file: health_check_blocks.json
+
+jobs:
+  context:
+    runs-on: ubuntu-latest
+    outputs:
+      slack_channel: ${{ steps.environment.outputs.slack_channel }}
+      notify: ${{ steps.environment.outputs.notify }}
+      environment: ${{ steps.environment.outputs.environment }}
+
+    steps:
+      - name: Environment
+        id: environment
+        env:
+          notify: ${{ inputs.notify }}
+          environment: ${{ inputs.environment }}
+          slack_channel: ${{ inputs.slack_channel }}
+        run: |
+          if [[ "$environment" == "prod" ]]; then
+            environment="prod"
+          elif [[ "$environment" == "stage" ]]; then
+            environment="stage"
+          elif [[ "$environment" == "dev" ]]; then
+            environment="dev"
+          else
+            environment="host"
+          fi
+
+          {
+            echo "notify=$notify"
+            echo "slack_channel=$slack_channel"
+            echo "environment=$environment"
+          } >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
+  health_check:
+    runs-on: ubuntu-latest
+    needs: [context]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mozilla-l10n/addons-server-l10n
+          persist-credentials: false
+          path: locale
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: 3.12
+
+      - name: Set waffle switch dummy-monitor-fails to true
+        if: needs.context.outputs.environment == 'host'
+        uses: ./.github/actions/run-docker
+        with:
+          version: local
+          run: |
+            ./manage.py waffle_switch dummy-monitor-fails on
+
+      - name: Run health check
+        continue-on-error: true
+        id: health_check
+        shell: bash
+        env:
+          environment: ${{ needs.context.outputs.environment }}
+        run: |
+          ./scripts/health_check.py \
+          --env "${environment}" \
+          --verbose \
+          --output "${health_check_file}"
+
+      - name: Set message blocks
+        id: blocks
+        if: steps.health_check.outcome == 'failure'
+        shell: bash
+        run: |
+          if [ ! -f "$health_check_file" ]; then
+            echo "Health check file not found"
+            exit 1
+          fi
+
+          # Create the message blocks file
+          ./scripts/health_check_blocks.py \
+          --input "$health_check_file" \
+          --output "${{ env.health_check_blocks_file }}"
+
+          # Multiline output needs to use a delimiter to be passed to
+          # the GITHUB_OUTPUT file.
+          blocks=$(cat "${{ env.health_check_blocks_file }}")
+          echo "blocks<<EOF"$'\n'"$blocks"$'\n'EOF >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
+      - name: Notify Failure
+        if: steps.blocks.outcome == 'success' && needs.context.outputs.slack_channel != ''
+        uses: mozilla/addons/.github/actions/slack@c2dc2fd5862487f41add188a13243c2e71fdaa42  # 1.3
+        with:
+          slack_token: ${{ secrets.SLACK_TOKEN }}
+          payload: |
+            {
+              "channel": "${{ needs.context.outputs.slack_channel }}",
+              "blocks": ${{ toJson(steps.blocks.outputs.blocks) }},
+              "text": "[${{ needs.context.outputs.environment }}] Health check ${{ steps.health_check.outcome }}",
+              # Don't unfurl links or media
+              "unfurl_links": false,
+              "unfurl_media": false,
+            }
+          dry_run: ${{ !(needs.context.outputs.environment != 'host' && needs.context.outputs.notify == 'true') }}
+
+      - name: Exit with outcome
+        shell: bash
+        env:
+          environment: ${{ needs.context.outputs.environment }}
+          outcome: ${{ steps.health_check.outcome }}
+        run: |
+
+          if [[ "$environment" == 'host' && "$outcome" != "failure" ]]; then
+            echo "Health check should fail on host environment to simulate a real failure"
+            exit 1
+          fi
+
+          if [[ "$environment" != 'host' && "$outcome" == "failure" ]]; then
+            echo "Health check should not fail on a live environment, that is a real failure!"
+            exit 1
+          fi

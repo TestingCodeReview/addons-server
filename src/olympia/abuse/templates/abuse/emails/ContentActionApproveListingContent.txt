@@ -1,0 +1,23 @@
+Hello,
+
+Your {{ type }} had previously been suspended or removed from Mozilla Add-ons following a review against Mozilla's policies.
+
+{% if is_public %}
+We have checked and determined that your content adheres to Mozilla's policies. We have restored your {{ type }}, and it is now available again at {{ target_url }}.
+{% else %}
+We have checked and determined that your content adheres to Mozilla's policies. We have re-enabled your {{ type }}; see {{ target_url }} for more on its availability.
+{% endif %}
+{% if manual_reasoning_text %}{{ manual_reasoning_text }}. {% endif %}
+
+{% if has_attachment %}
+A reviewer has attached a file. {% if dev_url %}You can view it or reply by visiting {{ dev_url }}.{% endif %}
+
+{% endif %}
+Thank you for your patience.
+
+More information about Mozilla's add-on policies can be found at {{ policy_document_url }}.
+
+[{{ reference_id }}]
+--
+Mozilla Add-ons Team
+{{ SITE_URL }}

@@ -1,180 +1,238 @@
 import os
-import six
 
 from django import http
 from django.db.transaction import non_atomic_requests
 from django.shortcuts import get_object_or_404, redirect
+from django.template.response import TemplateResponse
+from django.urls import reverse
+from django.utils.cache import patch_cache_control, patch_vary_headers
 
 import olympia.core.logger
-
 from olympia import amo
 from olympia.access import acl
-from olympia.addons.decorators import (
-    addon_view_factory, owner_or_unlisted_reviewer)
-from olympia.addons.models import Addon
-from olympia.amo.urlresolvers import reverse
-from olympia.amo.utils import HttpResponseSendFile, render, urlparams
+from olympia.addons.decorators import addon_view_factory
+from olympia.addons.models import Addon, AddonRegionalRestrictions
+from olympia.amo.decorators import api_authentication
+from olympia.amo.utils import HttpResponseXSendFile
 from olympia.files.models import File
 from olympia.versions.models import Version
 
 
-# The version detail page redirects to the version within pagination, so we
-# need to enforce the number of versions per page.
-PER_PAGE = 30
-addon_view = addon_view_factory(Addon.objects.valid)
-
 log = olympia.core.logger.getLogger('z.versions')
 
 
-def _version_list_qs(addon):
-    # We only show versions that have files with the right status.
-    if addon.is_unreviewed():
-        status = amo.STATUS_AWAITING_REVIEW
-    else:
-        status = amo.STATUS_PUBLIC
-    return (addon.versions.filter(channel=amo.RELEASE_CHANNEL_LISTED)
-                          .filter(files__status=status)
-                          .distinct().order_by('-created'))
-
-
-@addon_view
-@non_atomic_requests
-def version_list(request, addon):
-    qs = _version_list_qs(addon)
-    versions = amo.utils.paginate(request, qs, PER_PAGE)
-    versions.object_list = list(versions.object_list)
-    Version.transformer(versions.object_list)
-    return render(request, 'versions/version_list.html', {
-        'addon': addon, 'versions': versions})
-
-
-@addon_view
-@non_atomic_requests
-def version_detail(request, addon, version_num):
-    ids = list(_version_list_qs(addon).values_list('version', flat=True))
-
-    url = reverse('addons.versions', args=[addon.slug])
-    if version_num in ids:
-        page = 1 + ids.index(version_num) // PER_PAGE
-        to = urlparams(url, 'version-%s' % version_num, page=page)
-        return http.HttpResponseRedirect(to)
-    else:
-        raise http.Http404()
-
-
-@addon_view
+@addon_view_factory(lambda: Addon.objects.public().no_transforms())
 @non_atomic_requests
 def update_info(request, addon, version_num):
-    version = Version.objects.filter(addon=addon, version=version_num,
-                                     files__status__in=amo.VALID_FILE_STATUSES,
-                                     channel=amo.RELEASE_CHANNEL_LISTED).last()
-    if not version:
-        raise http.Http404()
-    return render(request, 'versions/update_info.html',
-                  {'version': version},
-                  content_type='application/xhtml+xml')
+    version = get_object_or_404(
+        addon.versions.approved()
+        .filter(channel=amo.CHANNEL_LISTED)
+        .select_related(None)
+        .only_translations(),
+        version=version_num,
+    )
+    response = TemplateResponse(
+        request,
+        'versions/update_info.html',
+        context={'version': version},
+        content_type='application/xhtml+xml',
+    )
+    patch_cache_control(response, max_age=60 * 60)
+    return response
 
 
 @non_atomic_requests
 def update_info_redirect(request, version_id):
-    version = get_object_or_404(Version.objects, pk=version_id)
-    return redirect(reverse('addons.versions.update_info',
-                            args=(version.addon.id, version.version)),
-                    permanent=True)
-
-
-# Should accept junk at the end for filename goodness.
-@non_atomic_requests
-def download_file(request, file_id, type=None, file_=None, addon=None):
-    def is_appropriate_reviewer(addon, channel):
-        return (acl.is_reviewer(request, addon)
-                if channel == amo.RELEASE_CHANNEL_LISTED
-                else acl.check_unlisted_addons_reviewer(request))
-
-    if not file_:
-        file_ = get_object_or_404(File.objects, pk=file_id)
-    if not addon:
-        addon = get_object_or_404(Addon.objects,
-                                  pk=file_.version.addon_id)
-    channel = file_.version.channel
-
-    if addon.is_disabled or file_.status == amo.STATUS_DISABLED:
-        if (is_appropriate_reviewer(addon, channel) or
-                acl.check_addon_ownership(
-                    request, addon, dev=True, ignore_disabled=True)):
-            return HttpResponseSendFile(
-                request, file_.guarded_file_path,
-                content_type='application/x-xpinstall')
-        else:
-            log.info(
-                u'download file {file_id}: addon/file disabled and '
-                u'user {user_id} is not an owner or reviewer.'.format(
-                    file_id=file_id, user_id=request.user.pk))
-            raise http.Http404()  # Not owner or admin.
-
-    if channel == amo.RELEASE_CHANNEL_UNLISTED:
-        if (acl.check_unlisted_addons_reviewer(request) or
-                acl.check_addon_ownership(
-                    request, addon, dev=True, ignore_disabled=True)):
-            return HttpResponseSendFile(
-                request, file_.file_path,
-                content_type='application/x-xpinstall')
-        else:
-            log.info(
-                u'download file {file_id}: version is unlisted and '
-                u'user {user_id} is not an owner or reviewer.'.format(
-                    file_id=file_id, user_id=request.user.pk))
-            raise http.Http404()  # Not owner or admin.
-
-    attachment = bool(type == 'attachment')
-
-    loc = urlparams(file_.get_file_cdn_url(attachment=attachment),
-                    filehash=file_.hash)
-    response = http.HttpResponseRedirect(loc)
-    response['X-Target-Digest'] = file_.hash
+    version = get_object_or_404(
+        Version.objects.approved()
+        .filter(channel=amo.CHANNEL_LISTED)
+        .select_related(None)
+        .no_transforms()
+        .select_related('addon'),
+        pk=version_id,
+    )
+    if not version.addon.is_public():
+        raise http.Http404()
+    response = redirect(
+        reverse(
+            'addons.versions.update_info', args=(version.addon.slug, version.version)
+        ),
+        permanent=True,
+    )
+    patch_cache_control(response, max_age=60 * 60)
     return response
 
 
-def guard():
-    return Addon.objects.filter(_current_version__isnull=False)
-
-
-@addon_view_factory(guard)
 @non_atomic_requests
-def download_latest(request, addon, type='xpi', platform=None):
-    platforms = [amo.PLATFORM_ALL.id]
-    if platform is not None and int(platform) in amo.PLATFORMS:
-        platforms.append(int(platform))
-    version = addon._current_version_id
-    files = File.objects.filter(platform__in=platforms,
-                                version=version)
-    try:
-        # If there's a file matching our platform, it'll float to the end.
-        file_ = sorted(files, key=lambda f: f.platform == platforms[-1])[-1]
-    except IndexError:
-        raise http.Http404()
-    return download_file(request, file_.id, type=type, file_=file_,
-                         addon=addon)
+@api_authentication
+def download_file(request, file_id, download_type=None, **kwargs):
+    """
+    Download the file identified by `file_id` parameter.
 
+    If the file is disabled or belongs to an unlisted or enterprise version,
+    requires an add-on developer, an appropriate reviewer for the channel or a
+    user with a special permission. If the file is deleted or belongs to a
+    deleted version or add-on, reviewers can still access but developers can't.
+    """
 
-@non_atomic_requests
-def download_source(request, version_id):
-    version = get_object_or_404(Version.objects, pk=version_id)
+    def is_appropriate_reviewer(addon, channel):
+        # This allows a user with a special permission to access the file, even
+        # if the version/add-on is deleted.
+        if acl.action_allowed_for(request.user, amo.permissions.ADDONS_FILE_DOWNLOAD):
+            return True
 
-    # General case: version is listed.
-    if version.channel == amo.RELEASE_CHANNEL_LISTED:
-        if not (version.source and
-                (acl.check_addon_ownership(
-                    request, version.addon, dev=True, ignore_disabled=True))):
-            raise http.Http404()
+        if channel == amo.CHANNEL_LISTED:
+            return (
+                acl.is_static_theme_reviewer(request.user)
+                if addon.type == amo.ADDON_STATICTHEME
+                else acl.is_listed_addons_viewer_or_reviewer(request.user)
+            )
+        else:
+            return acl.is_unlisted_addons_viewer_or_reviewer(request.user)
+
+    file_ = get_object_or_404(File.objects, pk=file_id)
+    # Include deleted add-ons in the queryset, we'll check for that below.
+    addon = get_object_or_404(
+        Addon.unfiltered.all().no_transforms(), pk=file_.version.addon_id
+    )
+    version = file_.version
+    channel = version.channel
+
+    if version.deleted or addon.is_deleted:
+        # Only the appropriate reviewer can see deleted things.
+        require_permission = True
+        has_permission = is_appropriate_reviewer(addon, channel)
+        apply_georestrictions = False
+    elif (
+        addon.is_disabled
+        or file_.status == amo.STATUS_DISABLED
+        or channel in (amo.CHANNEL_UNLISTED, amo.CHANNEL_ENTERPRISE)
+    ):
+        # Only the appropriate reviewer or developers of the add-on can see
+        # disabled, unlisted or enterprise things.
+        require_permission = True
+        has_permission = is_appropriate_reviewer(
+            addon, channel
+        ) or acl.check_addon_ownership(
+            request.user,
+            addon,
+            allow_developer=True,
+            allow_mozilla_disabled_addon=True,
+        )
+        apply_georestrictions = False
     else:
-        if not owner_or_unlisted_reviewer(request, version.addon):
-            raise http.Http404  # Not listed, not owner or unlisted reviewer.
-    res = HttpResponseSendFile(request, version.source.path)
+        # Public case: we're either directly downloading the file or
+        # redirecting, but in any case we have permission in the general sense,
+        # though georestrictions are in effect.
+        require_permission = False
+        has_permission = True
+        apply_georestrictions = True
+
+    region_code = request.META.get('HTTP_X_COUNTRY_CODE', None)
+    # Whether to set Content-Disposition: attachment header or not, to force
+    # the file to be downloaded rather than installed (used by admin/reviewer
+    # tools).
+    attachment = download_type == 'attachment'
+    if not has_permission:
+        log.debug(
+            f'download file {file_id}: addon/version/file not public and '
+            f'user {request.user.pk} does not have relevant permissions.'
+        )
+        response = http.HttpResponseNotFound()
+    elif (
+        apply_georestrictions
+        and region_code
+        and AddonRegionalRestrictions.objects.filter(
+            addon=addon, excluded_regions__contains=region_code.upper()
+        ).exists()
+    ):
+        response = http.HttpResponse(status=451)
+        url = 'https://www.mozilla.org/about/policy/transparency/'
+        response['Link'] = f'<{url}>; rel="blocked-by"'
+    else:
+        if not file_.file:
+            raise http.Http404()
+        # We're returning a X-Accel-Redirect, we can set
+        # Content-Disposition: attachment ourselves in HttpResponseXSendFile:
+        # nginx won't override it if present.
+        response = HttpResponseXSendFile(
+            request,
+            file_.file.path,
+            content_type='application/x-xpinstall',
+            attachment=attachment,
+        )
+    # Always add a few headers to the response (even errors). Don't cache if
+    # the addon/version required permissions to access though.
+    if not require_permission:
+        patch_cache_control(response, max_age=60 * 60 * 24)
+    patch_vary_headers(response, ['X-Country-Code'])
+    response['Access-Control-Allow-Origin'] = '*'
+    return response
+
+
+@addon_view_factory(Addon.objects.public)
+@non_atomic_requests
+def download_latest(request, addon, download_type=None, **kwargs):
+    """
+    Redirect to the URL to download the file from 'current'
+    (latest public listed) version of an add-on.
+
+    Returns a 404 for add-ons that are deleted/disabled/non-public/without an
+    approved listed version.
+    """
+    file_ = addon.current_version.file
+    attachment = download_type == 'attachment'
+    response = http.HttpResponseRedirect(file_.get_absolute_url(attachment=attachment))
+    patch_cache_control(response, max_age=60 * 60 * 1)
+    response['Access-Control-Allow-Origin'] = '*'
+    return response
+
+
+@non_atomic_requests
+@api_authentication
+def download_source(request, version_id):
+    """
+    Download source code for a given version_id.
+
+    Requires developer of the add-on or source download permission. If the
+    version or add-on is deleted, developers can't access.
+
+    If the version source code wasn't provided, but the user had the right
+    permissions, a 404 is raised.
+    """
+    # Include deleted versions in the queryset, we'll check for that below.
+    version = get_object_or_404(Version.unfiltered, pk=version_id)
+    addon = version.addon
+
+    # Channel doesn't matter, source code is only available to users with source
+    # download permission, or developers of the add-on.
+    # If the add-on, version or file is deleted or disabled, then only user with
+    # source download can access.
+    has_permission = acl.action_allowed_for(
+        request.user, amo.permissions.ADDONS_SOURCE_DOWNLOAD
+    )
+
+    if (
+        addon.status != amo.STATUS_DISABLED
+        and version.file.status != amo.STATUS_DISABLED
+        and not version.deleted
+        and not addon.is_deleted
+    ):
+        has_permission = has_permission or acl.check_addon_ownership(
+            request.user,
+            addon,
+            allow_addons_edit_permission=False,
+            allow_developer=True,
+        )
+    if not (has_permission and getattr(version, 'source', None)):
+        raise http.Http404()
+
+    response = HttpResponseXSendFile(request, version.source.path)
     path = version.source.path
-    if not isinstance(path, six.text_type):
+    if not isinstance(path, str):
         path = path.decode('utf8')
-    name = os.path.basename(path.replace(u'"', u''))
-    disposition = u'attachment; filename="{0}"'.format(name).encode('utf8')
-    res['Content-Disposition'] = disposition
-    return res
+    name = os.path.basename(path.replace('"', ''))
+    disposition = f'attachment; filename="{name}"'.encode()
+    response['Content-Disposition'] = disposition
+    response['Access-Control-Allow-Origin'] = '*'
+    return response

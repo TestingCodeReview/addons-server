@@ -1,6 +1,6 @@
 import codecs
 import re
-import six
+
 
 UNICODE_BOMS = [
     (codecs.BOM_UTF8, 'utf-8'),
@@ -24,13 +24,13 @@ def decode(data):
     stripping.
     """
 
-    if isinstance(data, six.text_type):
+    if isinstance(data, str):
         return data
 
     # Detect standard unicode BOMs.
     for bom, encoding in UNICODE_BOMS:
         if data.startswith(bom):
-            return data[len(bom):].decode(encoding, errors='ignore')
+            return data[len(bom) :].decode(encoding, errors='ignore')
 
     # Try straight UTF-8.
     try:

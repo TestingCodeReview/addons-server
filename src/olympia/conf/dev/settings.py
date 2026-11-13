@@ -1,21 +1,6 @@
-import logging
-
+# ruff: noqa: F405
 from olympia.lib.settings_base import *  # noqa
 
-
-# Allow addons-dev CDN for CSP.
-CSP_BASE_URI += (
-    # Required for the legacy discovery pane.
-    'https://addons-dev.allizom.org',
-)
-CDN_HOST = 'https://addons-dev-cdn.allizom.org'
-CSP_CONNECT_SRC += (CDN_HOST,)
-CSP_FONT_SRC += (CDN_HOST,)
-CSP_IMG_SRC += (CDN_HOST,)
-CSP_SCRIPT_SRC += (
-    CDN_HOST,
-)
-CSP_STYLE_SRC += (CDN_HOST,)
 
 ENGAGE_ROBOTS = False
 
@@ -26,121 +11,72 @@ EMAIL_BACKEND = EMAIL_URL['EMAIL_BACKEND']
 EMAIL_HOST_USER = EMAIL_URL['EMAIL_HOST_USER']
 EMAIL_HOST_PASSWORD = EMAIL_URL['EMAIL_HOST_PASSWORD']
 
-ENV = env('ENV')
 RAISE_ON_SIGNAL_ERROR = True
 
-API_THROTTLING = False
+API_THROTTLING = True
 
 DOMAIN = env('DOMAIN', default='addons-dev.allizom.org')
+SERVICES_DOMAIN = env('SERVICES_DOMAIN', default='services.addons-dev.allizom.org')
 SERVER_EMAIL = 'zdev@addons.mozilla.org'
 SITE_URL = 'https://' + DOMAIN
-SERVICES_URL = env('SERVICES_URL',
-                   default='https://services.addons-dev.allizom.org')
-STATIC_URL = '%s/static/' % CDN_HOST
-MEDIA_URL = '%s/user-media/' % CDN_HOST
+INTERNAL_SITE_URL = env('INTERNAL_SITE_URL', default='https://addons-dev.allizom.org')
+EXTERNAL_SITE_URL = env('EXTERNAL_SITE_URL', default='https://addons-dev.allizom.org')
+SERVICES_URL = 'https://' + SERVICES_DOMAIN
+STATIC_URL = '%s/static-server/' % EXTERNAL_SITE_URL
+MEDIA_URL = '%s/user-media/' % EXTERNAL_SITE_URL
 
-SESSION_COOKIE_DOMAIN = ".%s" % DOMAIN
+CONTENT_SECURITY_POLICY['DIRECTIVES']['font-src'] += (STATIC_URL,)
+# img-src already contains 'self', but we could be on reviewers or admin
+# domain and want to load things from the regular domain.
+CONTENT_SECURITY_POLICY['DIRECTIVES']['img-src'] += (MEDIA_URL, STATIC_URL)
+CONTENT_SECURITY_POLICY['DIRECTIVES']['script-src'] += (STATIC_URL,)
+CONTENT_SECURITY_POLICY['DIRECTIVES']['style-src'] += (STATIC_URL,)
+
+SESSION_COOKIE_DOMAIN = '.%s' % DOMAIN
 
 # Domain emails should be sent to.
-INBOUND_EMAIL_DOMAIN = env('INBOUND_EMAIL_DOMAIN',
-                           default='addons-dev.allizom.org')
+INBOUND_EMAIL_DOMAIN = env('INBOUND_EMAIL_DOMAIN', default='addons-dev.allizom.org')
 
 DATABASES = {
-    'default': get_db_config('DATABASES_DEFAULT_URL', charset='utf8mb4'),
-    'slave': get_db_config(
-        'DATABASES_SLAVE_URL', atomic_requests=False, charset='utf8mb4'),
+    'default': get_db_config('DATABASES_DEFAULT_URL'),
+    'replica': get_db_config('DATABASES_REPLICA_URL', atomic_requests=False),
 }
 
-SERVICES_DATABASE = get_db_config('SERVICES_DATABASE_URL')
-
-SLAVE_DATABASES = ['slave']
-
-CACHES = {}
-CACHES['default'] = env.cache('CACHES_DEFAULT')
-CACHES['default']['TIMEOUT'] = 500
-CACHES['default']['BACKEND'] = 'django.core.cache.backends.memcached.MemcachedCache'  # noqa
-CACHES['default']['KEY_PREFIX'] = CACHE_KEY_PREFIX
+REPLICA_DATABASES = ['replica']
 
 # Celery
 CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 
-LOGGING['loggers'].update({
-    'amqp': {'level': logging.WARNING},
-    'raven': {'level': logging.WARNING},
-    'requests': {'level': logging.WARNING},
-    'z.addons': {'level': logging.DEBUG},
-    'z.task': {'level': logging.DEBUG},
-    'z.pool': {'level': logging.ERROR},
-})
-
 # Update the logger name used for mozlog
 LOGGING['formatters']['json']['logger_name'] = 'http_app_addons_dev'
 
-csp = 'csp.middleware.CSPMiddleware'
-
 ES_TIMEOUT = 60
-ES_HOSTS = env('ES_HOSTS')
-ES_URLS = ['http://%s' % h for h in ES_HOSTS]
-ES_INDEXES = dict((k, '%s_%s' % (v, ENV)) for k, v in ES_INDEXES.items())
+ES_INDEXES = {k: f'{v}_{ENV}' for k, v in ES_INDEXES.items()}
 
-CEF_PRODUCT = STATSD_PREFIX
-
-NEW_FEATURES = True
-
-REDIRECT_URL = 'https://outgoing.stage.mozaws.net/v1/'
-
-ADDONS_LINTER_BIN = 'node_modules/.bin/addons-linter'
-
-XSENDFILE_HEADER = 'X-Accel-Redirect'
+# --enable-background-service-worker linter flag value
+ADDONS_LINTER_ENABLE_SERVICE_WORKER = True
 
 ALLOW_SELF_REVIEWS = True
 
-PERSONA_DEFAULT_PAGES = 2
-
-NEWRELIC_ENABLE = env.bool('NEWRELIC_ENABLE', default=False)
-
-if NEWRELIC_ENABLE:
-    NEWRELIC_INI = '/etc/newrelic.d/%s.ini' % DOMAIN
-
 FXA_CONFIG = {
-    'default': {
-        'client_id': env('FXA_CLIENT_ID'),
-        'client_secret': env('FXA_CLIENT_SECRET'),
-        'content_host': 'https://stable.dev.lcip.org',
-        'oauth_host': 'https://oauth-stable.dev.lcip.org/v1',
-        'profile_host': 'https://stable.dev.lcip.org/profile/v1',
-        'redirect_url':
-            'https://%s/api/v3/accounts/authenticate/' % DOMAIN,
-        'scope': 'profile',
-    },
-    'amo': {
-        'client_id': env('AMO_FXA_CLIENT_ID'),
-        'client_secret': env('AMO_FXA_CLIENT_SECRET'),
-        'content_host': 'https://stable.dev.lcip.org',
-        'oauth_host': 'https://oauth-stable.dev.lcip.org/v1',
-        'profile_host': 'https://stable.dev.lcip.org/profile/v1',
-        'redirect_url': 'https://amo.addons-dev.allizom.org/fxa-authenticate',
-        'scope': 'profile',
-    },
+    **FXA_CONFIG,
     'local': {
         'client_id': env('DEVELOPMENT_FXA_CLIENT_ID'),
         'client_secret': env('DEVELOPMENT_FXA_CLIENT_SECRET'),
-        'content_host': 'https://stable.dev.lcip.org',
-        'oauth_host': 'https://oauth-stable.dev.lcip.org/v1',
-        'profile_host': 'https://stable.dev.lcip.org/profile/v1',
-        'redirect_url': 'http://localhost:3000/fxa-authenticate',
-        'scope': 'profile',
+        # fxa redirects to http://localhost:3000/api/auth/authenticate-callback/?config=local
     },
 }
-DEFAULT_FXA_CONFIG_NAME = 'default'
-ALLOWED_FXA_CONFIGS = ['default', 'amo', 'local']
+FXA_CONTENT_HOST = 'https://accounts.stage.mozaws.net'
+FXA_OAUTH_HOST = 'https://oauth.stage.mozaws.net/v1'
+FXA_PROFILE_HOST = 'https://profile.stage.mozaws.net/v1'
+FXA_SUPPORT_HOST = 'https://api-accounts.stage.mozaws.net/v1'
 
-CORS_ENDPOINT_OVERRIDES = cors_endpoint_overrides(
-    ['amo.addons-dev.allizom.org', 'localhost:3000']
+FXA_ACTIVES_BIGQUERY_TABLE = (
+    'moz-fx-fxa-nonprod.fxa_rp_active_accounts.client_285dd6fd9907a74c_active_accounts'
 )
 
-FXA_SQS_AWS_QUEUE_URL = (
-    'https://sqs.us-east-1.amazonaws.com/927034868273/'
-    'amo-account-change-dev')
+SITEMAP_DEBUG_AVAILABLE = True
 
-VAMO_URL = 'https://versioncheck-dev.allizom.org'
+ENABLE_ADMIN_MLBF_UPLOAD = True
+
+SWAGGER_UI_ENABLED = True

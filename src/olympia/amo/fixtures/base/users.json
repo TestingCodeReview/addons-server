@@ -8,6 +8,7 @@
             "averagerating": null,
             "homepage": "",
             "email": "regular@mozilla.com",
+            "fxa_id": "fake-fxa-id-for-999",
             "biography": null,
             "deleted": 0,
             "username": "regularuser",
@@ -15,7 +16,7 @@
             "created": "2009-02-02 11:50:31",
             "notes": "",
             "modified": "2010-01-12 17:01:41",
-            "read_dev_agreement": "2017-09-23 00:00:00",
+            "read_dev_agreement": "2099-12-02 00:00:00",
             "last_login": "2012-05-22 14:59:28"
         },
         "model": "users.userprofile",
@@ -31,6 +32,7 @@
             "occupation": "Internets",
             "homepage": "http://micropipes.com/blog/",
             "email": "clouserw@gmail.com",
+            "fxa_id": "fake-fxa-id-for-10482",
             "location": "Portland, OR",
             "biography": "clever phrase here",
             "deleted": 0,
@@ -39,7 +41,7 @@
             "created": "2007-03-05 13:09:38",
             "notes": "",
             "modified": "2010-03-19 13:50:38",
-            "read_dev_agreement": "2017-09-23 00:00:00",
+            "read_dev_agreement": "2099-12-02 00:00:00",
             "last_login": "2012-05-22 14:59:28"
         }
     },
@@ -52,6 +54,7 @@
             "averagerating": null,
             "homepage": "http://jeffbalogh.org",
             "email": "admin@mozilla.com",
+            "fxa_id": "fake-fxa-id-for-4043307",
             "biography": null,
             "deleted": 0,
             "username": "admin",
@@ -59,7 +62,7 @@
             "created": "2009-02-02 11:50:31",
             "notes": "",
             "modified": "2010-01-12 17:01:41",
-            "read_dev_agreement": "2017-09-23 00:00:00",
+            "read_dev_agreement": "2099-12-02 00:00:00",
             "last_login": "2012-05-22 14:59:28"
         },
         "model": "users.userprofile",
@@ -81,23 +84,25 @@
             "created": "2009-02-02 11:50:31",
             "notes": "",
             "modified": "2010-01-12 17:01:41",
-            "read_dev_agreement": "2017-09-23 00:00:00",
+            "read_dev_agreement": "2099-12-02 00:00:00",
             "last_login": "2012-05-22 14:59:28"
         },
         "model": "users.userprofile",
         "pk": 1337
-    },{
+    },
+    {
         "pk": 5497308,
         "model": "users.userprofile",
         "fields": {
             "display_collections": false,
             "email": "reviewer@mozilla.com",
+            "fxa_id": "fake-fxa-id-for-5497308",
             "username": "reviewer",
             "deleted": false,
             "created": "2010-10-19 13:02:25",
             "modified": "2010-11-16 10:51:34",
             "last_login_ip": "127.0.0.1",
-            "read_dev_agreement": "2017-09-23 00:00:00",
+            "read_dev_agreement": "2099-12-02 00:00:00",
             "last_login": "2012-05-22 14:59:28"
         }
     },
@@ -106,13 +111,14 @@
         "model": "users.userprofile",
         "fields": {
             "display_collections": false,
-            "email": "persona_reviewer@mozilla.com",
-            "username": "Persona Reviewer",
+            "email": "theme_reviewer@mozilla.com",
+            "fxa_id": "fake-fxa-id-for-5497311",
+            "username": "Theme Reviewer",
             "deleted": false,
             "created": "2010-10-19 13:02:25",
             "modified": "2010-11-16 10:51:34",
             "last_login_ip": "127.0.0.1",
-            "read_dev_agreement": "2017-09-23 00:00:00",
+            "read_dev_agreement": "2099-12-02 00:00:00",
             "last_login": "2012-05-22 14:59:28"
         }
     },
@@ -128,6 +134,7 @@
             "averagerating": null,
             "homepage": "",
             "email": "partner@mozilla.com",
+            "fxa_id": "fake-fxa-id-for-20",
             "username": "partner",
             "biography": null,
             "deleted": false,
@@ -135,7 +142,7 @@
             "notes": null,
             "modified": "2011-12-01 16:20:56",
             "last_login_ip": "",
-            "read_dev_agreement": "2017-09-23 00:00:00",
+            "read_dev_agreement": "2099-12-02 00:00:00",
             "last_login": "2012-05-22 14:59:28"
         }
     },
@@ -173,7 +180,7 @@
         "pk": 50005,
         "model": "access.group",
         "fields": {
-            "rules": "Personas:Review",
+            "rules": "Addons:ThemeReview",
             "modified": "2017-10-26 15:00:00",
             "name": "Reviewers: Themes",
             "created": "2012-01-27 12:41:00"

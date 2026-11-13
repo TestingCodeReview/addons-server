@@ -1,0 +1,889 @@
+import uuid
+from datetime import datetime
+from unittest import mock
+
+from django.core.exceptions import ValidationError
+from django.db.utils import IntegrityError
+
+import pytest
+import time_machine
+
+from olympia import amo
+from olympia.access.models import Group, GroupUser
+from olympia.amo.tests import TestCase, addon_factory, user_factory, version_factory
+from olympia.constants.scanners import (
+    ABORTED,
+    ABORTING,
+    ANNOTATIONS_RULE_NAME,
+    COMPLETED,
+    FLAG_FOR_HUMAN_REVIEW,
+    NARC,
+    NEW,
+    NO_ACTION,
+    RUNNING,
+    SCANNER_SERVICE_ACCOUNTS_GROUP,
+    SCANNERS,
+    SCHEDULED,
+    WEBHOOK,
+    WEBHOOK_DURING_VALIDATION,
+    YARA,
+)
+from olympia.files.models import FileUpload
+from olympia.scanners.models import (
+    ImproperScannerQueryRuleStateError,
+    ScannerQueryResult,
+    ScannerQueryRule,
+    ScannerResult,
+    ScannerRule,
+    ScannerWebhook,
+    ScannerWebhookEvent,
+)
+from olympia.users.models import UserProfile
+
+
+class FakeYaraMatch:
+    def __init__(self, rule, tags, meta):
+        self.rule = rule
+        self.tags = tags
+        self.meta = meta
+
+
+class TestScannerResultMixin:
+    __test__ = False
+
+    def create_result(self, *args, **kwargs):
+        return self.model.objects.create(*args, **kwargs)
+
+    def create_fake_yara_match(
+        self,
+        rule='some-yara-rule',
+        tags=None,
+        description='some description',
+        filename='some/file.js',
+    ):
+        return FakeYaraMatch(
+            rule=rule,
+            tags=tags or [],
+            meta={
+                'description': description,
+                'filename': filename,
+            },
+        )
+
+    def test_add_yara_result(self):
+        result = self.create_result(scanner=YARA)
+        match = self.create_fake_yara_match()
+
+        result.add_yara_result(rule=match.rule, tags=match.tags, meta=match.meta)
+
+        assert result.results == [
+            {'rule': match.rule, 'tags': match.tags, 'meta': match.meta}
+        ]
+
+    def test_extract_rule_names_with_no_yara_results(self):
+        result = self.create_result(scanner=YARA)
+        assert result.extract_rule_names() == []
+
+    def test_extract_rule_names_with_yara_results(self):
+        result = self.create_result(scanner=YARA)
+        rule1 = 'rule-1'
+        rule2 = 'rule-2'
+
+        for rule in [rule1, rule2]:
+            match = self.create_fake_yara_match(rule=rule)
+            result.add_yara_result(rule=match.rule, tags=match.tags, meta=match.meta)
+
+        assert result.extract_rule_names() == [rule1, rule2]
+
+    def test_extract_rule_names_with_narc_results(self):
+        result = self.create_result(scanner=NARC)
+        rule1 = 'rule-1'
+        rule2 = 'rule-2'
+
+        for rule in [rule1, rule2]:
+            result.results.append({'rule': rule, 'meta': {'whatever': 'eh'}})
+
+        assert result.extract_rule_names() == [rule1, rule2]
+
+    def test_extract_rule_names_returns_unique_list(self):
+        result = self.create_result(scanner=YARA)
+        rule1 = 'rule-1'
+        rule2 = 'rule-2'
+
+        for rule in [rule1, rule2, rule1, rule2]:
+            match = self.create_fake_yara_match(rule=rule)
+            result.add_yara_result(rule=match.rule, tags=match.tags, meta=match.meta)
+
+        assert result.extract_rule_names() == [rule1, rule2]
+
+    def test_extract_rule_names_with_null_results(self):
+        result = self.create_result(scanner=YARA, results=None)
+        assert result.extract_rule_names() == []
+
+    def test_get_files_and_data_by_matched_rules_with_null_results(self):
+        result = self.create_result(scanner=YARA, results=None)
+        assert result.get_files_and_data_by_matched_rules() == {}
+
+    def test_extract_rule_names_with_no_matched_rules_attribute(self):
+        result = self.create_result(scanner=WEBHOOK)
+        result.results = {}
+        assert result.extract_rule_names() == []
+
+    def test_extract_rule_names_with_no_matched_rules(self):
+        result = self.create_result(scanner=WEBHOOK)
+        result.results = {'matchedRules': []}
+        assert result.extract_rule_names() == []
+
+    def test_extract_rule_names_with_matched_rules(self):
+        result = self.create_result(scanner=WEBHOOK)
+        rules = ['rule-1', 'rule-2']
+        result.results = {'matchedRules': rules}
+        assert result.extract_rule_names() == rules
+
+    def test_get_scanner_name(self):
+        result = self.create_result(scanner=YARA)
+        assert result.get_scanner_name() == 'yara'
+
+    def test_get_pretty_results(self):
+        result = self.create_result(scanner=YARA)
+        result.results = {'foo': 'bar'}
+        assert result.get_pretty_results() == '{\n  "foo": "bar"\n}'
+
+    def test_get_files_and_data_by_matched_rules_with_no_yara_results(self):
+        result = self.create_result(scanner=YARA)
+        assert result.get_files_and_data_by_matched_rules() == {}
+
+    def test_get_files_and_data_by_matched_rules_for_yara(self):
+        result = self.create_result(scanner=YARA)
+        rule1 = 'rule-1'
+        file1 = 'file/1.js'
+        match1 = self.create_fake_yara_match(rule=rule1, filename=file1)
+        result.add_yara_result(rule=match1.rule, tags=match1.tags, meta=match1.meta)
+        rule2 = 'rule-2'
+        file2 = 'file/2.js'
+        match2 = self.create_fake_yara_match(rule=rule2, filename=file2)
+        result.add_yara_result(rule=match2.rule, tags=match2.tags, meta=match2.meta)
+        # rule1 with file2
+        match3 = self.create_fake_yara_match(rule=rule1, filename=file2)
+        result.add_yara_result(rule=match3.rule, tags=match3.tags, meta=match3.meta)
+        assert result.get_files_and_data_by_matched_rules() == {
+            rule1: [
+                {'filename': '', 'data': {'description': 'some description'}},
+                {'filename': file1},
+                {'filename': file2},
+            ],
+            rule2: [
+                {'filename': '', 'data': {'description': 'some description'}},
+                {'filename': file2},
+            ],
+        }
+
+    def test_get_files_and_data_by_matched_rules_no_file_somehow(self):
+        result = self.create_result(scanner=YARA)
+        rule = self.rule_model.objects.create(name='foobar', scanner=YARA)
+        result.add_yara_result(rule=rule.name)
+        result.save()
+        assert result.get_files_and_data_by_matched_rules() == {
+            'foobar': [
+                {'filename': '', 'data': {}},
+                {'filename': '???'},
+            ],
+        }
+
+    def test_get_files_and_data_by_matched_rules_with_no_results(self):
+        result = self.create_result(scanner=WEBHOOK)
+        result.results = {'matchedRules': []}
+        assert result.get_files_and_data_by_matched_rules() == {}
+
+    def test_get_files_and_data_by_matched_rules_with_scan_map(self):
+        result = self.create_result(scanner=WEBHOOK)
+        file1 = 'file/1.js'
+        rule1 = 'rule1'
+        file2 = 'file/2.js'
+        rule2 = 'rule2'
+        file3 = 'file/3.js'
+        rule3 = 'rule3'
+        file4 = 'file/4.js'
+        result.results = {
+            'scanMap': {
+                file1: {
+                    rule1: {
+                        'RULE_HAS_MATCHED': True,
+                    },
+                    rule2: {},
+                    # no rule3
+                },
+                file2: {
+                    rule1: {
+                        'RULE_HAS_MATCHED': False,
+                    },
+                    rule2: {},
+                    # no rule3
+                },
+                file3: {
+                    rule1: {},
+                    rule2: {},
+                    rule3: {
+                        'RULE_HAS_MATCHED': True,
+                        'EXTRA': [
+                            'some',
+                            'thing',
+                        ],
+                    },
+                },
+                file4: {
+                    # no rule1 or rule2
+                    rule3: {
+                        'RULE_HAS_MATCHED': True,
+                    },
+                },
+                '__GLOBAL__': {
+                    rule1: {
+                        'RULE_HAS_MATCHED': True,
+                        'MAWR_DATA': [
+                            'foo',
+                            'bar',
+                        ],
+                    }
+                },
+            }
+        }
+        assert result.get_files_and_data_by_matched_rules() == {
+            rule1: [
+                {'data': {}, 'filename': file1},
+                {'data': {'MAWR_DATA': ['foo', 'bar']}, 'filename': ''},
+            ],
+            rule3: [
+                {'data': {'EXTRA': ['some', 'thing']}, 'filename': file3},
+                {'data': {}, 'filename': file4},
+            ],
+        }
+
+    def test_get_files_and_data_by_matched_rules_else_branch_is_generic(self):
+        result = self.create_result(scanner=WEBHOOK)
+        result.results = {
+            'scanMap': {
+                'file/1.js': {
+                    'rule1': {'RULE_HAS_MATCHED': True},
+                    'rule2': {'RULE_HAS_MATCHED': False},
+                },
+                '__GLOBAL__': {
+                    'rule1': {'RULE_HAS_MATCHED': True, 'EXTRA': 'data'},
+                },
+            }
+        }
+        assert result.get_files_and_data_by_matched_rules() == {
+            'rule1': [
+                {'filename': 'file/1.js', 'data': {}},
+                {'filename': '', 'data': {'EXTRA': 'data'}},
+            ],
+        }
+
+    def test_get_files_and_data_by_matched_rules_with_annotations(self):
+        result = self.create_result(
+            scanner=WEBHOOK,
+            results={
+                'annotations': {
+                    'RULE_1': [
+                        {'file': 'bg.js', 'message': 'File-level concern.'},
+                        {'message': 'Entity-level concern.'},
+                    ],
+                    ANNOTATIONS_RULE_NAME: [
+                        {'message': 'Generic fallback annotation.'},
+                    ],
+                },
+            },
+        )
+        assert result.get_files_and_data_by_matched_rules() == {
+            'RULE_1': [
+                {'filename': 'bg.js', 'data': {'message': 'File-level concern.'}},
+                {'filename': '', 'data': {'message': 'Entity-level concern.'}},
+            ],
+            ANNOTATIONS_RULE_NAME: [
+                {'filename': '', 'data': {'message': 'Generic fallback annotation.'}},
+            ],
+        }
+
+    def test_get_files_and_data_by_matched_rules_annotations_over_scan_map(self):
+        result = self.create_result(
+            scanner=WEBHOOK,
+            results={
+                'scanMap': {
+                    'file/1.js': {
+                        'RULE_1': {'RULE_HAS_MATCHED': True},
+                    },
+                },
+                'annotations': {
+                    'RULE_2': [
+                        {
+                            'file': 'file/2.js',
+                            'message': 'Some annotation message.',
+                        },
+                    ],
+                },
+            },
+        )
+        assert result.get_files_and_data_by_matched_rules() == {
+            'RULE_2': [
+                {
+                    'filename': 'file/2.js',
+                    'data': {
+                        'message': 'Some annotation message.',
+                    },
+                }
+            ],
+        }
+
+    def test_get_files_and_data_by_matched_rules_for_narc(self):
+        result = self.create_result(scanner=NARC)
+        rule = self.rule_model.objects.create(name='foobar', scanner=NARC)
+        result.results = [
+            {
+                'rule': rule.name,
+                'meta': {
+                    'locale': None,
+                    'source': 'something',
+                    'string': 'Some string',
+                },
+            }
+        ]
+        result.save()
+        assert result.get_files_and_data_by_matched_rules() == {
+            'foobar': [
+                {
+                    'locale': None,
+                    'source': 'something',
+                    'string': 'Some string',
+                },
+            ],
+        }
+
+    def test_duplicate(self):
+        addon = addon_factory()
+        result_version = version_factory(addon=addon)
+        result = ScannerResult.objects.create(
+            scanner=ScannerRule.objects.create(name='ringo', scanner=WEBHOOK).scanner,
+            version=result_version,
+            results={'matchedRules': ['ringo']},
+        )
+        assert result.matched_rules.exists()
+
+        dupe_version = version_factory(addon=addon)
+        dupe = result.duplicate(version=dupe_version)
+        assert dupe.pk is not None
+        assert dupe.results == result.results
+        assert dupe.scanner == result.scanner
+        assert dupe.version == dupe_version
+        assert list(dupe.matched_rules.all()) == list(result.matched_rules.all())
+
+        dupe_again_version = version_factory(addon=addon)
+        dupe_again = dupe.duplicate(version_id=dupe_again_version.id)
+        assert dupe_again.pk is not None
+        assert dupe_again.results == result.results
+        assert dupe_again.scanner == result.scanner
+        assert dupe_again.version == dupe_again_version
+        assert list(dupe_again.matched_rules.all()) == list(
+            dupe_again.matched_rules.all()
+        )
+
+
+class TestScannerResult(TestScannerResultMixin, TestCase):
+    __test__ = True
+    model = ScannerResult
+    rule_model = ScannerRule
+
+    def create_file_upload(self):
+        addon = addon_factory()
+        return FileUpload.objects.create(
+            addon=addon,
+            user=user_factory(),
+            ip_address='1.2.3.4',
+            source=amo.UPLOAD_SOURCE_DEVHUB,
+            channel=amo.CHANNEL_LISTED,
+        )
+
+    def create_result(self, *args, **kwargs):
+        kwargs['upload'] = self.create_file_upload()
+        return super().create_result(*args, **kwargs)
+
+    def test_create(self):
+        upload = self.create_file_upload()
+
+        result = self.model.objects.create(upload=upload, scanner=YARA)
+
+        assert result.id is not None
+        assert result.upload == upload
+        assert result.scanner == YARA
+        assert result.results == []
+        assert result.version is None
+        assert result.has_matches is False
+
+    def test_create_different_entries_for_a_single_upload(self):
+        upload = self.create_file_upload()
+
+        narc_result = self.model.objects.create(upload=upload, scanner=NARC)
+        yara_result = self.model.objects.create(upload=upload, scanner=YARA)
+
+        assert narc_result.scanner == NARC
+        assert yara_result.scanner == YARA
+
+    def test_upload_constraint(self):
+        upload = self.create_file_upload()
+        result = self.model.objects.create(upload=upload, scanner=YARA)
+
+        upload.delete()
+        result.refresh_from_db()
+
+        assert result.upload is None
+
+    def test_save_set_has_matches(self):
+        result = self.create_result(scanner=YARA)
+        rule = self.rule_model.objects.create(
+            name='some rule name', scanner=result.scanner
+        )
+
+        result.has_matches = None
+        result.save()
+        assert result.has_matches is False
+
+        result.has_matches = None
+        result.results = [{'rule': rule.name}]  # Fake match
+        result.save()
+        assert result.has_matches is True
+
+    def test_save_ignores_disabled_rules(self):
+        result = self.create_result(scanner=YARA)
+        rule = self.rule_model.objects.create(
+            name='some rule name', scanner=result.scanner, is_active=False
+        )
+
+        result.has_matches = None
+        result.results = [{'rule': rule.name}]  # Fake match
+        result.save()
+        assert result.has_matches is False
+
+    def test_save_creates_unknown_webhook_rules(self):
+        existing_rule = self.rule_model.objects.create(
+            name='existing-rule',
+            scanner=WEBHOOK,
+            action=FLAG_FOR_HUMAN_REVIEW,
+        )
+        initial_count = self.rule_model.objects.count()
+        result = self.create_result(
+            scanner=WEBHOOK,
+            results={'matchedRules': ['existing-rule', 'unknown-rule']},
+        )
+
+        assert self.rule_model.objects.count() == initial_count + 1
+        new_rule = self.rule_model.objects.get(name='unknown-rule', scanner=WEBHOOK)
+        assert new_rule.is_active
+        assert new_rule.action == NO_ACTION
+        assert new_rule.policy is None
+        assert result.has_matches is True
+        assert set(result.matched_rules.all()) == {existing_rule, new_rule}
+
+    def test_save_does_not_duplicate_created_webhook_rules(self):
+        result = self.create_result(
+            scanner=WEBHOOK, results={'matchedRules': ['unknown-rule']}
+        )
+        initial_count = self.rule_model.objects.count()
+        result.save()
+
+        result.duplicate(version=version_factory(addon=addon_factory()))
+        assert self.rule_model.objects.count() == initial_count
+
+    def test_save_does_not_reenable_disabled_webhook_rules(self):
+        self.rule_model.objects.create(
+            name='disabled-rule', scanner=WEBHOOK, is_active=False
+        )
+        initial_count = self.rule_model.objects.count()
+        result = self.create_result(
+            scanner=WEBHOOK, results={'matchedRules': ['disabled-rule']}
+        )
+
+        assert self.rule_model.objects.count() == initial_count
+        assert result.has_matches is False
+        assert not result.matched_rules.exists()
+
+    def test_save_does_not_create_rules_for_incomplete_webhook_results(self):
+        initial_count = self.rule_model.objects.count()
+
+        for results in (None, {}):
+            result = self.create_result(scanner=WEBHOOK, results=results)
+            assert result.has_matches is False
+
+        assert self.rule_model.objects.count() == initial_count
+
+    def test_save_does_not_create_unknown_rules_for_other_scanners(self):
+        initial_count = self.rule_model.objects.count()
+        result = self.create_result(scanner=YARA, results=[{'rule': 'unknown'}])
+        assert self.rule_model.objects.count() == initial_count
+        assert result.has_matches is False
+
+    def test_str(self):
+        result = ScannerResult(scanner=YARA)
+        assert str(result) == 'yara'
+
+        event = ScannerWebhookEvent.objects.create(
+            event=WEBHOOK_DURING_VALIDATION,
+            webhook=ScannerWebhook.objects.create(name='some service'),
+        )
+        result = ScannerResult(scanner=WEBHOOK, webhook_event=event)
+        assert str(result) == 'some service (during_validation)'
+
+
+class TestScannerQueryResult(TestScannerResultMixin, TestCase):
+    __test__ = True
+    model = ScannerQueryResult
+    rule_model = ScannerQueryRule
+
+    def create_result(self, *args, **kwargs):
+        # We can't save ScannerQueryResults in database without a rule, so for
+        # this test class create_result() is overridden to not save the result
+        # initially - it will be saved later when adding the result data.
+        return self.model(*args, **kwargs)
+
+
+class TestScannerRuleMixin:
+    __test__ = False
+
+    def test_str(self):
+        result = self.model(name='Fôo')
+        assert str(result) == 'Fôo'
+        result.pretty_name = 'Bär'
+        assert str(result) == 'Bär'
+
+    def test_clean_raises_for_narc_rule_without_a_definition(self):
+        rule = self.model(name='some_rule', scanner=NARC)
+
+        with pytest.raises(ValidationError, match=r'should have a definition'):
+            rule.clean()
+
+    def test_clean_raises_for_narc_rule_that_doesnt_compile(self):
+        rule = self.model(
+            name='some_rule',
+            scanner=NARC,
+            definition=r'^test\Y',  # Invalid escape sequence in regexp
+        )
+
+        with pytest.raises(
+            ValidationError,
+            match=r'error occurred when compiling regular expression: bad escape',
+        ):
+            rule.clean()
+
+    def test_clean_raises_for_narc_rule_that_doesnt_compile_with_regex_module(self):
+        rule = self.model(
+            name='some_rule',
+            scanner=NARC,
+            definition=r'^(test){e<=-1}',
+        )
+
+        with pytest.raises(
+            ValidationError,
+            match=r'error occurred when compiling regular expression: bad',
+        ):
+            rule.clean()
+
+    def test_clean_raises_for_yara_rule_without_a_definition(self):
+        rule = self.model(name='some_rule', scanner=YARA)
+
+        with pytest.raises(ValidationError, match=r'should have a definition'):
+            rule.clean()
+
+    def test_clean_raises_for_yara_rule_without_same_rule_name(self):
+        rule = self.model(name='some_rule', scanner=YARA, definition='rule x {}')
+
+        with pytest.raises(ValidationError, match=r'should match the name of'):
+            rule.clean()
+
+    def test_clean_raises_when_yara_rule_has_two_rules(self):
+        rule = self.model(
+            name='some_rule',
+            scanner=YARA,
+            definition='rule some_rule {} rule foo {}',
+        )
+
+        with pytest.raises(ValidationError, match=r'Only one Yara rule'):
+            rule.clean()
+
+    def test_clean_raises_when_yara_rule_is_invalid(self):
+        rule = self.model(
+            name='some_rule',
+            scanner=YARA,
+            # Invalid because there is no `condition`.
+            definition='rule some_rule {}',
+        )
+
+        with pytest.raises(
+            ValidationError,
+            match=r'The definition is not valid: error\[E001\]: syntax error',
+        ):
+            rule.clean()
+
+    def test_clean_supports_our_external_variables(self):
+        externals = self.model.get_yara_externals()
+        assert externals
+        conditions = ' and '.join(externals)
+        rule = self.model(
+            name='some_rule',
+            scanner=YARA,
+            definition='rule some_rule { condition: %s}' % conditions,
+        )
+        rule.clean()  # Shouldn't raise, the externals are automatically added.
+
+    @mock.patch('yara_x.Compiler')
+    def test_clean_yara_uses_yara_x_compiler(self, compiler_class_mock):
+        rule = self.model(
+            name='some_rule',
+            scanner=YARA,
+            definition='rule some_rule { condition: true }',
+        )
+        compiler_mock = compiler_class_mock.return_value
+
+        rule.clean()
+
+        compiler_class_mock.assert_called_once_with()
+        assert compiler_mock.define_global.call_args_list == [
+            mock.call(name, value)
+            for name, value in self.model.get_yara_externals().items()
+        ]
+        compiler_mock.add_source.assert_called_once_with(rule.definition)
+        compiler_mock.build.assert_called_once_with()
+
+    @mock.patch('yara_x.Compiler')
+    def test_clean_raises_generic_error_when_yara_compile_failed(
+        self, compiler_class_mock
+    ):
+        rule = self.model(
+            name='some_rule',
+            scanner=YARA,
+            definition='rule some_rule { condition: true }',
+        )
+        compiler_class_mock.return_value.build.side_effect = Exception()
+
+        with pytest.raises(ValidationError, match=r'An error occurred'):
+            rule.clean()
+
+    def test_default_configuration_yara_on_save(self):
+        rule = self.model(
+            name='some_rule',
+            scanner=YARA,
+            definition='rule some_rule { condition: true }',
+        )
+        assert rule.configuration == {}
+        rule.save()
+        assert rule.configuration == {}
+
+    def test_default_configuration_narc_on_save(self):
+        rule = self.model(
+            name='some_rule',
+            scanner=NARC,
+            definition='.*',
+        )
+        assert rule.configuration == {}
+        rule.save()
+        assert rule.configuration == {
+            'examine_authors_names': True,
+            'examine_homoglyphs_variants': True,
+            'examine_listing_names': True,
+            'examine_normalized_variants': True,
+            'examine_slug': False,
+            'examine_xpi_names': True,
+            'examine_xpi_descriptions': False,
+            'examine_listing_summaries': False,
+        }
+        return rule
+
+    def test_configuration_isnt_overwritten_by_default_for_existing_rule(self):
+        rule = self.test_default_configuration_narc_on_save()
+        rule.configuration['examine_slug'] = True
+        rule.save()
+        assert rule.configuration == {
+            'examine_authors_names': True,
+            'examine_homoglyphs_variants': True,
+            'examine_listing_names': True,
+            'examine_normalized_variants': True,
+            'examine_slug': True,
+            'examine_xpi_names': True,
+            'examine_xpi_descriptions': False,
+            'examine_listing_summaries': False,
+        }
+
+
+class TestScannerRule(TestScannerRuleMixin, TestCase):
+    __test__ = True
+    model = ScannerRule
+
+    def test_scanner_choices(self):
+        field = self.model._meta.get_field('scanner')
+        assert list(field.choices) == list(SCANNERS.items())
+
+
+class TestScannerQueryRule(TestScannerRuleMixin, TestCase):
+    __test__ = True
+    model = ScannerQueryRule
+
+    def test_scanner_choices(self):
+        # Code search only supports yara for now.
+        field = self.model._meta.get_field('scanner')
+        assert list(field.choices) == [(YARA, 'yara'), (NARC, 'narc')]
+
+    @mock.patch('olympia.amo.celery.app.GroupResult.restore')
+    def test_completed_task_count(self, restore_mock):
+        restore_mock.return_value.completed_count.return_value = 42
+        rule = ScannerQueryRule(state=RUNNING, celery_group_result_id=str(uuid.uuid4()))
+        assert rule._get_completed_tasks_count() == 42
+
+        restore_mock.return_value = None
+        assert rule._get_completed_tasks_count() is None
+
+    def test_completed_task_count_no_group_id(self):
+        rule = ScannerQueryRule(state=RUNNING, celery_group_result_id=None)
+        assert rule._get_completed_tasks_count() is None
+
+    @mock.patch.object(ScannerQueryRule, '_get_completed_tasks_count')
+    def test_completion_rate(self, _get_completed_tasks_count_mock):
+        rule = ScannerQueryRule(state=RUNNING, task_count=10000)
+
+        _get_completed_tasks_count_mock.return_value = None
+        assert rule.completion_rate() is None
+
+        _get_completed_tasks_count_mock.return_value = 0
+        assert rule.completion_rate() == '0.00%'
+
+        _get_completed_tasks_count_mock.return_value = 1000
+        assert rule.completion_rate() == '10.00%'
+
+        _get_completed_tasks_count_mock.return_value = 3333
+        assert rule.completion_rate() == '33.33%'
+
+        _get_completed_tasks_count_mock.return_value = 10000
+        assert rule.completion_rate() == '100.00%'
+
+        rule.task_count = 0
+        assert rule.completion_rate() is None
+
+    def test_completion_rate_not_running(self):
+        rule = ScannerQueryRule(state=NEW, task_count=10000)
+        assert rule.completion_rate() is None
+
+        rule.state = SCHEDULED
+        assert rule.completion_rate() is None
+
+        rule.state = ABORTING
+        assert rule.completion_rate() is None
+
+        rule.state = ABORTED
+        assert rule.completion_rate() is None
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'current_state,target_state',
+    [
+        (NEW, SCHEDULED),
+        (SCHEDULED, RUNNING),
+        (NEW, ABORTING),  # Technically not exposed through the admin yet.
+        (SCHEDULED, ABORTING),  # Technically not exposed through the admin yet.
+        (RUNNING, ABORTING),
+        (ABORTING, ABORTED),
+        (RUNNING, COMPLETED),
+    ],
+)
+def test_query_rule_change_state_to_valid(current_state, target_state):
+    rule = ScannerQueryRule(name='some_rule', scanner=YARA)
+    rule.state = current_state
+    with time_machine.travel('2020-04-08 15:16:23.42', tick=False):
+        rule.change_state_to(target_state)
+        now = datetime.now()
+    if target_state == COMPLETED:
+        assert rule.completed == now
+        assert rule.completed != datetime.now()
+    else:
+        assert rule.completed is None
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'current_state,target_state',
+    [
+        (NEW, RUNNING),  # Should go through SCHEDULED first to work.
+        (NEW, ABORTED),  # Should go through ABORTING first to work.
+        (NEW, COMPLETED),  # Should go through RUNNING first to work.
+        (SCHEDULED, NEW),  # Can't reset to NEW.
+        (SCHEDULED, ABORTED),  # Should go through ABORTING first to work.
+        (SCHEDULED, COMPLETED),  # Should go through RUNNING first to work.
+        (RUNNING, NEW),  # Can't reset to NEW.
+        (RUNNING, ABORTED),  # Should go through ABORTING first to work.
+        (RUNNING, SCHEDULED),  # Can't reset to SCHEDULED
+        (ABORTING, NEW),  # Can't reset to NEW.
+        (ABORTING, RUNNING),  # Can't reset to RUNNING
+        (ABORTING, SCHEDULED),  # Can't reset to SCHEDULED
+        (ABORTED, NEW),  # Can't reset to NEW.
+        (ABORTED, RUNNING),  # Can't reset to RUNNING.
+        (ABORTED, SCHEDULED),  # Can't reset to SCHEDULED
+        (COMPLETED, NEW),  # Can't reset to... anything, it's completed!
+        (COMPLETED, RUNNING),  # As above.
+        (COMPLETED, ABORTED),  # As above.
+        (COMPLETED, ABORTING),  # As above.
+        (COMPLETED, SCHEDULED),  # As above.
+    ],
+)
+def test_query_rule_change_state_to_invalid(current_state, target_state):
+    rule = ScannerQueryRule(name='some_rule', scanner=YARA)
+    rule.state = current_state
+    with pytest.raises(ImproperScannerQueryRuleStateError):
+        rule.change_state_to(target_state)
+    # Manually changing state doesn't affect 'completed' property, and since
+    # changing through change_state_to() failed before it should always be
+    # None in this test.
+    assert rule.completed is None
+
+
+class TestScannerWebhook(TestCase):
+    def test_save_creates_a_service_account(self):
+        name = 'some name'
+        webhook = ScannerWebhook(name=name, url='https://example.com', api_key='secret')
+        assert webhook.service_account is None
+
+        webhook.save()
+        # Double-save to check the presence of a single `GroupUser` instance.
+        webhook.save()
+
+        user = webhook.service_account
+        assert user
+        assert user.pk is not None
+        assert user.notes == (
+            f'Service account automatically created for the "{name}" scanner webhook.'
+        )
+
+        scanner_group = Group.objects.get(name=SCANNER_SERVICE_ACCOUNTS_GROUP)
+        assert GroupUser.objects.filter(group=scanner_group, user=user).count() == 1
+
+    def test_save_does_not_recreate_service_account_on_rename(self):
+        webhook = ScannerWebhook(
+            name='some-name',
+            url='https://example.com',
+            api_key='secret',
+        )
+        webhook.save()
+        original_account = webhook.service_account
+        assert original_account is not None
+        expected_count = UserProfile.objects.count()
+
+        webhook.name = 'some-new-name'
+        webhook.save()
+
+        assert webhook.service_account == original_account
+        assert UserProfile.objects.count() == expected_count
+
+    def test_name_is_unique(self):
+        ScannerWebhook.objects.create(
+            name='some-name', url='https://example.com', api_key='secret'
+        )
+
+        with pytest.raises(IntegrityError):
+            ScannerWebhook.objects.create(
+                name='some-name', url='https://example.org', api_key='other-secret'
+            )

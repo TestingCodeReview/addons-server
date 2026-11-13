@@ -1,4 +1,4 @@
-{% from "devhub/includes/macros.html" import tip, some_html_tip, empty_unless %}
+{% from "devhub/includes/macros.html" import tip, empty_unless %}
 
 <form method="post" action="{{ url('devhub.addons.section', addon.slug, 'additional_details', 'edit') }}">
   <h3>
@@ -10,33 +10,23 @@
   </h3>
   <div class="item">
     <div class="item_wrapper">
-      {% if editable %}{{ form.non_field_errors() }}{% endif %}
+      {% if editable %}{{ main_form.non_field_errors() }}{% endif %}
       <table>
         <caption>{{ _('Additional Details for {0}')|format_html(addon.name) }}</caption>
         <tbody>
           <tr>
             <th>
               {{ tip(_("Tags"),
-                     _("Tags help users find your add-on and should be short "
-                       "descriptors such as tabs, toolbar, or twitter. You "
-                       "may have a maximum of {0} tags.").format(amo.MAX_TAGS)) }}
+                     _("Tags help users find your add-on. You may have a maximum of {0} tags. "
+                       "Only choose tags that are relevant to your add-on.").format(amo.MAX_TAGS)) }}
             </th>
             <td id="addon_tags_edit">
               {% if editable %}
-                {{ form.tags }}
-                {{ form.tags.errors }}
+                {{ main_form.tags }}
+                {{ main_form.tags.errors }}
                 <div class="edit-addon-details">
-                  {{ ngettext('Comma-separated, minimum of {0} character.',
-                              'Comma-separated, minimum of {0} characters.',
-                              amo.MIN_TAG_LENGTH)|format_html(amo.MIN_TAG_LENGTH) }}
-                  {{ _('Example: dark, cinema, noir. Limit 20.') }}
+                  {{ _('Limit {0} tags.')|format_html(amo.MAX_TAGS) }}
                 </div>
-                {% if restricted_tags %}
-                <div class="edit-addon-details">
-                    {{ ngettext('Reserved tag:', 'Reserved tags:', restricted_tags|length) }}
-                    {{ restricted_tags|join(', ') }}
-                </div>
-                {% endif %}
               {% else %}
                 {% call empty_unless(tags) %}
                   {{ tags|join(', ') }}
@@ -52,9 +42,9 @@
             </th>
             <td>
               {% if editable %}
-                <p>{{ _('Supported domains: %s'|format(', '.join(amo.VALID_CONTRIBUTION_DOMAINS))) }}</p>
-                <p>{{ form.contributions }}</p>
-                {{ form.contributions.errors }}
+                <p>{{ _('Supported domains: %(supported_domains)s', supported_domains=', '.join(amo.VALID_CONTRIBUTION_DOMAINS)) }}</p>
+                <p>{{ main_form.contributions }}</p>
+                {{ main_form.contributions.errors }}
               {% else %}
                 <a href="{{ addon.contributions }}" target="_blank" rel="noopener noreferrer">{{ addon.contributions }}</a>
               {% endif %}
@@ -69,8 +59,8 @@
             </th>
             <td class="addon_edit_locale">
               {% if editable %}
-                {{ form.default_locale }}
-                {{ form.default_locale.errors }}
+                {{ main_form.default_locale }}
+                {{ main_form.default_locale.errors }}
               {% else %}
                 {{ addon.language_ascii() }}
               {% endif %}
@@ -89,8 +79,8 @@
             </th>
             <td>
               {% if editable %}
-                {{ form.homepage }}
-                {{ form.homepage.errors }}
+                {{ main_form.homepage }}
+                {{ main_form.homepage.errors }}
               {% else %}
                 {% call empty_unless(addon.homepage) %}
                   {{ addon|all_locales('homepage') }}

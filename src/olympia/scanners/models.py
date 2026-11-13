@@ -1,0 +1,784 @@
+import json
+import re
+from collections import defaultdict
+from datetime import datetime
+
+from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.db import models
+from django.db.transaction import atomic
+from django.utils.functional import classproperty
+
+import regex
+import yara_x
+from django_jsonform.models.fields import JSONField as JSONFormJSONField
+
+import olympia.core.logger
+from olympia import amo
+from olympia.abuse.utils import (
+    find_automated_enforcement_actions_from_policies,
+)
+from olympia.access.models import Group, GroupUser
+from olympia.amo.models import ModelBase
+from olympia.constants.abuse import POLICY_EXPOSURE
+from olympia.constants.base import ADDON_EXTENSION, COSE_DATE_CUTOFF
+from olympia.constants.scanners import (
+    ABORTED,
+    ABORTING,
+    ACTIONS,
+    COMPLETED,
+    DEFAULT_RULE_CONFIGURATION_SCHEMA,
+    DELAY_AUTO_APPROVAL,
+    DELAY_AUTO_APPROVAL_INDEFINITELY,
+    DELAY_AUTO_APPROVAL_INDEFINITELY_AND_RESTRICT,
+    DELAY_AUTO_APPROVAL_INDEFINITELY_AND_RESTRICT_FUTURE_APPROVALS,
+    DISABLE_AND_BLOCK,
+    EMPTY_RULE_CONFIGURATION_SCHEMA,
+    FLAG_FOR_HUMAN_REVIEW,
+    NARC,
+    NARC_RULE_CONFIGURATION_SCHEMA,
+    NEW,
+    NO_ACTION,
+    QUERY_RULE_STATES,
+    RUNNING,
+    SCANNER_SERVICE_ACCOUNTS_GROUP,
+    SCANNERS,
+    SCHEDULED,
+    WEBHOOK,
+    WEBHOOK_EVENTS,
+    YARA,
+)
+from olympia.files.models import FileUpload
+from olympia.scanners.actions import (
+    _delay_auto_approval,
+    _delay_auto_approval_indefinitely,
+    _delay_auto_approval_indefinitely_and_restrict,
+    _delay_auto_approval_indefinitely_and_restrict_future_approvals,
+    _disable_and_block,
+    _flag_for_human_review,
+    _no_action,
+)
+from olympia.scanners.utils import default_from_schema
+from olympia.users.models import UserProfile
+
+
+log = olympia.core.logger.getLogger('z.scanners.models')
+
+
+class AbstractScannerResult(ModelBase):
+    # Store the "raw" results of a scanner.
+    results = models.JSONField(default=list, null=True)
+    scanner = models.PositiveSmallIntegerField(choices=SCANNERS.items())
+    version = models.ForeignKey(
+        'versions.Version',
+        related_name='%(class)ss',
+        on_delete=models.CASCADE,
+        null=True,
+    )
+
+    class Meta(ModelBase.Meta):
+        abstract = True
+
+    def add_yara_result(self, rule, tags=None, meta=None):
+        """This method is used to store a Yara result."""
+        self.results.append({'rule': rule, 'tags': tags or [], 'meta': meta or {}})
+
+    def extract_rule_names(self):
+        """This method parses the raw results and returns the (matched) rule
+        names. Not all scanners have rules that necessarily match."""
+        if self.results is None:
+            return []
+        if self.scanner in (NARC, YARA):
+            return sorted({result['rule'] for result in self.results})
+        if 'matchedRules' in self.results:
+            return self.results['matchedRules']
+        # We do not have support for the remaining scanners (yet).
+        return []
+
+    def get_rules_queryset(self):
+        """Helper to return the rule(s) queryset matching the rule name and
+        scanner for this result."""
+        return self.rule_model.objects.filter(
+            scanner=self.scanner,
+            name__in=self.extract_rule_names(),
+        )
+
+    @classproperty
+    def rule_model(self):
+        # Implement in concrete models.
+        raise NotImplementedError
+
+    def get_scanner_name(self):
+        return SCANNERS.get(self.scanner)
+
+    def get_pretty_results(self):
+        return json.dumps(self.results, indent=2)
+
+    def get_files_and_data_by_matched_rules(self):
+        """
+        Return results metadata from matched rules
+
+        This includes the filename that matched if applicable and the name of
+        the rule, but excluding info that would reveal the definition of the
+        rule itself).
+        """
+        res = defaultdict(list)
+        if self.results is None:
+            return res
+        if self.scanner == YARA:
+            for item in self.results:
+                ruleId = item.get('rule')
+                data = item.get('meta', {}).copy()
+                filename = data.pop('filename', '???')
+                # Put the other metadata at the top of the list of files for
+                # that rule, without a filename since it's "global".
+                if ruleId not in res:
+                    res[ruleId].append({'filename': '', 'data': data})
+                res[ruleId].append({'filename': filename})
+        elif self.scanner == NARC:
+            for item in self.results:
+                res[item['rule']].append(item.get('meta', {}))
+        else:
+            if 'annotations' in self.results:
+                for rule_name, annotation_list in self.results['annotations'].items():
+                    for annotation in annotation_list:
+                        filename = annotation.get('file', '')
+                        data = {k: v for k, v in annotation.items() if k != 'file'}
+                        res[rule_name].append({'filename': filename, 'data': data})
+            # NOTE: We keep support for `scanMap` for backward compatibility
+            # but that shouldn't be used anymore. Instead, `annotations` should
+            # be used. `scanMap` is ignored when `annotations` is present.
+            elif 'scanMap' in self.results:
+                scanMap = self.results.get('scanMap', {}).copy()
+                for filename, rules in scanMap.items():
+                    for ruleId, data in rules.items():
+                        data = data.copy()
+                        if data.pop('RULE_HAS_MATCHED', False):
+                            if filename == '__GLOBAL__':
+                                filename = ''
+                            res[ruleId].append({'filename': filename, 'data': data})
+        return res
+
+    def duplicate(self, *, version=None, version_id=None):
+        """Creates a (saved) copy of this instance, for a different version."""
+        overrides = {}
+        if version_id:
+            overrides['version_id'] = version_id
+        elif version:
+            overrides['version'] = version
+            overrides['version_id'] = version.id
+        obj = self.__class__(
+            **{
+                field.attname: getattr(self, field.attname)
+                for field in self._meta.concrete_fields
+                if not field.primary_key and field.attname not in overrides
+            },
+            **overrides,
+        )
+        obj.save()  # to recreate the matched_rules m2m
+        return obj
+
+
+def rule_schema(instance=None):
+    if instance:
+        if instance.scanner == NARC:
+            schema = NARC_RULE_CONFIGURATION_SCHEMA
+        else:
+            # Currently only NARC has configuration options, but leaving the
+            # possibility open for the future.
+            schema = DEFAULT_RULE_CONFIGURATION_SCHEMA
+    else:
+        # If we don't have an instance we shouldn't set a schema, because we
+        # can't predict whether or not it will be compatible with the scanner
+        # that the rule will be for.
+        schema = EMPTY_RULE_CONFIGURATION_SCHEMA
+    return schema
+
+
+class AbstractScannerRule(ModelBase):
+    name = models.CharField(
+        max_length=200,
+        help_text='This is the exact name of the rule used by a scanner.',
+    )
+    pretty_name = models.CharField(
+        default='',
+        help_text='Human-readable name for the scanner rule.',
+        max_length=255,
+        blank=True,
+        verbose_name='Human-readable name',
+    )
+    description = models.CharField(
+        default='',
+        help_text='Human readable description for the scanner rule.',
+        max_length=255,
+        blank=True,
+    )
+    scanner = models.PositiveSmallIntegerField(choices=SCANNERS.items())
+    definition = models.TextField(null=True, blank=True)
+    exclude_promoted_addons = models.BooleanField(
+        default=False,
+        help_text='Exclude add-ons that are in a promoted group from this rule',
+    )
+    configuration = JSONFormJSONField(schema=rule_schema, default=dict, blank=True)
+
+    class Meta(ModelBase.Meta):
+        abstract = True
+        unique_together = ('name', 'scanner')
+
+    @classmethod
+    def get_yara_externals(cls):
+        """
+        Return a dict with the various external variables we inject in every
+        yara rule automatically and their default values.
+        """
+        return {
+            'filename': '',
+            'is_json_file': False,
+            'is_manifest_file': False,
+            'is_locale_file': False,
+        }
+
+    def __str__(self):
+        return self.pretty_name or self.name
+
+    def clean(self):
+        if self.scanner == YARA:
+            self.clean_yara()
+        elif self.scanner == NARC:
+            self.clean_narc()
+
+    def clean_narc(self):
+        if not self.definition:
+            raise ValidationError({'definition': 'Narc rules should have a definition'})
+        try:
+            regex.compile(self.definition)
+        except Exception as exc:
+            raise ValidationError(
+                {
+                    'definition': (
+                        f'An error occurred when compiling regular expression: {exc}'
+                    )
+                }
+            ) from exc
+
+    def clean_yara(self):
+        if not self.definition:
+            raise ValidationError({'definition': 'Yara rules should have a definition'})
+
+        if f'rule {self.name}' not in self.definition:
+            raise ValidationError(
+                {
+                    'definition': (
+                        'The name of the rule in the definition should match '
+                        'the name of the scanner rule'
+                    )
+                }
+            )
+
+        if len(re.findall(r'rule\s+.+?\s+{', self.definition)) > 1:
+            raise ValidationError(
+                {'definition': 'Only one Yara rule is allowed in the definition'}
+            )
+
+        try:
+            compiler = yara_x.Compiler()
+            for name, value in self.get_yara_externals().items():
+                compiler.define_global(name, value)
+            compiler.add_source(self.definition)
+            compiler.build()
+        except yara_x.CompileError as syntaxError:
+            raise ValidationError(
+                {
+                    'definition': 'The definition is not valid: %(error)s'
+                    % {'error': syntaxError}
+                }
+            ) from syntaxError
+        except Exception as exc:
+            raise ValidationError(
+                {'definition': 'An error occurred when compiling the definition'}
+            ) from exc
+
+    def save(self, *args, **kwargs):
+        if self.pk is None and not self.configuration:
+            schema = rule_schema(self)
+            self.configuration = default_from_schema(schema)
+        return super().save(*args, **kwargs)
+
+
+class ScannerRule(AbstractScannerRule):
+    action = models.PositiveSmallIntegerField(
+        choices=ACTIONS.items(),
+        default=NO_ACTION,
+        verbose_name='Workflow action',
+        help_text='Workflow action to execute.',
+    )
+    policy = models.ForeignKey(
+        'abuse.CinderPolicy',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        help_text=(
+            'Policy used to automatically derive an action from when the rule hit.'
+        ),
+        limit_choices_to={
+            'expose_in_reviewer_tools__in': POLICY_EXPOSURE.FOR_EXTENSIONS.values
+        },
+    )
+    is_active = models.BooleanField(
+        default=True,
+        help_text=(
+            'When unchecked, scanner results will not be linked to this rule '
+            'and its automated actions will not be executed. For webhook '
+            'rules, only uncheck this as a last resort in an emergency.'
+        ),
+    )
+    exclude_promoted_addons = models.BooleanField(
+        default=False,
+        help_text=(
+            'When checked, the automated actions of this rule will not be '
+            'executed for add-ons that are in a promoted group.'
+        ),
+    )
+
+    class Meta(AbstractScannerRule.Meta):
+        db_table = 'scanners_rules'
+
+
+class ScannerWebhook(ModelBase):
+    name = models.CharField(max_length=100, unique=True)
+    url = models.URLField(max_length=255)
+    api_key = models.CharField(max_length=255)
+    is_active = models.BooleanField(default=True)
+    service_account = models.ForeignKey(
+        UserProfile,
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name='scanner_webhooks',
+    )
+
+    class Meta:
+        db_table = 'scanners_webhooks'
+
+    def save(self, *args, **kwargs):
+        if not self.service_account:
+            service_account, created = (
+                UserProfile.objects.get_or_create_service_account(
+                    name=f'webhook-{self.name}',
+                    notes=(
+                        'Service account automatically created for '
+                        f'the "{self.name}" scanner webhook.'
+                    ),
+                )
+            )
+            if created:
+                # Add service account to the scanner group.
+                group = Group.objects.get(name=SCANNER_SERVICE_ACCOUNTS_GROUP)
+                GroupUser.objects.get_or_create(group=group, user=service_account)
+
+            self.service_account = service_account
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.name
+
+
+class ScannerWebhookEvent(ModelBase):
+    webhook = models.ForeignKey(ScannerWebhook, on_delete=models.CASCADE)
+    event = models.PositiveSmallIntegerField(choices=WEBHOOK_EVENTS.items())
+    is_active = models.BooleanField(
+        default=True,
+        help_text=(
+            'Whether the scanner should be called for this event. Once this '
+            'event is added to the scanner, it cannot be removed because '
+            'some scanner results might have already been linked to it.'
+        ),
+    )
+
+    class Meta:
+        db_table = 'scanners_webhook_events'
+        unique_together = ('webhook', 'event')
+
+    @classmethod
+    def to_wait_for(cls, *, version, event_ids):
+        """Return the events subscribed to one of `event_ids` that the version
+        is expected to get results for."""
+        return cls.objects.filter(
+            # We want to find the active events to wait for...
+            event__in=event_ids,
+            is_active=True,
+            # ...but only for scanners that are active...
+            webhook__is_active=True,
+            # ...and only if the scanner hasn't been modified after the version
+            # was created, in order to avoid waiting indefinitely on scanners
+            # that were enabled *after*.
+            webhook__modified__lte=version.created,
+        )
+
+    def __str__(self):
+        return f'{self.webhook} ({WEBHOOK_EVENTS.get(self.event)})'
+
+
+class ScannerResult(AbstractScannerResult):
+    upload = models.ForeignKey(
+        FileUpload,
+        related_name='%(class)ss',  # scannerresults
+        on_delete=models.SET_NULL,
+        null=True,
+    )
+    webhook_event = models.ForeignKey(
+        ScannerWebhookEvent,
+        related_name='%(class)ss',  # scannerresults
+        on_delete=models.SET_NULL,
+        null=True,
+    )
+    activity_log = models.OneToOneField(
+        'activity.ActivityLog',
+        related_name='scanner_result',
+        on_delete=models.SET_NULL,
+        null=True,
+    )
+    matched_rules = models.ManyToManyField(
+        'ScannerRule', through='ScannerMatch', related_name='results'
+    )
+    has_matches = models.BooleanField(null=True)
+
+    class Meta(AbstractScannerResult.Meta):
+        db_table = 'scanners_results'
+        constraints = [
+            models.UniqueConstraint(
+                fields=('upload', 'webhook_event', 'scanner', 'version'),
+                name='upload_webhook_event_scanner_version_uniq',
+            )
+        ]
+        indexes = [
+            models.Index(fields=('has_matches',)),
+        ]
+
+    @classproperty
+    def rule_model(self):
+        return self.matched_rules.rel.model
+
+    @property
+    def webhook(self):
+        return self.webhook_event.webhook if self.webhook_event else None
+
+    @property
+    def is_complete(self):
+        return self.results is None or 'matchedRules' in self.results
+
+    @classproperty
+    def complete_q(cls):
+        """The `is_complete` condition, as a queryset filter."""
+        return models.Q(results__isnull=True) | models.Q(
+            results__has_key='matchedRules'
+        )
+
+    def get_rules_queryset(self):
+        # See: https://github.com/mozilla/addons-server/issues/13143
+        return super().get_rules_queryset().filter(is_active=True)
+
+    def save(self, *args, **kwargs):
+        if self.scanner == WEBHOOK:
+            # Create the unknown rules reported by a webhook scanner, so that
+            # we don't need to manually register them in the admin.
+            for name in self.extract_rule_names():
+                self.rule_model.objects.get_or_create(
+                    name=name,
+                    scanner=self.scanner,
+                    defaults={
+                        'is_active': True,
+                    },
+                )
+
+        matched_rules = self.get_rules_queryset()
+        self.has_matches = bool(matched_rules)
+        # Save the instance first...
+        super().save(*args, **kwargs)
+        # ...then add the associated rules.
+        for scanner_rule in matched_rules:
+            self.matched_rules.add(scanner_rule)
+
+    @classmethod
+    def get_matched_rules_for_version(cls, version, *, rules=None):
+        """Active rules matched by the results of `version`, optionally narrowed
+        down to `rules`, a list of pks or a queryset of rules (e.g. the rules of
+        a single pushed result)."""
+        result_query_name = cls._meta.get_field('matched_rules').related_query_name()
+
+        qs = cls.rule_model.objects.filter(
+            **{f'{result_query_name}__version': version, 'is_active': True}
+        )
+        if rules is not None:
+            qs = qs.filter(pk__in=rules)
+        if version.addon.is_promoted:
+            qs = qs.exclude(exclude_promoted_addons=True)
+        return qs
+
+    @classmethod
+    def run_actions(cls, version, *, rules=None):
+        if version.channel == amo.CHANNEL_ENTERPRISE:
+            log.info(
+                'Not running actions on version %s as it is an enterprise version',
+                version.pk,
+            )
+            return False
+        cls.execute_workflow_action(version, rules=rules)
+        cls.execute_policy_enforcement_action(version, rules=rules)
+        return True
+
+    @classmethod
+    def execute_policy_enforcement_action(cls, version, *, rules=None):
+        from olympia.abuse.models import (
+            CinderPolicy,
+            ContentDecision,
+            ContentDecisionFollowupAction,
+        )
+        from olympia.abuse.tasks import report_decision_to_cinder_and_notify
+
+        log.info('Checking policy rules and actions for version %s.', version.pk)
+        addon = version.addon
+
+        if addon.type != ADDON_EXTENSION:
+            log.info(
+                'Not running policy action(s) on version %s which belongs to a '
+                'non-extension.',
+                version.pk,
+            )
+            return
+
+        matching_rules = cls.get_matched_rules_for_version(version, rules=rules).filter(
+            policy__isnull=False
+        )
+
+        policies = CinderPolicy.objects.filter(
+            pk__in=matching_rules.values_list('policy', flat=True).distinct(),
+        ).without_parents_if_their_children_are_present()
+
+        if not policies:
+            log.info(
+                'No violated policy found when scanning version %s.',
+                version.pk,
+            )
+            return
+
+        # Find the action + follow-up actions to execute based on all policies
+        # that were hit.
+        primary_enforcement_action, followup_actions = (
+            find_automated_enforcement_actions_from_policies(
+                policies=policies, addon=addon, version=version
+            )
+        )
+        if len(primary_enforcement_action) != 1:
+            # We didn't find an applicable enforcement action. Out of abundance
+            # of caution we add a NHR for this version and delay auto-approval
+            # if there wasn't a scanner NHR on this version already.
+            _delay_auto_approval_indefinitely(version=version, rule=None)
+            log.error(
+                'No applicable enforcement action found when scanning version %s.',
+                version.pk,
+            )
+            return
+
+        with atomic():
+            decision = ContentDecision.objects.create(
+                addon=version.addon,
+                action=primary_enforcement_action[0],
+                reviewer_user_id=settings.TASK_USER_ID,
+                metadata={ContentDecision.POLICY_DYNAMIC_VALUES: {}},
+            )
+            for action in followup_actions:
+                ContentDecisionFollowupAction.objects.create(
+                    decision=decision, action=action
+                )
+            decision.target_versions.add(version)
+            # We might have executed a single action, but we record all
+            # policies we found - they should all be in the notification email.
+            decision.policies.set(policies)
+            log_entry = decision.execute_action()
+        report_decision_to_cinder_and_notify.delay(
+            decision_id=decision.id, notify_owners=bool(log_entry)
+        )
+
+    @classmethod
+    def execute_workflow_action(cls, version, *, rules=None):
+        """Try to find and execute a "workflow action" for a given version,
+        based on the scanner results and associated rules.
+
+        If an action is found, it is run synchronously from this method, not in
+        a task.
+        """
+        log.info('Checking workflow rules and actions for version %s.', version.pk)
+
+        if version.addon.type != ADDON_EXTENSION:
+            log.info(
+                'Not running workflow action(s) on version %s which belongs to a '
+                'non-extension.',
+                version.pk,
+            )
+            return
+
+        rule = (
+            cls.get_matched_rules_for_version(version, rules=rules)
+            .order_by(
+                # The `-` sign means descending order.
+                '-action'
+            )
+            .first()
+        )
+
+        if not rule:
+            log.info('No workflow action to execute for version %s.', version.pk)
+            return
+
+        action_id = rule.action
+        action_name = ACTIONS.get(action_id, None)
+
+        if not action_name:
+            raise ValueError('invalid action %s' % action_id)
+
+        ACTION_FUNCTIONS = {
+            NO_ACTION: _no_action,
+            FLAG_FOR_HUMAN_REVIEW: _flag_for_human_review,
+            DELAY_AUTO_APPROVAL: _delay_auto_approval,
+            DELAY_AUTO_APPROVAL_INDEFINITELY: _delay_auto_approval_indefinitely,
+            DELAY_AUTO_APPROVAL_INDEFINITELY_AND_RESTRICT: (
+                _delay_auto_approval_indefinitely_and_restrict
+            ),
+            DELAY_AUTO_APPROVAL_INDEFINITELY_AND_RESTRICT_FUTURE_APPROVALS: (
+                _delay_auto_approval_indefinitely_and_restrict_future_approvals
+            ),
+            DISABLE_AND_BLOCK: _disable_and_block,
+        }
+
+        action_function = ACTION_FUNCTIONS.get(action_id, None)
+
+        if not action_function:
+            raise NotImplementedError(
+                'no implementation for workflow action %s' % action_id
+            )
+
+        # We have a valid action to execute, so let's do it!
+        log.info(
+            'Starting workflow action "%s" for version %s.', action_name, version.pk
+        )
+        action_function(version=version, rule=rule)
+        log.info('Ending workflow action "%s" for version %s.', action_name, version.pk)
+
+    def __str__(self):
+        if self.scanner == WEBHOOK:
+            return str(self.webhook_event)
+        return self.get_scanner_name()
+
+
+class ScannerMatch(ModelBase):
+    result = models.ForeignKey(ScannerResult, on_delete=models.CASCADE)
+    rule = models.ForeignKey(ScannerRule, on_delete=models.CASCADE)
+
+
+class ImproperScannerQueryRuleStateError(ValueError):
+    pass
+
+
+class ScannerQueryRule(AbstractScannerRule):
+    scanner = models.PositiveSmallIntegerField(
+        choices=((YARA, 'yara'), (NARC, 'narc')),
+    )
+    state = models.PositiveSmallIntegerField(
+        choices=QUERY_RULE_STATES.items(), default=NEW
+    )
+    run_on_disabled_addons = models.BooleanField(
+        default=False,
+        help_text='Run this rule on add-ons that have been force-disabled as well.',
+    )
+    run_on_current_version_only = models.BooleanField(
+        default=False,
+        help_text=(
+            'Run this rule on the latest currently publicly listed version of '
+            'each add-on only.'
+        ),
+    )
+    run_on_specific_channels = models.JSONField(
+        default=list,
+    )
+    created_after = models.DateField(
+        db_default=None, default=COSE_DATE_CUTOFF, null=True, blank=True
+    )
+    celery_group_result_id = models.UUIDField(default=None, null=True)
+    task_count = models.PositiveIntegerField(default=0)
+    completed = models.DateTimeField(default=None, null=True, blank=True)
+
+    class Meta(AbstractScannerRule.Meta):
+        db_table = 'scanners_query_rules'
+
+    def change_state_to(self, target):
+        """Immediately change state of the rule in database or raise
+        ImproperScannerQueryRuleStateError."""
+        prereqs = {
+            # New is the default state.
+            NEW: (),
+            # Scheduled should only happen through the admin. It's the
+            # prerequisite to running the task.
+            SCHEDULED: (NEW,),
+            # Running should only happen through the task, after we went
+            # through the admin to schedule the query.
+            RUNNING: (SCHEDULED,),
+            # Aborting can happen from various states.
+            ABORTING: (NEW, SCHEDULED, RUNNING),
+            # Aborted should only happen after aborting.
+            ABORTED: (ABORTING,),
+            # Completed should only happen through the task
+            COMPLETED: (RUNNING,),
+        }
+        if self.state in prereqs[target]:
+            props = {
+                'state': target,
+            }
+            if target == COMPLETED:
+                props['completed'] = datetime.now()
+            self.update(**props)
+        else:
+            raise ImproperScannerQueryRuleStateError()
+
+    def _get_completed_tasks_count(self):
+        if self.celery_group_result_id is not None:
+            from olympia.amo.celery import app as celery_app
+
+            result = celery_app.GroupResult.restore(str(self.celery_group_result_id))
+            if result:
+                return result.completed_count()
+        return None
+
+    def completion_rate(self):
+        if self.state == RUNNING:
+            completed_tasks_count = self._get_completed_tasks_count()
+            if completed_tasks_count is not None and self.task_count:
+                rate = (completed_tasks_count / self.task_count) * 100
+                return f'{rate:.2f}%'
+        return None
+
+
+class ScannerQueryResult(AbstractScannerResult):
+    # Note: ScannerResult uses a M2M called 'matched_rules', but here we don't
+    # need a M2M because there will always be a single rule for each result, so
+    # we have a single FK called 'matched_rule' (singular).
+    matched_rule = models.ForeignKey(
+        ScannerQueryRule, on_delete=models.CASCADE, related_name='results'
+    )
+    was_blocked = models.BooleanField(null=True, default=None)
+    was_promoted = models.BooleanField(null=True, default=None)
+
+    class Meta(AbstractScannerResult.Meta):
+        db_table = 'scanners_query_results'
+        indexes = [
+            models.Index(fields=('was_blocked',)),
+            models.Index(fields=('was_promoted',)),
+        ]
+
+    @classproperty
+    def rule_model(cls):
+        return cls.matched_rule.field.related_model
+
+    def save(self, *args, **kwargs):
+        if self.results:
+            self.matched_rule = self.get_rules_queryset().get()
+        super().save(*args, **kwargs)

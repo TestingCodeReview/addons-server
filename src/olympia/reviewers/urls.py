@@ -1,95 +1,105 @@
-from django.conf.urls import url
 from django.shortcuts import redirect
+from django.urls import include, re_path
 
 from olympia.addons.urls import ADDON_ID
-from olympia.reviewers import views, views_themes
+from olympia.reviewers import views
+from olympia.users.urls import USER_ID
 
 
-# All URLs under /editors/
+def queue_urls():
+    return [
+        re_path(
+            queue.url_suffix,
+            getattr(views, queue.view_name),
+            kwargs={'tab': tab},
+            name=f'reviewers.{queue.name}',
+        )
+        for tab, queue in views.reviewer_tables_registry.items()
+    ]
+
+
+# All URLs under /reviewers/
 urlpatterns = (
-    url(r'^$', views.dashboard, name='reviewers.dashboard'),
-    url(r'^dashboard$',
-        lambda request: redirect('reviewers.dashboard', permanent=True)),
-    url(r'^queue$', views.queue, name='reviewers.queue'),
-    url(r'^queue/new$', views.queue_nominated,
-        name='reviewers.queue_nominated'),
-    url(r'^queue/updates$', views.queue_pending,
-        name='reviewers.queue_pending'),
-    url(r'^queue/reviews$', views.queue_moderated,
-        name='reviewers.queue_moderated'),
-    url(r'^queue/application_versions\.json$', views.application_versions_json,
-        name='reviewers.application_versions_json'),
-    url(r'^queue/auto_approved', views.queue_auto_approved,
-        name='reviewers.queue_auto_approved'),
-    url(r'^queue/content_review', views.queue_content_review,
-        name='reviewers.queue_content_review'),
-    url(r'^queue/expired_info_requests', views.queue_expired_info_requests,
-        name='reviewers.queue_expired_info_requests'),
-    url(r'^unlisted_queue$', views.unlisted_queue,
-        name='reviewers.unlisted_queue'),
-    url(r'^unlisted_queue/all$', views.unlisted_list,
-        name='reviewers.unlisted_queue_all'),
-    url(r'^moderationlog$', views.ratings_moderation_log,
-        name='reviewers.ratings_moderation_log'),
-    url(r'^moderationlog/(\d+)$', views.ratings_moderation_log_detail,
-        name='reviewers.ratings_moderation_log.detail'),
-    url(r'^reviewlog$', views.reviewlog, name='reviewers.reviewlog'),
-    url(r'^queue_version_notes/%s?$' % ADDON_ID, views.queue_version_notes,
-        name='reviewers.queue_version_notes'),
-    url(r'^queue_review_text/(\d+)?$', views.queue_review_text,
-        name='reviewers.queue_review_text'),  # (?P<addon_id>[^/<>"']+)
-    url(r'^queue_viewing$', views.queue_viewing,
-        name='reviewers.queue_viewing'),
-    url(r'^review_viewing$', views.review_viewing,
-        name='reviewers.review_viewing'),
+    re_path(r'^$', views.dashboard, name='reviewers.dashboard'),
+    re_path(
+        r'^dashboard$', lambda request: redirect('reviewers.dashboard', permanent=True)
+    ),
+    re_path(r'^queue/', include(queue_urls())),
+    re_path(
+        r'^queue/theme_new$',
+        lambda request: redirect('reviewers.queue_theme', permanent=True),
+    ),
+    re_path(
+        r'^queue/theme_updates$',
+        lambda request: redirect('reviewers.queue_theme', permanent=True),
+    ),
+    re_path(
+        r'^moderationlog$',
+        views.ratings_moderation_log,
+        name='reviewers.ratings_moderation_log',
+    ),
+    re_path(
+        r'^moderationlog/(\d+)$',
+        views.ratings_moderation_log_detail,
+        name='reviewers.ratings_moderation_log.detail',
+    ),
+    re_path(r'^reviewlog$', views.reviewlog, name='reviewers.reviewlog'),
+    re_path(
+        r'^queue_version_notes/%s?$' % ADDON_ID,
+        views.queue_version_notes,
+        name='reviewers.queue_version_notes',
+    ),
+    re_path(
+        r'^queue_review_text/(\d+)?$',
+        views.queue_review_text,
+        name='reviewers.queue_review_text',
+    ),  # (?P<addon_id>[^/<>"']+)
+    re_path(r'^queue_viewing$', views.queue_viewing, name='reviewers.queue_viewing'),
+    re_path(r'^review_viewing$', views.review_viewing, name='reviewers.review_viewing'),
     # 'content' is not a channel, but is a special kind of review that we only
     # do for listed add-ons, so we abuse the channel parameter to handle that.
-    url(r'^review(?:-(?P<channel>listed|unlisted|content))?/%s$' % ADDON_ID,
-        views.review, name='reviewers.review'),
-    url(r'^whiteboard/(?P<channel>listed|unlisted|content)/%s$' % ADDON_ID,
-        views.whiteboard, name='reviewers.whiteboard'),
-    url(r'^eula/%s$' % ADDON_ID, views.eula, name='reviewers.eula'),
-    url(r'^privacy/%s$' % ADDON_ID, views.privacy, name='reviewers.privacy'),
-
-    url(r'^performance/(?P<user_id>\d+)?$', views.performance,
-        name='reviewers.performance'),
-    url(r'^motd$', views.motd, name='reviewers.motd'),
-    url(r'^motd/save$', views.save_motd, name='reviewers.save_motd'),
-    url(r'^abuse-reports/%s$' % ADDON_ID, views.abuse_reports,
-        name='reviewers.abuse_reports'),
-    url(r'^leaderboard/$', views.leaderboard, name='reviewers.leaderboard'),
-    url(r'^theme_background_images/(?P<version_id>[^ /]+)?$',
+    re_path(
+        r'^review(?:-(?P<channel>listed|unlisted|enterprise|content))?/%s$' % ADDON_ID,
+        views.review,
+        name='reviewers.review',
+    ),
+    re_path(
+        r'^review-version/%s/(?P<version>[^/<>]+)' % ADDON_ID,
+        views.review_version_redirect,
+        name='reviewers.review_version_redirect',
+    ),
+    re_path(
+        r'^whiteboard/(?P<channel>listed|unlisted|enterprise|content)/%s$' % ADDON_ID,
+        views.whiteboard,
+        name='reviewers.whiteboard',
+    ),
+    re_path(
+        r'^decision-review/(?P<decision_id>[^/<>]+)$',
+        views.decision_review,
+        name='reviewers.decision_review',
+    ),
+    re_path(r'^eula/%s$' % ADDON_ID, views.eula, name='reviewers.eula'),
+    re_path(r'^privacy/%s$' % ADDON_ID, views.privacy, name='reviewers.privacy'),
+    re_path(r'^motd$', views.motd, name='reviewers.motd'),
+    re_path(r'^motd/save$', views.save_motd, name='reviewers.save_motd'),
+    re_path(
+        r'^abuse-reports/%s$' % ADDON_ID,
+        views.abuse_reports,
+        name='reviewers.abuse_reports',
+    ),
+    re_path(
+        r'^theme_background_images/(?P<version_id>[^ /]+)?$',
         views.theme_background_images,
-        name='reviewers.theme_background_images'),
-
-    url(r'^themes$',
-        lambda request: redirect('reviewers.dashboard', permanent=True)),
-    url(r'^themes/pending$', views_themes.themes_list,
-        name='reviewers.themes.list'),
-    url(r'^themes/flagged$', views_themes.themes_list,
-        name='reviewers.themes.list_flagged',
-        kwargs={'flagged': True}),
-    url(r'^themes/updates$', views_themes.themes_list,
-        name='reviewers.themes.list_rereview',
-        kwargs={'rereview': True}),
-    url(r'^themes/queue/$', views_themes.themes_queue,
-        name='reviewers.themes.queue_themes'),
-    url(r'^themes/queue/flagged$', views_themes.themes_queue_flagged,
-        name='reviewers.themes.queue_flagged'),
-    url(r'^themes/queue/updates$', views_themes.themes_queue_rereview,
-        name='reviewers.themes.queue_rereview'),
-    url(r'^themes/queue/commit$', views_themes.themes_commit,
-        name='reviewers.themes.commit'),
-    url(r'^themes/queue/single/(?P<slug>[^ /]+)$', views_themes.themes_single,
-        name='reviewers.themes.single'),
-    url(r'^themes/history/(?P<user_id>[^ /]+)?$',
-        views_themes.themes_history, name='reviewers.themes.history'),
-    url(r'^themes/logs$', views_themes.themes_logs,
-        name='reviewers.themes.logs'),
-    url(r'^themes/release$', views_themes.release_locks,
-        name='reviewers.themes.release_locks'),
-    url(r'^themes/logs/deleted/$', views_themes.deleted_themes,
-        name='reviewers.themes.deleted'),
-    url(r'^themes/search/$', views_themes.themes_search,
-        name='reviewers.themes.search'),
+        name='reviewers.theme_background_images',
+    ),
+    re_path(
+        r'^developer_profile/%s$' % USER_ID,
+        views.developer_profile,
+        name='reviewers.developer_profile',
+    ),
+    re_path(
+        r'^usage_per_version/%s$' % ADDON_ID,
+        views.usage_per_version,
+        name='reviewers.usage_per_version',
+    ),
 )

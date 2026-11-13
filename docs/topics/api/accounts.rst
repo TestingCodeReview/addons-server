@@ -4,9 +4,10 @@ Accounts
 
 .. note::
 
-    These APIs are experimental and are currently being worked on. Endpoints
-    may change without warning. Consider the :ref:`v3 API<api-stable-v3>`
-    if you need stability. The only authentication method available at
+    These APIs are not frozen and can change at any time without warning.
+    See :ref:`the API versions available<api-versions-list>` for alternatives
+    if you need stability.
+    The only authentication method available at
     the moment is :ref:`the internal one<api-auth-internal>`.
 
 The following API endpoints cover a users account.
@@ -26,7 +27,7 @@ Most of the information is optional and provided by the user so may be missing o
 A developer is defined as a user who is listed as a developer or owner of one or more approved add-ons.
 
 
-.. http:get:: /api/v4/accounts/account/(int:user_id|string:username)/
+.. http:get:: /api/v5/accounts/account/(int:user_id|string:username)/
 
     .. _account-object:
 
@@ -45,15 +46,17 @@ A developer is defined as a user who is listed as a developer or owner of one or
     :>json string|null occupation: The occupation of the user.
     :>json string|null picture_type: the image type (only 'image/png' is supported) if a user photo has been uploaded, or null otherwise.
     :>json string|null picture_url: URL to a photo of the user, or null if no photo has been uploaded.
-    :>json string username: deprecated property still included for backwards compatability.  Previous chosen by the user, used in the account url. If not previously set will be a randomly generated string.
+    :>json string username: deprecated property still included for backwards compatibility.  Previous chosen by the user, used in the account url. If not previously set will be a randomly generated string.
 
 
 
 If you authenticate and access your own account by specifing your own ``user_id`` the following additional fields are returned.
 You can always access your account, regardless of whether you are a developer or not.
-If you have `Users:Edit` permission you will see these extra fields for all user accounts.
+If you have ``Users:Edit`` permission you will see these extra fields for all user accounts.
+If you have ``Users:Lookup`` permission (but not ``Users:Edit``) you will see the
+:ref:`lookup account object <account-object-lookup>` instead.
 
-.. http:get:: /api/v4/accounts/account/(int:user_id|string:username)/
+.. http:get:: /api/v5/accounts/account/(int:user_id|string:username)/
 
     .. _account-object-self:
 
@@ -66,6 +69,7 @@ If you have `Users:Edit` permission you will see these extra fields for all user
     :>json boolean is_verified: The user has been verified via FirefoxAccounts.
     :>json array permissions: A list of the additional :ref:`permissions <account-permissions>` this user has.
     :>json boolean read_dev_agreement: The user has read, and agreed to, the developer agreement that is required to submit addons.
+    :>json object site_status: The :ref:`site status <site-status-object>` - exposed here as a convenience to avoid an extra api call for logged in users.
 
 
     :statuscode 200: account found.
@@ -87,18 +91,48 @@ If you have `Users:Edit` permission you will see these extra fields for all user
     The following are some commonly tested permissions; see https://github.com/mozilla/addons-server/blob/master/src/olympia/constants/permissions.py
     for the full list.
 
-    ==================  ==========================================================
-                 Value  Description
-    ==================  ==========================================================
-     `AdminTools:View`  Can access the website admin interface index page.  Inner
-                        pages may require other/additional permissions.
-         `Addons:Edit`  Allows viewing and editing of any add-ons details in
-                        developer tools.
-       `Addons:Review`  Can access the add-on reviewer tools to approve/reject
-                        add-on submissions.
-     `Personas:Review`  Can access the theme reviewer tools to approve/reject
-                        theme submissions.
-    ==================  ==========================================================
+    =====================  =======================================================
+                    Value  Description
+    =====================  =======================================================
+            `Addons:Edit`  Allows viewing and editing of any add-ons details in
+                           developer tools.
+          `Addons:Review`  Can access the add-on reviewer tools to approve/reject
+                           add-on submissions.
+     `Addons:ThemeReview`  Can access the theme reviewer tools to approve/reject
+                           theme submissions.
+    =====================  =======================================================
+
+
+--------------
+Account Lookup
+--------------
+
+.. _`account-lookup`:
+
+.. note::
+    This API requires :doc:`authentication <auth>` and ``Users:Lookup`` permission.
+
+This endpoint looks up one or more accounts by email address.
+Since multiple accounts can share the same email address, the response is always a list.
+Deleted accounts are excluded from results.
+
+.. http:get:: /api/v5/accounts/account/lookup/
+
+    .. _account-object-lookup:
+
+    Returns a list of :ref:`account objects <account-object>` with the following additional field.
+    Sensitive fields from the :ref:`self object <account-object-self>` such as ``last_login_ip``
+    and ``permissions`` are not included.
+
+    :>json string email: Email address used by the user to login and create this account.
+
+    :query string email: The email address to look up.
+
+    :statuscode 200: account(s) found.
+    :statuscode 400: ``email`` query parameter is missing.
+    :statuscode 401: authentication required.
+    :statuscode 403: insufficient permissions (requires ``Users:Lookup`` or ``Users:Edit``).
+    :statuscode 404: no account with that email address.
 
 
 -------
@@ -111,7 +145,7 @@ Profile
 
 This endpoint is a shortcut to your own account. It returns an :ref:`account object <account-object-self>`
 
-.. http:get:: /api/v4/accounts/profile/
+.. http:get:: /api/v5/accounts/profile/
 
 
 ----
@@ -128,7 +162,7 @@ This endpoint allows some of the details for an account to be updated.  Any fiel
 in the :ref:`account <account-object>` (or :ref:`self <account-object-self>`)
 but not listed below are not editable and will be ignored in the patch request.
 
-.. http:patch:: /api/v4/accounts/account/(int:user_id|string:username)/
+.. http:patch:: /api/v5/accounts/account/(int:user_id|string:username)/
 
     .. _account-edit-request:
 
@@ -147,15 +181,15 @@ To upload a picture for the profile the request must be sent as content-type `mu
 Images must be either PNG or JPG; the maximum file size is 4MB.
 Other :ref:`editable values <account-edit-request>` can be set at the same time.
 
-.. http:patch:: /api/v4/accounts/account/(int:user_id|string:username)/
+.. http:patch:: /api/v5/accounts/account/(int:user_id|string:username)/
 
     **Request:**
 
     .. sourcecode:: bash
 
-        curl "https://addons.mozilla.org/api/v4/accounts/account/12345/"
+        curl "https://addons.mozilla.org/api/v5/accounts/account/12345/"
             -g -XPATCH --form "picture_upload=@photo.png"
-            -H "Authorization: Bearer <token>"
+            -H "Authorization: JWT <token>"
 
     :param user-id: The numeric user id.
     :form picture_upload: The user's picture to upload.
@@ -168,7 +202,7 @@ Deleting the picture
 
 To delete the account profile picture call the special endpoint.
 
-.. http:delete:: /api/v4/accounts/account/(int:user_id|string:username)/picture
+.. http:delete:: /api/v5/accounts/account/(int:user_id|string:username)/picture
 
 
 ------
@@ -181,15 +215,15 @@ Delete
     This API requires :doc:`authentication <auth>` and `Users:Edit`
     permission to delete accounts other than your own.
 
-.. note::
-    Accounts of users who are authors of Add-ons can't be deleted.
-    All Add-ons (and Themes) must be deleted or transfered to other users first.
+This endpoint allows the account to be deleted. The data will be permanently
+removed, including profile details (picture, user name, display name, location,
+home page, biography, occupation), notification preferences, reviews, and
+collections. If the user authored any add-ons they will also be deleted,
+unless ownership is shared with other authors. In that case, the user will be
+removed as an author and the remaining authors will maintain ownership of the
+add-on.
 
-This endpoint allows the account to be deleted. The reviews and ratings
-created by the user will not be deleted; but all the user's details are
-cleared.
-
-.. http:delete:: /api/v4/accounts/account/(int:user_id|string:username)/
+.. http:delete:: /api/v5/accounts/account/(int:user_id|string:username)/
 
 
 ------------------
@@ -205,7 +239,7 @@ Notifications List
 This endpoint allows you to list the account notifications set for the specified user.
 The result is an unpaginated list of the fields below. There are currently 10 notification types.
 
-.. http:get:: /api/v4/accounts/account/(int:user_id|string:username)/notifications/
+.. http:get:: /api/v5/accounts/account/(int:user_id|string:username)/notifications/
 
     :>json string name: The notification short name.
     :>json boolean enabled: If the notification is enabled (defaults to True).
@@ -225,11 +259,33 @@ Notifications Update
 This endpoint allows account notifications to be set or updated. The request should be a dict of `name`:True|False pairs.
 Any number of notifications can be changed; only non-mandatory notifications can be changed - attempting to set a mandatory notification will return an error.
 
-.. http:post:: /api/v4/accounts/account/(int:user_id|string:username)/notifications/
+.. http:post:: /api/v5/accounts/account/(int:user_id|string:username)/notifications/
 
     .. _notification-update-request:
 
     :<json boolean <name>: Is the notification enabled?
+
+
+------------------------
+Notification Unsubscribe
+------------------------
+
+.. _`notification-unsubscribe`:
+
+This special endpoint is used to handle notification update requests coming from email unsubscribe links.
+Only a single notification can be changed, and it will always be updated to `enabled = False`.
+Only non-mandatory notifications can be changed - attempting to set a mandatory notification will return an error.
+
+.. http:post:: /api/v5/accounts/unsubscribe/
+
+    .. _notification-unsubscribe-request:
+
+    :<json string hash: The generated hash of the token
+    :<json string notification: The short name of the notification that should be disabled
+    :<json string token: The base64 encoded email address of the account
+    :>json string name: The notification short name.
+    :>json boolean enabled: If the notification is enabled (should always be False).
+    :>json boolean mandatory: If the notification can be set by the user (should always be False, or an error would have been sent instead).
 
 
 --------------
@@ -249,7 +305,7 @@ This allows you to generate a new user account and sign in as that user.
     * This endpoint is not available in all
       :ref:`API environments <api-environments>`.
 
-.. http:post:: /api/v4/accounts/super-create/
+.. http:post:: /api/v5/accounts/super-create/
 
     **Request:**
 
@@ -272,7 +328,7 @@ This allows you to generate a new user account and sign in as that user.
 
     .. sourcecode:: bash
 
-        curl "https://addons.mozilla.org/api/v4/accounts/super-create/" \
+        curl "https://addons.mozilla.org/api/v5/accounts/super-create/" \
             -X POST -H "Authorization: JWT <jwt-token>"
 
     **Response:**
@@ -316,14 +372,14 @@ Log out of the current session. This is for use with the
 :ref:`internal authentication <api-auth-internal>` that authenticates browser
 sessions.
 
-.. http:delete:: /api/v4/accounts/session/
+.. http:delete:: /api/v5/accounts/session/
 
     **Request:**
 
     .. sourcecode:: bash
 
-        curl "https://addons.mozilla.org/api/v4/accounts/session/"
-            -H "Authorization: Bearer <jwt-token>" -X DELETE
+        curl "https://addons.mozilla.org/api/v5/accounts/session/"
+            -H "Authorization: Session <sessionid>" -X DELETE
 
     **Response:**
 

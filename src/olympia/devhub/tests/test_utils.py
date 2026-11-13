@@ -1,51 +1,52 @@
-# -*- coding: utf-8 -*-
+import json
 import os.path
+from datetime import datetime, timedelta
+from unittest import mock
 
 from django.conf import settings
-from django.forms import ValidationError
 from django.test.utils import override_settings
 
-import mock
 import pytest
-from waffle.testutils import override_switch
-
-from celery.result import AsyncResult
-from six import text_type
+from celery import group
 
 from olympia import amo
-from olympia.amo.storage_utils import copy_stored_file
+from olympia.addons.models import Addon
 from olympia.amo.tests import (
-    addon_factory, TestCase, user_factory, version_factory)
+    TestCase,
+    addon_factory,
+    user_factory,
+    version_factory,
+)
+from olympia.amo.tests.test_helpers import get_addon_file
+from olympia.applications.models import AppVersion
 from olympia.devhub import tasks, utils
-from olympia.files.models import FileUpload
-from olympia.lib.akismet.models import AkismetReport
+from olympia.files.tasks import repack_fileupload
+from olympia.files.tests.test_models import UploadMixin
+from olympia.scanners.tasks import (
+    call_webhooks_during_validation,
+    run_yara,
+)
+from olympia.versions.models import Version
 
 
-class TestAddonsLinterBase(TestCase):
-
+class TestAddonsLinterListed(UploadMixin, TestCase):
     def setUp(self):
         # Create File objects for version 1.0 and 1.1.
         self.addon = addon_factory(
-            guid='test-desktop@nowhere', slug='test-amo-addon',
+            guid='test-desktop@nowhere',
+            slug='test-amo-addon',
             version_kw={'version': '1.0'},
-            file_kw={'filename': 'webextension.xpi'})
+            file_kw={'filename': 'webextension.xpi'},
+        )
         self.version = self.addon.current_version
-        self.file = self.version.current_file
+        self.file = self.version.file
 
         # Create a FileUpload object for an XPI containing version 1.1.
-        self.file_upload = FileUpload.objects.create(
-            path=self.file.current_file_path)
+        self.file_upload = self.get_upload(
+            abspath=self.file.file.path, with_validation=False
+        )
 
-        # Patch validation tasks that we expect the validator to call.
-        self.save_file = self.patch(
-            'olympia.devhub.tasks.handle_file_validation_result').subtask
-        self.save_upload = self.patch(
-            'olympia.devhub.tasks.handle_upload_validation_result').subtask
-
-        self.validate_file = self.patch(
-            'olympia.devhub.tasks.validate_file').subtask
-        self.validate_upload = self.patch(
-            'olympia.devhub.tasks.validate_file_path').subtask
+        self.mock_chain = self.patch('olympia.devhub.utils.chain')
 
     def patch(self, thing):
         """Patch the given "thing", and revert the patch on test teardown."""
@@ -53,112 +54,56 @@ class TestAddonsLinterBase(TestCase):
         self.addCleanup(patcher.stop)
         return patcher.start()
 
-    def check_upload(self, file_upload, listed=True):
+    def test_check_upload(self):
         """Check that the given new file upload is validated properly."""
         # Run validator.
-        utils.Validator(file_upload, listed=listed)
+        utils.Validator(self.file_upload)
 
-        # We shouldn't be attempting to validate an existing file.
-        assert not self.validate_file.called
+        # Make sure we setup the correct validation task.
+        self.mock_chain.assert_called_once_with(
+            tasks.create_initial_validation_results.si(),
+            repack_fileupload.s(self.file_upload.pk),
+            tasks.validate_upload.s(self.file_upload.pk),
+            tasks.check_for_api_keys_in_file.s(self.file_upload.pk),
+            tasks.check_data_collection_permissions.s(self.file_upload.pk),
+            group(
+                [
+                    tasks.forward_linter_results.s(self.file_upload.pk),
+                    call_webhooks_during_validation.s(self.file_upload.pk),
+                ]
+            ),
+            tasks.handle_upload_validation_result.s(self.file_upload.pk, False),
+        )
 
-        channel = (amo.RELEASE_CHANNEL_LISTED if listed
-                   else amo.RELEASE_CHANNEL_UNLISTED)
-
-        # Make sure we run the correct validation task for the upload.
-        self.validate_upload.assert_called_once_with(
-            [file_upload.path],
-            {'channel': channel})
-
-        # Make sure we run the correct save validation task, with a
-        # fallback error handler.
-        self.save_upload.assert_has_calls([
-            mock.call([mock.ANY, file_upload.pk, channel, False],
-                      immutable=True),
-            mock.call([file_upload.pk, channel, False], link_error=mock.ANY)])
-
-    def check_file(self, file_):
+    def test_check_file(self):
         """Check that the given file is validated properly."""
+        # Mock tasks that we should not execute.
+        repack_fileupload = self.patch('olympia.files.tasks.repack_fileupload')
+        validate_upload = self.patch('olympia.devhub.tasks.validate_upload')
+
         # Run validator.
-        utils.Validator(file_)
+        utils.Validator(self.file)
 
-        # We shouldn't be attempting to validate a bare upload.
-        assert not self.validate_upload.called
+        # We shouldn't be attempting to call the `validate_upload` tasks when
+        # dealing with a file.
+        assert not repack_fileupload.called
+        assert not validate_upload.called
 
-        # Make sure we run the correct validation task.
-        self.validate_file.assert_called_once_with([file_.pk])
+        # Make sure we setup the correct validation task.
+        self.mock_chain.assert_called_once_with(
+            tasks.create_initial_validation_results.si(),
+            tasks.validate_file.s(self.file.pk),
+            tasks.handle_file_validation_result.s(self.file.pk),
+        )
 
-        # Make sure we run the correct save validation task, with a
-        # fallback error handler.
-        self.save_file.assert_has_calls([
-            mock.call([mock.ANY, file_.pk, file_.version.channel, False],
-                      immutable=True),
-            mock.call([file_.pk, file_.version.channel, False],
-                      link_error=mock.ANY)])
+    def test_validate_non_theme_passing_theme_specific_arg(self):
+        repack_fileupload = self.patch('olympia.files.tasks.repack_fileupload')
+        validate_upload = self.patch('olympia.devhub.tasks.validate_upload')
 
-
-class TestAddonsLinterListed(TestAddonsLinterBase):
-    @mock.patch('celery.Signature.__or__')
-    def test_run_once_per_file(self, chain_mock):
-        """Tests that only a single validation task is run for a given file."""
-        task = mock.Mock()
-        chain_mock.return_value = task
-        task.delay.return_value = mock.Mock(task_id='42')
-
-        assert isinstance(tasks.validate(self.file), mock.Mock)
-        assert task.delay.call_count == 1
-
-        assert isinstance(tasks.validate(self.file), AsyncResult)
-        assert task.delay.call_count == 1
-
-        new_version = version_factory(addon=self.addon, version='0.0.2')
-        assert isinstance(tasks.validate(new_version.current_file), mock.Mock)
-        assert task.delay.call_count == 2
-
-    @mock.patch('celery.Signature.__or__')
-    def test_run_once_file_upload(self, chain_mock):
-        """Tests that only a single validation task is run for a given file
-        upload."""
-        task = mock.Mock()
-        chain_mock.return_value = task
-        task.delay.return_value = mock.Mock(task_id='42')
-
-        assert isinstance(
-            tasks.validate(self.file_upload, listed=True), mock.Mock)
-        assert task.delay.call_count == 1
-
-        assert isinstance(
-            tasks.validate(self.file_upload, listed=True), AsyncResult)
-        assert task.delay.call_count == 1
-
-    def test_cache_key(self):
-        """Tests that the correct cache key is generated for a given object."""
-
-        assert (utils.Validator(self.file).cache_key ==
-                'validation-task:files.File:{0}:None'.format(self.file.pk))
-
-        assert (utils.Validator(self.file_upload, listed=False).cache_key ==
-                'validation-task:files.FileUpload:{0}:False'.format(
-                    self.file_upload.pk))
-
-    @mock.patch('olympia.devhub.utils.parse_addon')
-    def test_search_plugin(self, parse_addon):
-        """Test that search plugins are handled correctly."""
-        parse_addon.return_value = {
-            'guid': None,
-            'version': '20140103',
-        }
-
-        addon = addon_factory(type=amo.ADDON_SEARCH,
-                              version_kw={'version': '20140101'})
-
-        assert addon.guid is None
-        self.check_upload(self.file_upload)
-
-        self.validate_upload.reset_mock()
-        self.save_file.reset_mock()
-
-        version = version_factory(addon=addon, version='20140102')
-        self.check_file(version.files.get())
+        with self.assertRaises(utils.InvalidAddonType):
+            utils.Validator(self.file_upload, theme_specific=True)
+        assert not repack_fileupload.called
+        assert not validate_upload.called
 
 
 class TestLimitAddonsLinterResults(TestCase):
@@ -183,8 +128,7 @@ class TestLimitAddonsLinterResults(TestCase):
 
     @override_settings(VALIDATOR_MESSAGE_LIMIT=2)
     def test_errors_are_first(self):
-        validation = self.make_validation(
-            ['error', 'warning', 'notice', 'error'])
+        validation = self.make_validation(['error', 'warning', 'notice', 'error'])
         utils.limit_validation_results(validation)
         limited = validation['messages']
         assert len(limited) == 3
@@ -194,15 +138,10 @@ class TestLimitAddonsLinterResults(TestCase):
 
 
 class TestFixAddonsLinterOutput(TestCase):
-
     def test_fix_output(self):
         original_output = {
             'count': 4,
-            'summary': {
-                'errors': 0,
-                'notices': 0,
-                'warnings': 4
-            },
+            'summary': {'errors': 0, 'notices': 0, 'warnings': 4},
             'metadata': {
                 'manifestVersion': 2,
                 'name': 'My Dogs New Tab',
@@ -210,9 +149,7 @@ class TestFixAddonsLinterOutput(TestCase):
                 'version': '2.13.15',
                 'architecture': 'extension',
                 'emptyFiles': [],
-                'jsLibs': {
-                    'lib/vendor/jquery.js': 'jquery.2.1.4.jquery.js'
-                }
+                'jsLibs': {'lib/vendor/jquery.js': 'jquery.2.1.4.jquery.js'},
             },
             'errors': [],
             'notices': [],
@@ -222,20 +159,20 @@ class TestFixAddonsLinterOutput(TestCase):
                     'code': 'MANIFEST_PERMISSIONS',
                     'message': '/permissions: Unknown permissions ...',
                     'description': 'See https://mzl.la/1R1n1t0 ...',
-                    'file': 'manifest.json'
+                    'file': 'manifest.json',
                 },
                 {
                     '_type': 'warning',
                     'code': 'MANIFEST_PERMISSIONS',
                     'message': '/permissions: Unknown permissions ...',
                     'description': 'See https://mzl.la/1R1n1t0 ....',
-                    'file': 'manifest.json'
+                    'file': 'manifest.json',
                 },
                 {
                     '_type': 'warning',
                     'code': 'MANIFEST_CSP',
-                    'message': '\'content_security_policy\' is ...',
-                    'description': 'A custom content_security_policy ...'
+                    'message': "'content_security_policy' is ...",
+                    'description': 'A custom content_security_policy ...',
                 },
                 {
                     '_type': 'warning',
@@ -244,13 +181,12 @@ class TestFixAddonsLinterOutput(TestCase):
                     'description': 'document.write will fail in...',
                     'column': 13,
                     'file': 'lib/vendor/knockout.js',
-                    'line': 5449
-                }
-            ]
+                    'line': 5449,
+                },
+            ],
         }
 
-        fixed = utils.fix_addons_linter_output(
-            original_output, amo.RELEASE_CHANNEL_LISTED)
+        fixed = utils.fix_addons_linter_output(original_output, amo.CHANNEL_LISTED)
 
         assert fixed['success']
         assert fixed['warnings'] == 4
@@ -273,177 +209,38 @@ class TestFixAddonsLinterOutput(TestCase):
             assert fixed['metadata'][key] == value
 
 
-@override_switch('akismet-spam-check', active=True)
-class TestGetAddonAkismetReports(TestCase):
-    def setUp(self):
-        super(TestGetAddonAkismetReports, self).setUp()
-
-        patcher = mock.patch.object(
-            AkismetReport, 'create_for_addon')
-        self.addCleanup(patcher.stop)
-        self.create_for_addon_mock = patcher.start()
-        self.parse_addon_mock = self.patch('olympia.devhub.utils.parse_addon')
-
-    @override_switch('akismet-spam-check', active=False)
-    def test_waffle_off(self):
-        reports = utils.get_addon_akismet_reports(
-            None, '', '')
-        assert reports == []
-        self.create_for_addon_mock.assert_not_called()
-
-    def test_upload(self):
-        user = user_factory()
-        upload = FileUpload.objects.create()
-        self.parse_addon_mock.return_value = {'description': u'fóó'}
-        user_agent = 'Mr User/Agent'
-        referrer = 'http://foo.baa/'
-        reports = utils.get_addon_akismet_reports(
-            user, user_agent, referrer, upload=upload)
-        assert len(reports) == 1
-        self.create_for_addon_mock.assert_called_with(
-            upload=upload, addon=None, user=user, property_name='description',
-            property_value=u'fóó', user_agent=user_agent, referrer=referrer)
-        self.create_for_addon_mock.assert_called_once()
-
-    def test_upload_with_addon(self):
-        # Give addon some existing metadata.
-        addon = addon_factory()
-        user = user_factory()
-        upload = FileUpload.objects.create(addon=addon)
-        # summary is parsed but it's in existing_data - i.e. should have
-        # been spam checked previous it so will be ignored.
-        self.parse_addon_mock.return_value = {
-            'name': u'fóó', 'summary': u'summáry'}
-        user_agent = 'Mr User/Agent'
-        referrer = 'http://foo.baa/'
-        reports = utils.get_addon_akismet_reports(
-            user, user_agent, referrer, upload=upload,
-            existing_data=[u'summáry'])
-        # only one, no summary because it's in existing data
-        assert len(reports) == 1
-        self.create_for_addon_mock.assert_called_with(
-            upload=upload, addon=addon, user=user, property_name='name',
-            property_value=u'fóó', user_agent=user_agent, referrer=referrer)
-        self.create_for_addon_mock.assert_called_once()
-
-    def test_upload_locales(self):
-        addon = addon_factory(summary=u'¡Ochó!', default_locale='es-AR')
-        user = user_factory()
-        upload = FileUpload.objects.create(addon=addon)
-        existing_data = utils.fetch_existing_translations_from_addon(
-            addon, ('summary', 'name', 'description'))
-        # check fetch_existing_translations_from_addon worked okay
-        assert existing_data == {text_type(addon.name), u'¡Ochó!'}
-        self.parse_addon_mock.return_value = {
-            'description': {
-                'en-US': u'fóó',
-                'fr': u'lé foo',
-                'de': '',  # should be ignored because empty
-                'es-ES': u'¡Ochó!'  # ignored because in existing_data
-            },
-            'name': u'just one name',
-            'summary': None,  # should also be ignored because None
-        }
-        user_agent = 'Mr User/Agent'
-        referrer = 'http://foo.baa/'
-        reports = utils.get_addon_akismet_reports(
-            user, user_agent, referrer, upload=upload,
-            existing_data=existing_data)
-        assert len(reports) == 3
-        assert self.create_for_addon_mock.call_count == 3
-        calls = [
-            mock.call(
-                upload=upload, addon=addon, user=user,
-                property_name='name', property_value=u'just one name',
-                user_agent=user_agent, referrer=referrer),
-            mock.call(
-                upload=upload, addon=addon, user=user,
-                property_name='description', property_value=u'fóó',
-                user_agent=user_agent, referrer=referrer),
-            mock.call(
-                upload=upload, addon=addon, user=user,
-                property_name='description', property_value=u'lé foo',
-                user_agent=user_agent, referrer=referrer)]
-        self.create_for_addon_mock.assert_has_calls(calls, any_order=True)
-
-    def test_addon_update(self):
-        addon = addon_factory(summary=u'¡Ochó!', default_locale='es-AR')
-        user = user_factory()
-        existing_data = utils.fetch_existing_translations_from_addon(
-            addon, ('summary', 'name', 'description'))
-        # check fetch_existing_translations_from_addon worked okay
-        assert existing_data == {text_type(addon.name), u'¡Ochó!'}
-        cleaned_data = {
-            'description': {
-                'en-US': u'fóó',
-                'fr': u'lé foo',
-                'de': '',  # should be ignored because empty
-                'es-ES': u'¡Ochó!'  # ignored because in exist_data
-            },
-            'name': {
-                'en-GB': u'just one name',
-                'fr': None,
-            },
-        }
-        user_agent = 'Mr User/Agent'
-        referrer = 'http://foo.baa/'
-        reports = utils.get_addon_akismet_reports(
-            user, user_agent, referrer, addon=addon, data=cleaned_data,
-            existing_data=existing_data)
-        assert len(reports) == 3
-        assert self.create_for_addon_mock.call_count == 3
-        calls = [
-            mock.call(
-                upload=None, addon=addon, user=user,
-                property_name='name', property_value=u'just one name',
-                user_agent=user_agent, referrer=referrer),
-            mock.call(
-                upload=None, addon=addon, user=user,
-                property_name='description', property_value=u'fóó',
-                user_agent=user_agent, referrer=referrer),
-            mock.call(
-                upload=None, addon=addon, user=user,
-                property_name='description', property_value=u'lé foo',
-                user_agent=user_agent, referrer=referrer)]
-        self.create_for_addon_mock.assert_has_calls(calls, any_order=True)
-
-    def test_broken_upload(self):
-        user = user_factory()
-        upload = FileUpload.objects.create()
-        self.parse_addon_mock.side_effect = ValidationError('foo')
-        user_agent = 'Mr User/Agent'
-        referrer = 'http://foo.baa/'
-        reports = utils.get_addon_akismet_reports(
-            user, user_agent, referrer, upload=upload)
-        assert reports == []
-        self.create_for_addon_mock.assert_not_called()
-
-
 @pytest.mark.django_db
-def test_extract_theme_properties():
-    addon = addon_factory(type=amo.ADDON_STATICTHEME)
-    result = utils.extract_theme_properties(
-        addon, addon.current_version.channel)
-    assert result == {}  # There's no file, but it be should safely handled.
+@pytest.mark.parametrize(
+    'zip_file',
+    (
+        'src/olympia/devhub/tests/addons/static_theme.zip',
+        'src/olympia/devhub/tests/addons/static_theme_deprecated.zip',
+    ),
+)
+def test_extract_theme_properties(zip_file):
+    versions = {
+        amo.DEFAULT_WEBEXT_MAX_VERSION,
+        amo.DEFAULT_STATIC_THEME_MIN_VERSION_FIREFOX,
+    }
+    for version in versions:
+        AppVersion.objects.get_or_create(application=amo.FIREFOX.id, version=version)
+        AppVersion.objects.get_or_create(application=amo.ANDROID.id, version=version)
 
-    # Add the zip in the right place
-    zip_file = os.path.join(
-        settings.ROOT, 'src/olympia/devhub/tests/addons/static_theme.zip')
-    copy_stored_file(zip_file, addon.current_version.all_files[0].file_path)
-    result = utils.extract_theme_properties(
-        addon, addon.current_version.channel)
+    addon = addon_factory(
+        type=amo.ADDON_STATICTHEME,
+        file_kw={'filename': os.path.join(settings.ROOT, zip_file)},
+    )
+    result = utils.extract_theme_properties(addon, addon.current_version.channel)
     assert result == {
-        "colors": {
-            "accentcolor": "#adb09f",
-            "textcolor": "#000"
-        },
-        "images": {
-            "headerURL": "weta.png"
-        }
+        'colors': {'frame': '#adb09f', 'tab_background_text': '#000'},
+        'images': {'theme_frame': 'weta.png'},
     }
 
+    addon.current_version.file.update(file='')
+    result = utils.extract_theme_properties(addon, addon.current_version.channel)
+    assert result == {}  # There's no file, but it be should safely handled.
 
-@pytest.mark.django_db
+
 def test_wizard_unsupported_properties():
     data = {
         'colors': {
@@ -452,7 +249,7 @@ def test_wizard_unsupported_properties():
             'extracolor': 'rgb(1,2,3,0)',
         },
         'images': {
-            'headerURL': 'png.png',
+            'theme_frame': 'png.png',
             'additionalBackground': 'somethingelse.png',
         },
         'extrathing': {
@@ -460,6 +257,382 @@ def test_wizard_unsupported_properties():
         },
     }
     fields = ['foo', 'baa']
-    properties = utils.wizard_unsupported_properties(
-        data, fields)
+    properties = utils.wizard_unsupported_properties(data, fields)
     assert properties == ['extrathing', 'extracolor', 'additionalBackground']
+
+
+def test_process_validation_ending_tier_is_preserved():
+    results = {
+        'errors': 0,
+        'success': True,
+        'warnings': 0,
+        'notices': 0,
+        'message_tree': {},
+        'messages': [],
+        'ending_tier': 5,
+        'metadata': {
+            'version': '1.0',
+            'name': 'gK0Bes Bot',
+            'id': 'gkobes@gkobes',
+        },
+    }
+    data = utils.process_validation(results)
+    assert not data['errors']
+    assert data['ending_tier'] == 5
+
+
+class TestValidator(UploadMixin, TestCase):
+    @mock.patch('olympia.devhub.utils.chain')
+    def test_appends_final_task_for_file_uploads(self, mock_chain):
+        final_task = mock.Mock()
+        file_upload = self.get_upload('webextension.xpi', with_validation=False)
+
+        utils.Validator(file_upload, final_task=final_task)
+
+        mock_chain.assert_called_once_with(
+            tasks.create_initial_validation_results.si(),
+            repack_fileupload.s(file_upload.pk),
+            tasks.validate_upload.s(file_upload.pk),
+            tasks.check_for_api_keys_in_file.s(file_upload.pk),
+            tasks.check_data_collection_permissions.s(file_upload.pk),
+            group(
+                [
+                    tasks.forward_linter_results.s(file_upload.pk),
+                    call_webhooks_during_validation.s(file_upload.pk),
+                ]
+            ),
+            tasks.handle_upload_validation_result.s(file_upload.pk, False),
+            final_task,
+        )
+
+    @mock.patch('olympia.devhub.utils.chain')
+    def test_appends_final_task_for_files(self, mock_chain):
+        final_task = mock.Mock()
+        file = version_factory(addon=addon_factory()).file
+
+        utils.Validator(file, final_task=final_task)
+
+        mock_chain.assert_called_once_with(
+            tasks.create_initial_validation_results.si(),
+            tasks.validate_file.s(file.pk),
+            tasks.handle_file_validation_result.s(file.pk),
+            final_task,
+        )
+
+    @mock.patch('olympia.devhub.utils.chain')
+    def test_adds_run_yara_when_enabled(self, mock_chain):
+        self.create_switch('enable-yara', active=True)
+        file_upload = self.get_upload('webextension.xpi', with_validation=False)
+
+        utils.Validator(file_upload)
+
+        mock_chain.assert_called_once_with(
+            tasks.create_initial_validation_results.si(),
+            repack_fileupload.s(file_upload.pk),
+            tasks.validate_upload.s(file_upload.pk),
+            tasks.check_for_api_keys_in_file.s(file_upload.pk),
+            tasks.check_data_collection_permissions.s(file_upload.pk),
+            group(
+                [
+                    tasks.forward_linter_results.s(file_upload.pk),
+                    call_webhooks_during_validation.s(file_upload.pk),
+                    run_yara.s(file_upload.pk),
+                ]
+            ),
+            tasks.handle_upload_validation_result.s(file_upload.pk, False),
+        )
+
+    @mock.patch('olympia.devhub.utils.chain')
+    def test_does_not_add_run_yara_when_disabled(self, mock_chain):
+        self.create_switch('enable-yara', active=False)
+        file_upload = self.get_upload('webextension.xpi', with_validation=False)
+
+        utils.Validator(file_upload)
+
+        mock_chain.assert_called_once_with(
+            tasks.create_initial_validation_results.si(),
+            repack_fileupload.s(file_upload.pk),
+            tasks.validate_upload.s(file_upload.pk),
+            tasks.check_for_api_keys_in_file.s(file_upload.pk),
+            tasks.check_data_collection_permissions.s(file_upload.pk),
+            group(
+                [
+                    tasks.forward_linter_results.s(file_upload.pk),
+                    call_webhooks_during_validation.s(file_upload.pk),
+                ]
+            ),
+            tasks.handle_upload_validation_result.s(file_upload.pk, False),
+        )
+
+    @mock.patch('olympia.devhub.utils.chain')
+    def test_adds_yara(self, mock_chain):
+        self.create_switch('enable-yara', active=True)
+        file_upload = self.get_upload('webextension.xpi', with_validation=False)
+
+        utils.Validator(file_upload)
+
+        mock_chain.assert_called_once_with(
+            tasks.create_initial_validation_results.si(),
+            repack_fileupload.s(file_upload.pk),
+            tasks.validate_upload.s(file_upload.pk),
+            tasks.check_for_api_keys_in_file.s(file_upload.pk),
+            tasks.check_data_collection_permissions.s(file_upload.pk),
+            group(
+                [
+                    tasks.forward_linter_results.s(file_upload.pk),
+                    call_webhooks_during_validation.s(file_upload.pk),
+                    run_yara.s(file_upload.pk),
+                ]
+            ),
+            tasks.handle_upload_validation_result.s(file_upload.pk, False),
+        )
+
+    @mock.patch('olympia.devhub.utils.chain')
+    def test_adds_all_scanners(self, mock_chain):
+        self.create_switch('enable-yara', active=True)
+        file_upload = self.get_upload('webextension.xpi', with_validation=False)
+
+        utils.Validator(file_upload)
+
+        mock_chain.assert_called_once_with(
+            tasks.create_initial_validation_results.si(),
+            repack_fileupload.s(file_upload.pk),
+            tasks.validate_upload.s(file_upload.pk),
+            tasks.check_for_api_keys_in_file.s(file_upload.pk),
+            tasks.check_data_collection_permissions.s(file_upload.pk),
+            group(
+                [
+                    tasks.forward_linter_results.s(file_upload.pk),
+                    call_webhooks_during_validation.s(file_upload.pk),
+                    run_yara.s(file_upload.pk),
+                ]
+            ),
+            tasks.handle_upload_validation_result.s(file_upload.pk, False),
+        )
+
+    def test_create_file_upload_tasks(self):
+        self.create_switch('enable-yara', active=True)
+        file_upload = self.get_upload('webextension.xpi', with_validation=False)
+        validator = utils.Validator(file_upload)
+
+        tasks = validator.create_file_upload_tasks(
+            upload_pk=file_upload.pk, is_mozilla_signed=False
+        )
+
+        assert isinstance(tasks, list)
+
+        expected_tasks = [
+            'olympia.devhub.tasks.create_initial_validation_results',
+            'olympia.files.tasks.repack_fileupload',
+            'olympia.devhub.tasks.validate_upload',
+            'olympia.devhub.tasks.check_for_api_keys_in_file',
+            'olympia.devhub.tasks.check_data_collection_permissions',
+            'celery.group',
+            'olympia.devhub.tasks.handle_upload_validation_result',
+        ]
+        assert len(tasks) == len(expected_tasks)
+        assert expected_tasks == [task.name for task in tasks]
+
+        scanners_group = tasks[5]
+
+        expected_parallel_tasks = [
+            'olympia.devhub.tasks.forward_linter_results',
+            'olympia.scanners.tasks.call_webhooks_during_validation',
+            'olympia.scanners.tasks.run_yara',
+        ]
+        assert len(scanners_group.tasks) == len(expected_parallel_tasks)
+        assert expected_parallel_tasks == [task.name for task in scanners_group.tasks]
+
+
+class TestCreateVersionForUpload(UploadMixin, TestCase):
+    fixtures = ['base/addon_3615']
+
+    def setUp(self):
+        super().setUp()
+        self.addon = Addon.objects.get(pk=3615)
+        self.mocks = {}
+        for key in ['Version.from_upload', 'parse_addon', 'statsd.incr']:
+            patcher = mock.patch('olympia.devhub.utils.%s' % key)
+            self.mocks[key] = patcher.start()
+            self.addCleanup(patcher.stop)
+        self.user = user_factory()
+
+    def test_statsd_logging_new_addon(self):
+        empty_addon = Addon.objects.create()
+        file_ = get_addon_file('valid_webextension.xpi')
+        upload = self.get_upload(
+            abspath=file_, user=self.user, addon=empty_addon, version=None
+        )
+        utils.create_version_for_upload(
+            addon=empty_addon,
+            upload=upload,
+            channel=amo.CHANNEL_LISTED,
+            client_info=None,
+        )
+        assert self.mocks['parse_addon'].call_count == 1
+        self.mocks['Version.from_upload'].assert_called()
+        self.mocks['statsd.incr'].assert_any_call('signing.submission.addon.listed')
+
+    def test_statsd_logging_new_version(self):
+        file_ = get_addon_file('valid_webextension.xpi')
+        upload = self.get_upload(
+            abspath=file_, user=self.user, addon=self.addon, version=None
+        )
+        utils.create_version_for_upload(
+            addon=self.addon,
+            upload=upload,
+            channel=amo.CHANNEL_LISTED,
+            client_info=None,
+        )
+        assert self.mocks['parse_addon'].call_count == 1
+        self.mocks['Version.from_upload'].assert_called()
+        self.mocks['statsd.incr'].assert_any_call('signing.submission.version.listed')
+
+    def test_file_passed_all_validations_not_most_recent(self):
+        file_ = get_addon_file('valid_webextension.xpi')
+        upload = self.get_upload(
+            abspath=file_, user=self.user, addon=self.addon, version='1.0'
+        )
+        newer_upload = self.get_upload(
+            abspath=file_, user=self.user, addon=self.addon, version='1.0'
+        )
+        newer_upload.update(created=datetime.today() + timedelta(hours=1))
+
+        # Check that the older file won't turn into a Version.
+        utils.create_version_for_upload(
+            addon=self.addon,
+            upload=upload,
+            channel=amo.CHANNEL_LISTED,
+            client_info=None,
+        )
+        assert not self.mocks['Version.from_upload'].called
+
+        # But the newer one will.
+        utils.create_version_for_upload(
+            addon=self.addon,
+            upload=newer_upload,
+            channel=amo.CHANNEL_LISTED,
+            client_info=None,
+        )
+        self.mocks['Version.from_upload'].assert_called_with(
+            newer_upload,
+            self.addon,
+            amo.CHANNEL_LISTED,
+            selected_apps=[amo.FIREFOX.id],
+            parsed_data=self.mocks['parse_addon'].return_value,
+            client_info=None,
+        )
+
+    def test_file_passed_all_validations_version_exists(self):
+        file_ = get_addon_file('valid_webextension.xpi')
+        upload = self.get_upload(
+            abspath=file_, user=self.user, addon=self.addon, version='1.0'
+        )
+        Version.objects.create(addon=upload.addon, version=upload.version)
+
+        # Check that the older file won't turn into a Version.
+        utils.create_version_for_upload(
+            addon=self.addon,
+            upload=upload,
+            channel=amo.CHANNEL_LISTED,
+            client_info=None,
+        )
+        assert not self.mocks['Version.from_upload'].called
+
+    def test_file_passed_all_validations_most_recent_failed(self):
+        file_ = get_addon_file('valid_webextension.xpi')
+        upload = self.get_upload(
+            abspath=file_, user=self.user, addon=self.addon, version='1.0'
+        )
+        newer_upload = self.get_upload(
+            abspath=file_, user=self.user, addon=self.addon, version='1.0'
+        )
+        newer_upload.update(
+            created=datetime.today() + timedelta(hours=1),
+            valid=False,
+            validation=json.dumps({'errors': 5}),
+        )
+
+        utils.create_version_for_upload(
+            addon=self.addon,
+            upload=upload,
+            channel=amo.CHANNEL_LISTED,
+            client_info=None,
+        )
+        assert not self.mocks['Version.from_upload'].called
+
+    def test_file_passed_all_validations_most_recent(self):
+        file_ = get_addon_file('valid_webextension.xpi')
+        upload = self.get_upload(
+            abspath=file_, user=self.user, addon=self.addon, version='1.0'
+        )
+        newer_upload = self.get_upload(
+            abspath=file_, user=self.user, addon=self.addon, version='0.5'
+        )
+        newer_upload.update(created=datetime.today() + timedelta(hours=1))
+
+        # The Version is created because the newer upload is for a different
+        # version_string.
+        utils.create_version_for_upload(
+            addon=self.addon,
+            upload=upload,
+            channel=amo.CHANNEL_LISTED,
+            client_info=None,
+        )
+        self.mocks['parse_addon'].assert_called_with(
+            upload, addon=self.addon, user=self.user
+        )
+        self.mocks['Version.from_upload'].assert_called_with(
+            upload,
+            self.addon,
+            amo.CHANNEL_LISTED,
+            selected_apps=[amo.FIREFOX.id],
+            parsed_data=self.mocks['parse_addon'].return_value,
+            client_info=None,
+        )
+
+    def test_file_passed_all_validations_beta_string(self):
+        file_ = get_addon_file('valid_webextension.xpi')
+        upload = self.get_upload(
+            abspath=file_, user=self.user, addon=self.addon, version='1.0beta1'
+        )
+        utils.create_version_for_upload(
+            addon=self.addon,
+            upload=upload,
+            channel=amo.CHANNEL_LISTED,
+            client_info=None,
+        )
+        self.mocks['parse_addon'].assert_called_with(
+            upload, addon=self.addon, user=self.user
+        )
+        self.mocks['Version.from_upload'].assert_called_with(
+            upload,
+            self.addon,
+            amo.CHANNEL_LISTED,
+            selected_apps=[amo.FIREFOX.id],
+            parsed_data=self.mocks['parse_addon'].return_value,
+            client_info=None,
+        )
+
+    def test_file_passed_all_validations_no_version(self):
+        file_ = get_addon_file('valid_webextension.xpi')
+        upload = self.get_upload(
+            abspath=file_, user=self.user, addon=self.addon, version=None
+        )
+        utils.create_version_for_upload(
+            addon=self.addon,
+            upload=upload,
+            channel=amo.CHANNEL_LISTED,
+            client_info=None,
+        )
+        self.mocks['parse_addon'].assert_called_with(
+            upload, addon=self.addon, user=self.user
+        )
+        self.mocks['Version.from_upload'].assert_called_with(
+            upload,
+            self.addon,
+            amo.CHANNEL_LISTED,
+            selected_apps=[amo.FIREFOX.id],
+            parsed_data=self.mocks['parse_addon'].return_value,
+            client_info=None,
+        )

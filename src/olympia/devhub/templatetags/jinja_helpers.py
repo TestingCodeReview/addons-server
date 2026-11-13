@@ -1,21 +1,13 @@
-import urllib
-
-from collections import defaultdict
-
-from django.utils.encoding import force_bytes
-from django.utils.translation import ugettext, ungettext
+from django.utils.translation import gettext, ngettext
 
 import jinja2
-import six
-
 from django_jinja import library
 
 from olympia import amo
 from olympia.access import acl
 from olympia.activity.models import ActivityLog
-from olympia.activity.utils import filter_queryset_to_pending_replies
-from olympia.addons.templatetags.jinja_helpers import new_context
-from olympia.amo.templatetags.jinja_helpers import format_date, page_title
+from olympia.amo.templatetags.jinja_helpers import format_date, new_context, page_title
+from olympia.constants.abuse import DECISION_ACTIONS
 from olympia.files.models import File
 
 
@@ -24,7 +16,7 @@ library.global_function(acl.check_addon_ownership)
 
 @library.global_function
 @library.render_with('devhub/addons/listing/items.html')
-@jinja2.contextfunction
+@jinja2.pass_context
 def dev_addon_listing_items(context, addons, src=None, notes=None):
     if notes is None:
         notes = {}
@@ -32,23 +24,14 @@ def dev_addon_listing_items(context, addons, src=None, notes=None):
 
 
 @library.global_function
-@jinja2.contextfunction
+@jinja2.pass_context
 def dev_page_title(context, title=None, addon=None):
     """Wrapper for devhub page titles."""
     if addon:
-        title = u'%s :: %s' % (title, addon.name)
+        title = f'{title} :: {addon.name}'
     else:
-        devhub = ugettext('Developer Hub')
-        title = '%s :: %s' % (title, devhub) if title else devhub
-    return page_title(context, title)
-
-
-@library.global_function
-@jinja2.contextfunction
-def docs_page_title(context, title=None):
-    """Wrapper for docs page titles."""
-    devhub = ugettext('Add-on Documentation :: Developer Hub')
-    title = '%s :: %s' % (title, devhub) if title else devhub
+        devhub = gettext('Developer Hub')
+        title = f'{title} :: {devhub}' if title else devhub
     return page_title(context, title)
 
 
@@ -56,24 +39,13 @@ def docs_page_title(context, title=None):
 @library.render_with('devhub/versions/file_status_message.html')
 def file_status_message(file):
     choices = File.STATUS_CHOICES
-    return {'fileid': file.id, 'platform': file.get_platform_display(),
-            'created': format_date(file.created),
-            'status': choices[file.status],
-            'actions': amo.LOG_REVIEW_EMAIL_USER,
-            'status_date': format_date(file.datestatuschanged)}
-
-
-@library.global_function
-def dev_files_status(files):
-    """Group files by their status (and files per status)."""
-    status_count = defaultdict(int)
-    choices = File.STATUS_CHOICES
-
-    for file in files:
-        status_count[file.status] += 1
-
-    return [(count, six.text_type(choices[status])) for
-            (status, count) in status_count.items()]
+    return {
+        'fileid': file.id,
+        'created': format_date(file.created),
+        'status': choices[file.status],
+        'actions': amo.LOG_REVIEW_EMAIL_USER,
+        'status_date': format_date(file.datestatuschanged),
+    }
 
 
 @library.global_function
@@ -81,7 +53,7 @@ def status_class(addon):
     classes = {
         amo.STATUS_NULL: 'incomplete',
         amo.STATUS_NOMINATED: 'nominated',
-        amo.STATUS_PUBLIC: 'approved',
+        amo.STATUS_APPROVED: 'approved',
         amo.STATUS_DISABLED: 'admin-disabled',
         amo.STATUS_DELETED: 'deleted',
         amo.STATUS_REJECTED: 'rejected',
@@ -105,34 +77,92 @@ def log_action_class(action_id):
 def summarize_validation(validation):
     """Readable summary of add-on validation results."""
     # L10n: first parameter is the number of errors
-    errors = ungettext('{0} error', '{0} errors',
-                       validation.errors).format(validation.errors)
+    errors = ngettext('{0} error', '{0} errors', validation.errors).format(
+        validation.errors
+    )
     # L10n: first parameter is the number of warnings
-    warnings = ungettext('{0} warning', '{0} warnings',
-                         validation.warnings).format(validation.warnings)
-    return "%s, %s" % (errors, warnings)
-
-
-@library.filter
-def display_url(url):
-    """Display a URL like the browser URL bar would.
-
-    Note: returns a Unicode object, not a valid URL.
-    """
-    url = force_bytes(url, errors='replace')
-    return urllib.unquote(url).decode('utf-8', errors='replace')
-
-
-@library.global_function
-def version_disabled(version):
-    """Return True if all the files are disabled."""
-    disabled = [status == amo.STATUS_DISABLED
-                for _id, status in version.statuses]
-    return all(disabled)
+    warnings = ngettext('{0} warning', '{0} warnings', validation.warnings).format(
+        validation.warnings
+    )
+    return f'{errors}, {warnings}'
 
 
 @library.global_function
 def pending_activity_log_count_for_developer(version):
-    alog = ActivityLog.objects.for_version(version).filter(
-        action__in=amo.LOG_REVIEW_QUEUE_DEVELOPER)
-    return filter_queryset_to_pending_replies(alog).count()
+    # unread_count is an annotation set by version_list() view to do this once
+    # for all versions in the list. We use it if it's present, otherwise fall
+    # back to the per-version computation.
+    if hasattr(version, 'unread_count'):
+        return version.unread_count
+    return ActivityLog.objects.for_versions(version).pending_for_developer().count()
+
+
+@library.global_function
+@library.render_with('devhub/includes/listing_header.html')
+@jinja2.pass_context
+def addon_listing_header(
+    context,
+    url_base,
+    sort_opts=None,
+    selected=None,
+    extra_sort_opts=None,
+    search_filter=None,
+):
+    if sort_opts is None:
+        sort_opts = {}
+    if extra_sort_opts is None:
+        extra_sort_opts = {}
+    if search_filter:
+        selected = search_filter.field
+        sort_opts = search_filter.opts
+        if hasattr(search_filter, 'extras'):
+            extra_sort_opts = search_filter.extras
+    # When an "extra" sort option becomes selected, it will appear alongside
+    # the normal sort options.
+    old_extras = extra_sort_opts
+    sort_opts, extra_sort_opts = list(sort_opts), []
+    for k, v in old_extras:
+        if k == selected:
+            sort_opts.append((k, v, True))
+        else:
+            extra_sort_opts.append((k, v))
+    return new_context(**locals())
+
+
+@library.filter
+def python_any(values):
+    return any(values)
+
+
+@library.global_function
+@library.render_with('devhub/includes/content_rejected.html')
+@jinja2.pass_context
+def content_rejected_info(context, addon):
+    rejected_log = (
+        addon.status == amo.STATUS_REJECTED
+        and ActivityLog.objects.filter(
+            addonlog__addon=addon, action=amo.LOG.REJECT_LISTING_CONTENT.id
+        )
+        .order_by('-created')
+        .first()
+    )
+    decision = (
+        rejected_log
+        and rejected_log.contentdecision_set.filter(
+            action=DECISION_ACTIONS.AMO_REJECT_LISTING_CONTENT
+        )
+        .order_by('created')
+        .last()
+    )
+    has_appeal_already = decision and decision.appeal_job
+    return {
+        'addon': context.get('addon'),
+        'page': context.get('page'),
+        'rejection_manual_reasoning_text': rejected_log.details.get('comments', '')
+        if rejected_log
+        else '',
+        'rejection_policy_texts': rejected_log.details.get('policy_texts', [])
+        if rejected_log
+        else [],
+        'has_appeal_already': has_appeal_already,
+    }

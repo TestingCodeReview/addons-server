@@ -2,13 +2,19 @@ import binascii
 import os
 import random
 
+from django.conf import settings
 from django.db import models
-from django.utils.encoding import force_text, python_2_unicode_compatible
+from django.urls import reverse
+from django.utils.crypto import constant_time_compare, get_random_string
+from django.utils.encoding import force_str
+from django.utils.translation import gettext
 
 from aesfield.field import AESField
 
 from olympia.amo.fields import PositiveAutoField
 from olympia.amo.models import ModelBase
+from olympia.amo.templatetags.jinja_helpers import absolutify
+from olympia.amo.utils import send_mail_jinja
 from olympia.users.models import UserProfile
 
 
@@ -21,21 +27,24 @@ API_KEY_TYPES = [
 ]
 
 
-@python_2_unicode_compatible
 class APIKey(ModelBase):
     """
     A developer's key/secret pair to access the API.
     """
+
     id = PositiveAutoField(primary_key=True)
-    user = models.ForeignKey(UserProfile, related_name='api_keys')
+    user = models.ForeignKey(
+        UserProfile, related_name='api_keys', on_delete=models.CASCADE
+    )
 
     # A user can only have one active key at the same time, it's enforced by
     # a unique db constraint. Since we keep old inactive keys though, nulls
     # need to be allowed (and we need to always set is_active=None instead of
     # is_active=False when revoking keys).
-    is_active = models.NullBooleanField(default=True)
+    is_active = models.BooleanField(default=True, null=True)
     type = models.PositiveIntegerField(
-        choices=dict(zip(API_KEY_TYPES, API_KEY_TYPES)).items(), default=0)
+        choices=dict(zip(API_KEY_TYPES, API_KEY_TYPES, strict=True)).items(), default=0
+    )
     key = models.CharField(max_length=255, db_index=True, unique=True)
     # TODO: use RSA public keys instead? If we were to use JWT RSA keys
     # then we'd only need to store the public key.
@@ -43,13 +52,18 @@ class APIKey(ModelBase):
 
     class Meta:
         db_table = 'api_key'
-        unique_together = (('user', 'is_active'),)
+        indexes = [
+            models.Index(fields=('user',), name='api_key_user_id'),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=('user', 'is_active'), name='user_id'),
+        ]
 
     def __str__(self):
         return (
-            u'<{cls} user={user}, type={type}, key={key} secret=...>'
-            .format(cls=self.__class__.__name__, key=self.key,
-                    type=self.type, user=self.user))
+            f'<{self.__class__.__name__} user={self.user}, type={self.type}, '
+            f'key={self.key} secret=...>'
+        )
 
     @classmethod
     def get_jwt_key(cls, **kwargs):
@@ -67,22 +81,27 @@ class APIKey(ModelBase):
         This method must be run within a db transaction.
         Returns an instance of APIKey.
         """
-        key = cls.get_unique_key('user:{}:'.format(user.pk))
+        key = cls.get_unique_key(f'user:{user.pk}:')
         return cls.objects.create(
-            key=key, secret=cls.generate_secret(32),
-            type=SYMMETRIC_JWT_TYPE, user=user, is_active=True)
+            key=key,
+            secret=cls.generate_secret(32),
+            type=SYMMETRIC_JWT_TYPE,
+            user=user,
+            is_active=True,
+        )
 
     @classmethod
     def get_unique_key(cls, prefix, try_count=1, max_tries=1000):
         if try_count >= max_tries:
             raise RuntimeError(
-                'a unique API key could not be found after {} tries'
-                .format(max_tries))
+                f'a unique API key could not be found after {max_tries} tries'
+            )
 
-        key = '{}{}'.format(prefix, random.randint(0, 999))
+        key = f'{prefix}{random.randint(0, 999)}'
         if cls.objects.filter(key=key).exists():
-            return cls.get_unique_key(prefix, try_count=try_count + 1,
-                                      max_tries=max_tries)
+            return cls.get_unique_key(
+                prefix, try_count=try_count + 1, max_tries=max_tries
+            )
         return key
 
     @staticmethod
@@ -98,6 +117,42 @@ class APIKey(ModelBase):
         """
         if byte_length < 32:  # at least 256 bit
             raise ValueError(
-                '{} is too short; secrets must be longer than 32 bytes'
-                .format(byte_length))
-        return force_text(binascii.b2a_hex(os.urandom(byte_length)))
+                f'{byte_length} is too short; secrets must be longer than 32 bytes'
+            )
+        return force_str(binascii.b2a_hex(os.urandom(byte_length)))
+
+
+class APIKeyConfirmation(ModelBase):
+    user = models.OneToOneField(UserProfile, primary_key=True, on_delete=models.CASCADE)
+    token = models.CharField(max_length=20)
+    confirmed_once = models.BooleanField(default=False)
+
+    @staticmethod
+    def generate_token():
+        """
+        Generate token for API Key Confirmation mechanism.
+
+        Returns a random 20 characters string (using a-z, A-Z, 0-9 characters).
+        """
+        return get_random_string(20)
+
+    def send_confirmation_email(self):
+        context = {
+            'api_key_confirmation_link': (
+                absolutify(reverse('devhub.api_key')) + f'?token={self.token}'
+            ),
+            'domain': settings.DOMAIN,
+        }
+        return send_mail_jinja(
+            gettext('Confirmation for developer API keys'),
+            'devhub/emails/api_key_confirmation.ltxt',
+            context,
+            recipient_list=[self.user.email],
+            countdown=settings.API_KEY_CONFIRMATION_DELAY,
+        )
+
+    def is_token_valid(self, token):
+        """
+        Compare token passed in argument with the one on the instance.
+        """
+        return constant_time_compare(self.token, token)

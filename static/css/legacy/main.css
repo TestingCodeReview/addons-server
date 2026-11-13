@@ -105,7 +105,6 @@ body,
 #title,
 .item h3,
 .section-teaser .addon-view h3 {
-    font-family: "helvetica neue", arial, helvetica, sans-serif;
     font-style: normal;
 }
 
@@ -116,12 +115,11 @@ h3,
 .highlight h3,
 .stats strong,
 h4.step {
-    font-family: georgia, serif;
     font-style: italic;
 }
 
 pre, code, kbd, tt, samp, tt {
-    font-family: "andale mono", monospace;
+    font-family: monospace;
 }
 
 /* @end */
@@ -328,11 +326,6 @@ input, textarea, select, button {
     font-size: 1em;
     line-height: inherit;
 }
-
-select {
-    background-color: #fff; /* fixes bug in Opera which inherits bgcolor from container */
-}
-
 
 button {
     overflow: visible;
@@ -649,7 +642,6 @@ a:hover.button,
 a:focus.button,
 a:active.button,
 button,input[type=submit],input[type=button] {
-    font-family:helvetica, arial, sans-serif;
     text-decoration:none;
     white-space:nowrap;
 }
@@ -942,7 +934,7 @@ form.favorite {
     max-width: 90em;
     min-width: 960px;
     position: relative;
-    min-height: 55em;
+    min-height: 768px; /* arbitrary high number to force the footer down */
 }
 
 /* @group Header */
@@ -2296,14 +2288,6 @@ ol.pagination + .num-results {
 
 .separated-listing .item .downloads {
     margin: 0;
-}
-
-.separated-listing .item .persona-inner {
-    padding: 0;
-}
-
-.separated-listing .item .persona-large .persona-preview [data-browsertheme] {
-    height: 72px;
 }
 
 .separated-listing blockquote {

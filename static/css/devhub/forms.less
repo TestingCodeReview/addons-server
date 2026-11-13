@@ -25,9 +25,9 @@
         th {
             color: #888;
             font-size: 11px;
-            padding: 0 0 5px;
+            padding: 8px 20px 8px 0;
             vertical-align: top;
-            width: 130px;
+            width: 140px;
             &.version-delete {
                 text-align: right;
                 width: 35px;
@@ -148,7 +148,8 @@ p.addon-submit-distribute {
 
     #addon-categories-edit #id_category {
         column-count: 2;
-        li label {
+
+        >*>label {
             font-weight: normal;
         }
     }
@@ -169,7 +170,7 @@ p.addon-submit-distribute {
         }
     }
 
-    #persona-license {
+    #theme-license {
         background-color: darken(#FCFDFE, 10%);
         border-radius: 5px;
         padding: 1em;
@@ -193,11 +194,12 @@ p.addon-submit-distribute {
     }
 }
 
-#submit-describe #addon-categories-edit label + ul {
-  column-count: 2;
-  li label {
-    font-weight: normal;
-  }
+#submit-describe #addon-categories-edit label+* {
+    column-count: 2;
+
+    >*>label {
+        font-weight: normal;
+    }
 }
 
 span.tip:hover,
@@ -273,8 +275,74 @@ a.remove:hover {
     }
 }
 
+.primary > header.support-header h2 {
+    margin-bottom: 8px;
+}
+
+.support-form {
+    div {
+        margin-bottom: 20px;
+
+        &:last-of-type {
+            margin-bottom: 0;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+        }
+    }
+
+    input[type="text"],
+    select,
+    textarea {
+        box-sizing: border-box;
+        width: 100%;
+    }
+
+    .action-group {
+        display: flex;
+        justify-content: flex-end;
+    }
+}
+
 .full-width {
     box-sizing: border-box;
     display: block;
     width: 100%;
+}
+
+#other-versions-header {
+    display:flex;
+    justify-content: space-between;
+
+    .version-buttons {
+        display: flex;
+        gap: 1em;
+    }
+
+    .button.version-rollback {
+        background-color: white;
+        color: #5784bf;
+        border-color: #5784bf;
+        border-style: solid;
+        border-width: 1px;
+    }
+}
+
+#modal-rollback-version {
+    td {
+        width: 15em;
+        padding-bottom: 1em;
+
+        > * {
+            box-sizing: border-box;
+            width: 100%;
+        }
+    }
+
+    .close {
+        margin: 2em;
+        font-weight: bolder;
+    }
 }

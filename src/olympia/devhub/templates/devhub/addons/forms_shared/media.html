@@ -28,6 +28,7 @@
             </label>
             {% endif %}
             {% if editable %}
+              {{ main_form.icon_upload_hash.errors }}
               <div id="icon_preview">
                 <div class="icon_preview" id="icon_preview_32">
                   <img src="{{ addon.get_icon_url(32) }}" alt="">
@@ -36,8 +37,7 @@
                   {# L10n: The size of the icon #}
                   {{ _('32x32px') }}
                   {{ tip(None,
-                         _("Used in listings of add-ons, like search results "
-                           "and featured add-ons.")) }}
+                         _("Used in listings of add-ons, like search results.")) }}
                 </div>
 
                 <div class="icon_preview" id="icon_preview_64">
@@ -59,16 +59,17 @@
                 </div>
               </div>
               <ul id="icons_default">
-                {{ form.icon_type }}
+                {{ main_form.icon_type }}
               </ul>
               <div class="invisible-upload">
                 <a class="button" href="#">{{ _('Upload a Custom Icon...') }}</a>
                 <input type="file" id="id_icon_upload" name="icon_upload"
+                       accept="{{ supported_image_types }}"
                        data-allowed-types="{{ supported_image_types }}"
                        data-upload-url="{{ url('devhub.addons.upload_icon', addon.slug) }}">
               </div>
               <div class="js-hidden">
-                {{ form.icon_upload_hash }}
+                {{ main_form.icon_upload_hash }}
               </div>
               <div class="edit-media-details">
                 {{ _('PNG and JPG supported.') }}
@@ -77,9 +78,6 @@
                 {% endif %}
                 {{ _('Icons will be resized to 128x128 pixels if larger.') }}
               </div>
-              <ul class="errorlist">
-                <li id="edit-icon-error"></li>
-              </ul>
             {% else %}
               <div id="icon_preview_readonly">
                   <img src="{{ addon.get_icon_url(128) }}" alt="">
@@ -111,6 +109,7 @@
                 {{ preview_form.non_form_errors() }}
                 <div id="file-list">
                   {% for form in preview_form.forms %}
+                    {{ form.errors }}
                     <div class="preview">
                       <span class="handle">&nbsp;</span>
                       {% if form.instance.id %}
@@ -134,13 +133,13 @@
                       <div class="preview_extra">
                         {{ form.upload_hash }}
                       </div>
-                      {{ form.errors }}
                     </div>
                   {% endfor %}
                 </div>
                 <div class="invisible-upload">
                   <a class="button" href="#">{{ _('Add a Screenshot...') }}</a>
                   <input type="file" id="screenshot_upload" name="uploads" multiple
+                         accept="{{ supported_image_types }}"
                          data-allowed-types="{{ supported_image_types }}"
                          data-upload-url="{{ url('devhub.addons.upload_preview', addon.slug) }}">
 
@@ -155,7 +154,7 @@
                   {% endif %}
                   {% trans %}
                     Having screenshots in your product page greatly increases its chances of
-                    being installed and being featured in the homepage.
+                    being installed.
                   {% endtrans %}
                 </div>
               {% endif %}

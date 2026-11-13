@@ -1,109 +1,278 @@
-# -*- coding: utf-8 -*-
-import json
 import os
 import shutil
+import tempfile
+import uuid
+from datetime import datetime, timedelta
+from unittest import mock
 
 from django.conf import settings
 from django.core.files.storage import default_storage as storage
 from django.utils import translation
 
-import mock
 import pytest
-import six
-
-from PIL import Image
+import time_machine
+from pyquery import PyQuery as pq
 from waffle.testutils import override_switch
 
-from olympia import amo
-from olympia.addons.forms import EditThemeForm, EditThemeOwnerForm, ThemeForm
-from olympia.addons.models import Addon, Category, Persona
-from olympia.amo.templatetags.jinja_helpers import user_media_path
-from olympia.amo.tests import TestCase, req_factory_factory
+from olympia import amo, core
+from olympia.addons.models import Addon
+from olympia.addons.views import AddonViewSet
+from olympia.amo.tests import (
+    TestCase,
+    addon_factory,
+    get_random_ip,
+    req_factory_factory,
+    user_factory,
+    version_factory,
+)
 from olympia.amo.tests.test_helpers import get_image_path
-from olympia.amo.urlresolvers import reverse
+from olympia.amo.utils import rm_local_tmp_dir
+from olympia.api.models import APIKey, APIKeyConfirmation
 from olympia.applications.models import AppVersion
 from olympia.devhub import forms
 from olympia.files.models import FileUpload
-from olympia.reviewers.models import RereviewQueueTheme
-from olympia.tags.models import Tag
-from olympia.users.models import UserProfile
-from olympia.versions.models import License
+from olympia.tags.models import AddonTag, Tag
+from olympia.versions.models import ApplicationsVersions
 
 
 class TestNewUploadForm(TestCase):
-
     def test_firefox_default_selected(self):
-        upload = FileUpload.objects.create(valid=False)
-        form = forms.NewUploadForm(
-            {'upload': upload.uuid}, request=mock.Mock())
+        user = user_factory()
+        upload = FileUpload.objects.create(
+            valid=False,
+            name='foo.xpi',
+            user=user,
+            source=amo.UPLOAD_SOURCE_DEVHUB,
+            ip_address='127.0.0.64',
+            channel=amo.CHANNEL_LISTED,
+        )
+        data = {'upload': upload.uuid}
+        request = req_factory_factory('/', post=True, data=data)
+        request.user = user
+        form = forms.NewUploadForm(data, request=request)
         assert form.fields['compatible_apps'].initial == [amo.FIREFOX.id]
+
+    def test_previous_compatible_apps_initially_selected(self):
+        addon = addon_factory()
+        user = user_factory()
+        appversion = AppVersion.objects.create(
+            application=amo.ANDROID.id, version='1.0'
+        )
+        ApplicationsVersions.objects.create(
+            version=addon.current_version,
+            application=amo.ANDROID.id,
+            min=appversion,
+            max=appversion,
+        )
+
+        upload = FileUpload.objects.create(
+            valid=False,
+            name='foo.xpi',
+            user=user,
+            source=amo.UPLOAD_SOURCE_DEVHUB,
+            ip_address='127.0.0.64',
+            channel=amo.CHANNEL_LISTED,
+        )
+        data = {'upload': upload.uuid}
+        request = req_factory_factory('/', post=True, data=data)
+        request.user = user
+
+        # Without an add-on, we only pre-select the default which is Firefox
+        form = forms.NewUploadForm(data, request=request)
+        assert form.fields['compatible_apps'].initial == [amo.FIREFOX.id]
+
+        # with an add-on provided we pre-select the applications based on the
+        # current version
+        form = forms.NewUploadForm(data, request=request, addon=addon)
+        assert form.fields['compatible_apps'].initial == [
+            amo.FIREFOX.id,
+            amo.ANDROID.id,
+        ]
 
     def test_compat_apps_widget_custom_label_class_rendered(self):
         """We are setting a custom class at the label
         of the compatibility apps multi-select to correctly render
         images.
         """
-        upload = FileUpload.objects.create(valid=False)
-        form = forms.NewUploadForm(
-            {'upload': upload.uuid}, request=mock.Mock())
+        user = user_factory()
+        upload = FileUpload.objects.create(
+            valid=False,
+            name='foo.xpi',
+            user=user,
+            source=amo.UPLOAD_SOURCE_DEVHUB,
+            ip_address='127.0.0.64',
+            channel=amo.CHANNEL_LISTED,
+        )
+        data = {'upload': upload.uuid}
+        request = req_factory_factory('/', post=True, data=data)
+        request.user = user
+        form = forms.NewUploadForm(data, request=request)
         result = form.fields['compatible_apps'].widget.render(
-            name='compatible_apps', value=amo.FIREFOX.id)
+            name='compatible_apps', value=amo.FIREFOX.id
+        )
         assert 'class="app firefox"' in result
 
         result = form.fields['compatible_apps'].widget.render(
-            name='compatible_apps', value=amo.ANDROID.id)
+            name='compatible_apps', value=amo.ANDROID.id
+        )
         assert 'class="app android"' in result
 
-    def test_only_valid_uploads(self):
-        upload = FileUpload.objects.create(valid=False)
-        form = forms.NewUploadForm(
-            {'upload': upload.uuid, 'compatible_apps': [amo.FIREFOX.id]},
-            request=mock.Mock())
-        assert ('There was an error with your upload. Please try again.' in
-                form.errors.get('__all__')), form.errors
+    @mock.patch('olympia.devhub.forms.parse_addon')
+    def test_only_valid_uploads(self, parse_addon_mock):
+        user = user_factory()
+        upload = FileUpload.objects.create(
+            valid=False,
+            name='foo.xpi',
+            user=user,
+            source=amo.UPLOAD_SOURCE_DEVHUB,
+            ip_address='127.0.0.64',
+            channel=amo.CHANNEL_LISTED,
+        )
+        upload = FileUpload.objects.create(
+            valid=False,
+            name='foo.xpi',
+            user=user,
+            source=amo.UPLOAD_SOURCE_DEVHUB,
+            ip_address='127.0.0.64',
+            channel=amo.CHANNEL_LISTED,
+        )
+        data = {'upload': upload.uuid, 'compatible_apps': [amo.FIREFOX.id]}
+        request = req_factory_factory('/', post=True, data=data)
+        request.user = user
+        form = forms.NewUploadForm(data, request=request)
+        assert (
+            'There was an error with your upload. Please try again.'
+            in form.errors.get('__all__')
+        ), form.errors
 
         # Admin override makes the form ignore the brokenness
-        with mock.patch('olympia.access.acl.action_allowed_user') as acl:
+        with mock.patch('olympia.access.acl.action_allowed_for') as acl:
             # For the 'Addons:Edit' permission check.
             acl.return_value = True
-            form = forms.NewUploadForm(
-                {'upload': upload.uuid, 'compatible_apps': [amo.FIREFOX.id],
-                    'admin_override_validation': True},
-                request=mock.Mock())
-            assert ('There was an error with your upload. Please try' not in
-                    form.errors.get('__all__')), form.errors
+            data['admin_override_validation'] = True
+            form = forms.NewUploadForm(data, request=request)
+            assert form.is_valid()
+
+            # Regular users can't override
+            acl.return_value = False
+            form = forms.NewUploadForm(data, request=request)
+            assert (
+                'There was an error with your upload. Please try again.'
+                in form.errors.get('__all__')
+            ), form.errors
 
         upload.validation = '{"errors": 0}'
         upload.save()
         addon = Addon.objects.create()
-        form = forms.NewUploadForm(
-            {'upload': upload.uuid, 'compatible_apps': [amo.FIREFOX.id]},
-            addon=addon, request=mock.Mock())
-        assert ('There was an error with your upload. Please try again.' not in
-                form.errors.get('__all__')), form.errors
+        data.pop('admin_override_validation')
+        form = forms.NewUploadForm(data, request=request, addon=addon)
+        assert form.is_valid()
 
-    # Those three patches are so files.utils.parse_addon doesn't fail on a
+    @mock.patch('olympia.devhub.forms.parse_addon')
+    def test_valid_upload_from_different_user(self, parse_addon_mock):
+        upload = FileUpload.objects.create(
+            valid=True,
+            name='foo.xpi',
+            user=user_factory(),
+            source=amo.UPLOAD_SOURCE_DEVHUB,
+            ip_address='127.0.0.64',
+            channel=amo.CHANNEL_LISTED,
+        )
+        data = {'upload': upload.uuid, 'compatible_apps': [amo.FIREFOX.id]}
+        request = req_factory_factory('/', post=True, data=data)
+        request.user = user_factory()
+        form = forms.NewUploadForm(data, request=request)
+        assert not form.is_valid()
+        assert (
+            'There was an error with your upload. Please try again.'
+            in form.errors.get('__all__')
+        ), form.errors
+
+        # Admin override can bypass
+        with mock.patch('olympia.access.acl.action_allowed_for') as acl:
+            # For the 'Addons:Edit' permission check.
+            acl.return_value = True
+            data['admin_override_validation'] = True
+            form = forms.NewUploadForm(data, request=request)
+            assert form.is_valid()
+
+            # Regular users can't override
+            acl.return_value = False
+            form = forms.NewUploadForm(data, request=request)
+            assert not form.is_valid()
+            assert (
+                'There was an error with your upload. Please try again.'
+                in form.errors.get('__all__')
+            ), form.errors
+
+    @mock.patch('olympia.devhub.forms.parse_addon')
+    def test_throttling(self, parse_addon_mock):
+        user = user_factory()
+        upload = FileUpload.objects.create(
+            valid=True,
+            name='foo.xpi',
+            user=user,
+            source=amo.UPLOAD_SOURCE_DEVHUB,
+            ip_address='127.0.0.64',
+            channel=amo.CHANNEL_LISTED,
+        )
+        data = {'upload': upload.uuid, 'compatible_apps': [amo.FIREFOX.id]}
+        request = req_factory_factory('/', post=True, data=data)
+        request.user = user
+        request.META['REMOTE_ADDR'] = '5.6.7.8'
+        with time_machine.travel('2019-04-08 15:16:23.42', tick=False) as frozen_time:
+            for _x in range(6):
+                self._add_fake_throttling_action(
+                    view_class=AddonViewSet,
+                    url='/',
+                    user=request.user,
+                    remote_addr=get_random_ip(),
+                )
+
+            form = forms.NewUploadForm(data, request=request)
+            assert not form.is_valid()
+            assert form.errors.get('__all__') == [
+                'You have submitted too many uploads recently. '
+                'Please try again after some time.'
+            ]
+
+            frozen_time.shift(delta=timedelta(seconds=61))
+            form = forms.NewUploadForm(data, request=request)
+            assert form.is_valid()
+
+    # Those five patches are so files.utils.parse_addon doesn't fail on a
     # non-existent file even before having a chance to call check_xpi_info.
-    @mock.patch('olympia.files.utils.Extractor.parse')
+    @mock.patch('olympia.files.utils.ManifestJSONExtractor')
+    @mock.patch('olympia.files.utils.SafeZip', lambda zip: mock.Mock())
+    @mock.patch('olympia.files.utils.SigningCertificateInformation', lambda cert: None)
     @mock.patch('olympia.files.utils.extract_xpi', lambda xpi, path: None)
     @mock.patch('olympia.files.utils.get_file', lambda xpi: None)
     # This is the one we want to test.
     @mock.patch('olympia.files.utils.check_xpi_info')
-    def test_check_xpi_called(self, mock_check_xpi_info, mock_parse):
+    def test_check_xpi_called(self, mock_check_xpi_info, manifest_extractor_parse):
         """Make sure the check_xpi_info helper is called.
 
         There's some important checks made in check_xpi_info, if we ever
         refactor the form to not call it anymore, we need to make sure those
         checks are run at some point.
         """
-        mock_parse.return_value = None
-        mock_check_xpi_info.return_value = {'name': 'foo', 'type': 2}
-        upload = FileUpload.objects.create(valid=True, name='foo.xpi')
-        addon = Addon.objects.create()
-        form = forms.NewUploadForm(
-            {'upload': upload.uuid, 'compatible_apps': [amo.FIREFOX.id]},
-            addon=addon, request=mock.Mock())
-        form.clean()
+        user = user_factory()
+        manifest_extractor_parse.parse.return_value = None
+        mock_check_xpi_info.return_value = {'name': 'foo', 'type': amo.ADDON_EXTENSION}
+        upload = FileUpload.objects.create(
+            valid=True,
+            name='foo.xpi',
+            user=user,
+            source=amo.UPLOAD_SOURCE_DEVHUB,
+            ip_address='127.0.0.64',
+            channel=amo.CHANNEL_LISTED,
+        )
+        addon = Addon.objects.create(type=amo.ADDON_EXTENSION)
+        data = {'upload': upload.uuid, 'compatible_apps': [amo.FIREFOX.id]}
+        request = req_factory_factory('/', post=True, data=data)
+        request.user = user
+        form = forms.NewUploadForm(data, addon=addon, request=request)
+        assert form.is_valid(), form.errors
         assert mock_check_xpi_info.called
 
 
@@ -111,24 +280,39 @@ class TestCompatForm(TestCase):
     fixtures = ['base/addon_3615']
 
     def setUp(self):
-        super(TestCompatForm, self).setUp()
-        AppVersion.objects.create(
-            application=amo.ANDROID.id, version='50.0')
-        AppVersion.objects.create(
-            application=amo.ANDROID.id, version='56.0')
-        AppVersion.objects.create(
-            application=amo.FIREFOX.id, version='56.0')
-        AppVersion.objects.create(
-            application=amo.FIREFOX.id, version='56.*')
-        AppVersion.objects.create(
-            application=amo.FIREFOX.id, version='57.0')
-        AppVersion.objects.create(
-            application=amo.FIREFOX.id, version='57.*')
+        super().setUp()
+        # Add useful AppVersions for testing. Note that some might already
+        # exist in the database because of data migrations or fixtures.
+        for version in ('56.0', '56.*', '57.0', '57.*', '*'):
+            AppVersion.objects.get_or_create(
+                application=amo.FIREFOX.id, version=version
+            )
+        for version in (
+            '48.0',
+            '50.0',
+            '56.0',
+            '68.*',
+            '79.0a1',
+            '79.0',
+            '79.*',
+            '113.0',
+            '119.0a1',
+            '119.0',
+            '120.0a1',
+            '120.0',
+            '121.0a1',
+            '121.0',
+            '*',
+        ):
+            AppVersion.objects.get_or_create(
+                application=amo.ANDROID.id, version=version
+            )
 
     def test_forms(self):
         version = Addon.objects.get(id=3615).current_version
-        formset = forms.CompatFormSet(None, queryset=version.apps.all(),
-                                      form_kwargs={'version': version})
+        formset = forms.CompatFormSet(
+            None, queryset=version.apps.all(), form_kwargs={'version': version}
+        )
         apps = [form.app for form in formset.forms]
         assert set(apps) == set(amo.APP_USAGE)
 
@@ -136,8 +320,9 @@ class TestCompatForm(TestCase):
         version = Addon.objects.get(id=3615).current_version
         current_min = version.apps.filter(application=amo.FIREFOX.id).get().min
         current_max = version.apps.filter(application=amo.FIREFOX.id).get().max
-        formset = forms.CompatFormSet(None, queryset=version.apps.all(),
-                                      form_kwargs={'version': version})
+        formset = forms.CompatFormSet(
+            None, queryset=version.apps.all(), form_kwargs={'version': version}
+        )
         form = formset.forms[0]
         assert form.app == amo.FIREFOX
         assert form.initial['application'] == amo.FIREFOX.id
@@ -145,106 +330,202 @@ class TestCompatForm(TestCase):
         assert form.initial['max'] == current_max.pk
 
     def _test_form_choices_expect_all_versions(self, version):
-        expected_min_choices = [(u'', u'---------')] + list(
-            AppVersion.objects.filter(application=amo.FIREFOX.id)
-                              .exclude(version__contains='*')
-                              .values_list('pk', 'version')
-                              .order_by('version_int'))
-        expected_max_choices = [(u'', u'---------')] + list(
-            AppVersion.objects.filter(application=amo.FIREFOX.id)
-                              .values_list('pk', 'version')
-                              .order_by('version_int'))
+        expected_min_choices = [('', '---------')] + [
+            (obj.pk, obj)
+            for obj in AppVersion.objects.filter(application=amo.FIREFOX.id)
+            .exclude(version__contains='*')
+            .order_by('version_int')
+        ]
+        expected_max_choices = [('', '---------')] + [
+            (obj.pk, obj)
+            for obj in AppVersion.objects.filter(application=amo.FIREFOX.id).order_by(
+                'version_int'
+            )
+        ]
 
-        formset = forms.CompatFormSet(None, queryset=version.apps.all(),
-                                      form_kwargs={'version': version})
+        formset = forms.CompatFormSet(
+            None, queryset=version.apps.all(), form_kwargs={'version': version}
+        )
         form = formset.forms[0]
         assert form.app == amo.FIREFOX
-        assert list(form.fields['min'].choices) == expected_min_choices
-        assert list(form.fields['max'].choices) == expected_max_choices
+
+        # The choices are wrapped in ModelChoiceIterator which itself wraps the
+        # values in ModelChoiceIteratorValue - except that first empty choice.
+        assert [
+            (getattr(choice[0], 'value', choice[0]), choice[1])
+            for choice in form.fields['min'].choices
+        ] == expected_min_choices
+        assert [
+            (getattr(choice[0], 'value', choice[0]), choice[1])
+            for choice in form.fields['max'].choices
+        ] == expected_max_choices
 
     def test_form_choices(self):
         version = Addon.objects.get(id=3615).current_version
-        version.files.all().update(is_webextension=True)
-        del version.all_files
         self._test_form_choices_expect_all_versions(version)
 
     def test_form_choices_no_compat(self):
         version = Addon.objects.get(id=3615).current_version
-        version.files.all().update(is_webextension=False)
         version.addon.update(type=amo.ADDON_DICT)
-        del version.all_files
         self._test_form_choices_expect_all_versions(version)
 
     def test_form_choices_language_pack(self):
         version = Addon.objects.get(id=3615).current_version
-        version.files.all().update(is_webextension=False)
         version.addon.update(type=amo.ADDON_LPAPP)
-        del version.all_files
-        self._test_form_choices_expect_all_versions(version)
-
-    def test_form_choices_legacy(self):
-        version = Addon.objects.get(id=3615).current_version
-        version.files.all().update(is_webextension=False)
-        del version.all_files
-
-        firefox_57 = AppVersion.objects.get(
-            application=amo.FIREFOX.id, version='57.0')
-        firefox_57_s = AppVersion.objects.get(
-            application=amo.FIREFOX.id, version='57.*')
-
-        expected_min_choices = [(u'', u'---------')] + list(
-            AppVersion.objects.filter(application=amo.FIREFOX.id)
-                              .exclude(version__contains='*')
-                              .exclude(pk__in=(firefox_57.pk, firefox_57_s.pk))
-                              .values_list('pk', 'version')
-                              .order_by('version_int'))
-        expected_max_choices = [(u'', u'---------')] + list(
-            AppVersion.objects.filter(application=amo.FIREFOX.id)
-                              .exclude(pk__in=(firefox_57.pk, firefox_57_s.pk))
-                              .values_list('pk', 'version')
-                              .order_by('version_int'))
-
-        formset = forms.CompatFormSet(None, queryset=version.apps.all(),
-                                      form_kwargs={'version': version})
-        form = formset.forms[0]
-        assert form.app == amo.FIREFOX
-        assert list(form.fields['min'].choices) == expected_min_choices
-        assert list(form.fields['max'].choices) == expected_max_choices
-
-        expected_an_choices = [(u'', u'---------')] + list(
-            AppVersion.objects.filter(application=amo.ANDROID.id)
-            .values_list('pk', 'version').order_by('version_int'))
-        form = formset.forms[1]
-        assert form.app == amo.ANDROID
-        assert list(form.fields['min'].choices) == expected_an_choices
-        assert list(form.fields['max'].choices) == expected_an_choices
-
-    def test_form_choices_mozilla_signed_legacy(self):
-        version = Addon.objects.get(id=3615).current_version
-        version.files.all().update(
-            is_webextension=False,
-            is_mozilla_signed_extension=True)
-        del version.all_files
         self._test_form_choices_expect_all_versions(version)
 
     def test_static_theme(self):
         version = Addon.objects.get(id=3615).current_version
-        version.files.all().update(is_webextension=True)
         version.addon.update(type=amo.ADDON_STATICTHEME)
-        del version.all_files
         self._test_form_choices_expect_all_versions(version)
 
-        formset = forms.CompatFormSet(None, queryset=version.apps.all(),
-                                      form_kwargs={'version': version})
+        formset = forms.CompatFormSet(
+            None, queryset=version.apps.all(), form_kwargs={'version': version}
+        )
         assert formset.can_delete is False  # No deleting Firefox app plz.
         assert formset.extra == 0  # And lets not extra apps be added.
+
+    def test_fenix_range_disabled_range_for_regular_extensions(self):
+        version = Addon.objects.get(id=3615).current_version
+        data = None
+        formset = forms.CompatFormSet(
+            data, queryset=version.apps.all(), form_kwargs={'version': version}
+        )
+        content = formset.render()
+        doc = pq(content)
+        assert doc('#id_form-1-application')[0].attrib['value'] == str(amo.ANDROID.id)
+        # Versions inside the forbidden Fenix range are disabled for regular
+        # extensions.
+        assert len(doc('#id_form-1-min option')) == 13
+        assert len(doc('#id_form-1-max option')) == 16
+        assert [x.text for x in doc('#id_form-1-min option[disabled=disabled]')] == [
+            '79.0a1',
+            '79.0',
+            '113.0',
+            '119.0a1',
+            '119.0',
+            '120.0a1',
+        ]
+        assert [x.text for x in doc('#id_form-1-max option[disabled=disabled]')] == [
+            '79.0a1',
+            '79.0',
+            '79.*',
+            '113.0',
+            '119.0a1',
+            '119.0',
+            '120.0a1',
+        ]
+        data = {
+            'form-TOTAL_FORMS': 2,
+            'form-INITIAL_FORMS': 1,
+            'form-MIN_NUM_FORMS': 0,
+            'form-MAX_NUM_FORMS': 1000,
+            'form-0-min': version.apps.all()[0].min.pk,
+            'form-0-max': version.apps.all()[0].max.pk,
+            'form-0-application': amo.FIREFOX.id,
+            'form-0-id': version.apps.all()[0].pk,
+            'form-1-min': AppVersion.objects.filter(application=amo.ANDROID.id).get(
+                version='48.0'
+            ),
+            'form-1-max': AppVersion.objects.filter(application=amo.ANDROID.id).get(
+                version='120.0'
+            ),
+            'form-1-application': amo.ANDROID.id,
+            'form-1-id': '',
+        }
+        # Range is validated at submission (even if we somehow pass disabled
+        # options).
+        formset = forms.CompatFormSet(
+            data, queryset=version.apps.all(), form_kwargs={'version': version}
+        )
+        assert not formset.is_valid()
+        assert formset.errors == [
+            {},
+            {
+                '__all__': [
+                    'Invalid version range. For Firefox for Android, you may only pick '
+                    'a range that starts with version 120.0 or higher, or ends with '
+                    'lower than version 79.0a1.'
+                ]
+            },
+        ]
+        # That range is valid because it's entirely below Fenix.
+        data['form-1-max'] = AppVersion.objects.get(
+            application=amo.ANDROID.id, version='68.*'
+        )
+        formset = forms.CompatFormSet(
+            data, queryset=version.apps.all(), form_kwargs={'version': version}
+        )
+        assert formset.is_valid()
+
+        # That range is valid because it's entirely above Fenix GA
+        data['form-1-min'] = AppVersion.objects.get(
+            application=amo.ANDROID.id, version='121.0a1'
+        )
+        data['form-1-max'] = AppVersion.objects.get(
+            application=amo.ANDROID.id, version='*'
+        )
+        formset = forms.CompatFormSet(
+            data, queryset=version.apps.all(), form_kwargs={'version': version}
+        )
+        assert formset.is_valid()
+
+    def test_fenix_range_not_disabled_for_recommended_android_extensions(self):
+        self.addon = Addon.objects.get(id=3615)
+        version = self.addon.current_version
+        ApplicationsVersions.objects.create(
+            version=version,
+            application=amo.ANDROID.id,
+            min=AppVersion.objects.get(application=amo.ANDROID.id, version='48.0'),
+            max=AppVersion.objects.get(application=amo.ANDROID.id, version='*'),
+        )
+        self.make_addon_promoted(
+            addon=self.addon,
+            api_name='all_fenix_versions',
+            can_be_compatible_with_all_fenix_versions=True,
+            approve_version=True,
+        )
+        del self.addon.publicly_promoted_groups  # Reset property
+        data = None
+        formset = forms.CompatFormSet(
+            data, queryset=version.apps.all(), form_kwargs={'version': version}
+        )
+        content = formset.render()
+        doc = pq(content)
+        assert doc('#id_form-1-application')[0].attrib['value'] == str(amo.ANDROID.id)
+        assert len(doc('#id_form-1-min option')) == 13
+        assert len(doc('#id_form-1-max option')) == 16
+        assert [x.text for x in doc('#id_form-1-min option[disabled=disabled]')] == []
+        assert [x.text for x in doc('#id_form-1-max option[disabled=disabled]')] == []
+        data = {
+            'form-TOTAL_FORMS': 2,
+            'form-INITIAL_FORMS': 1,
+            'form-MIN_NUM_FORMS': 0,
+            'form-MAX_NUM_FORMS': 1000,
+            'form-0-min': version.apps.all()[0].min.pk,
+            'form-0-max': version.apps.all()[0].max.pk,
+            'form-0-application': amo.FIREFOX.id,
+            'form-0-id': version.apps.all()[0].pk,
+            'form-1-min': AppVersion.objects.filter(application=amo.ANDROID.id).get(
+                version='48.0'
+            ),
+            'form-1-max': AppVersion.objects.filter(application=amo.ANDROID.id).get(
+                version='121.0a1'
+            ),
+            'form-1-application': amo.ANDROID.id,
+            'form-1-id': '',
+        }
+        formset = forms.CompatFormSet(
+            data, queryset=version.apps.all(), form_kwargs={'version': version}
+        )
+        assert formset.is_valid()
 
 
 class TestPreviewForm(TestCase):
     fixtures = ['base/addon_3615']
 
     def setUp(self):
-        super(TestPreviewForm, self).setUp()
+        super().setUp()
         self.dest = os.path.join(settings.TMP_PATH, 'preview')
         if not os.path.exists(self.dest):
             os.makedirs(self.dest)
@@ -253,492 +534,94 @@ class TestPreviewForm(TestCase):
     def test_preview_modified(self, update_mock):
         addon = Addon.objects.get(pk=3615)
         name = 'transparent.png'
-        form = forms.PreviewForm({'caption': 'test', 'upload_hash': name,
-                                  'position': 1})
-        with storage.open(os.path.join(self.dest, name), 'w') as f:
-            shutil.copyfileobj(open(get_image_path(name)), f)
+        upload_hash = uuid.uuid4().hex
+        form = forms.PreviewForm(
+            {'caption': 'test', 'upload_hash': upload_hash, 'position': 1}
+        )
+        with (
+            storage.open(os.path.join(self.dest, upload_hash), 'wb') as f,
+            open(get_image_path(name), 'rb') as copy_src,
+        ):
+            shutil.copyfileobj(copy_src, f)
         assert form.is_valid()
         form.save(addon)
         assert update_mock.called
+
+    def test_preview_invalid_hash(self):
+        form = forms.PreviewForm(
+            {'caption': 'test', 'upload_hash': 'something.png', 'position': 1}
+        )
+        assert not form.is_valid()
+        assert form.errors == {
+            'upload_hash': ['There was an error uploading your image.']
+        }
+
+    def test_caption_too_long(self):
+        form = forms.PreviewForm(
+            {'caption': 'û' * 281, 'upload_hash': uuid.uuid4().hex, 'position': 1}
+        )
+        assert form.fields['caption'].max_length == 280
+        assert form.fields['caption'].widget.attrs['maxlength'] == '280'
+        assert not form.is_valid()
+        assert form.errors == {
+            'caption': ['Ensure this value has at most 280 characters (it has 281).']
+        }
+
+    def test_preview_transparency(self):
+        addon = Addon.objects.get(pk=3615)
+        name = 'transparent-cotton'
+        upload_hash = uuid.uuid4().hex
+        form = forms.PreviewForm(
+            {'caption': 'test', 'upload_hash': upload_hash, 'position': 1}
+        )
+        with (
+            storage.open(os.path.join(self.dest, upload_hash), 'wb') as f,
+            open(get_image_path(name + '.png'), 'rb') as copy_src,
+        ):
+            shutil.copyfileobj(copy_src, f)
+        assert form.is_valid()
+        form.save(addon)
+        preview = addon.previews.all()[0]
+        assert os.path.exists(preview.thumbnail_path)
+        with (
+            storage.open(preview.thumbnail_path, 'rb') as thumb_file,
+            open(get_image_path(name + '.jpg'), 'rb') as sample_file,
+        ):
+            assert thumb_file.read() == sample_file.read()
 
     @mock.patch('olympia.amo.utils.pngcrush_image')
     def test_preview_size(self, pngcrush_image_mock):
         addon = Addon.objects.get(pk=3615)
         name = 'teamaddons.jpg'
-        form = forms.PreviewForm({'caption': 'test', 'upload_hash': name,
-                                  'position': 1})
-        with storage.open(os.path.join(self.dest, name), 'w') as f:
-            shutil.copyfileobj(open(get_image_path(name)), f)
+        upload_hash = uuid.uuid4().hex
+        form = forms.PreviewForm(
+            {'caption': 'test', 'upload_hash': upload_hash, 'position': 1}
+        )
+        with (
+            storage.open(os.path.join(self.dest, upload_hash), 'wb') as f,
+            open(get_image_path(name), 'rb') as copy_src,
+        ):
+            shutil.copyfileobj(copy_src, f)
         assert form.is_valid()
         form.save(addon)
         preview = addon.previews.all()[0]
         assert preview.sizes == (
-            {u'image': [2400, 1600], u'thumbnail': [640, 427],
-             u'original': [3000, 2000]})
+            {
+                'image': [2400, 1600],
+                'thumbnail': [533, 355],
+                'original': [3000, 2000],
+                'thumbnail_format': 'jpg',
+            }
+        )
         assert os.path.exists(preview.image_path)
         assert os.path.exists(preview.thumbnail_path)
         assert os.path.exists(preview.original_path)
 
-        assert pngcrush_image_mock.call_count == 2
-        assert pngcrush_image_mock.call_args_list[0][0][0] == (
-            preview.thumbnail_path)
-        assert pngcrush_image_mock.call_args_list[1][0][0] == (
-            preview.image_path)
-
-
-class TestThemeForm(TestCase):
-    fixtures = ['base/user_2519']
-
-    def setUp(self):
-        super(TestThemeForm, self).setUp()
-        self.populate()
-        self.request = mock.Mock()
-        self.request.user = mock.Mock()
-        self.request.user.groups_list = []
-        self.request.user.is_authenticated = True
-
-    def populate(self):
-        self.cat = Category.objects.create(
-            application=amo.FIREFOX.id, type=amo.ADDON_PERSONA)
-        License.objects.create(id=amo.LICENSE_CC_BY.id)
-
-    def get_dict(self, **kw):
-        data = {
-            'name': 'new name',
-            'slug': 'special-slug',
-            'category': self.cat.id,
-            'accentcolor': '#003366',
-            'textcolor': '#C0FFEE',
-            'description': 'new description',
-            'tags': 'tag1, tag2, tag3',
-            'license': amo.LICENSE_CC_BY.id,
-            'agreed': True,
-            'header_hash': 'b4ll1n'
-        }
-        data.update(**kw)
-        return data
-
-    def post(self, **kw):
-        self.form = ThemeForm(self.get_dict(**kw), request=self.request)
-        return self.form
-
-    def test_name_required(self):
-        self.post(name=u'')
-        assert not self.form.is_valid()
-        assert self.form.errors == {'name': ['This field is required.']}
-
-    def test_name_length(self):
-        self.post(name=u'a' * 51)
-        assert not self.form.is_valid()
-        assert self.form.errors == {
-            'name': ['Ensure this value has at most '
-                     '50 characters (it has 51).']}
-
-    def test_slug_unique(self):
-        # A theme cannot share the same slug as another theme's.
-        Addon.objects.create(type=amo.ADDON_PERSONA, slug='harry-potter')
-        for slug in ('Harry-Potter', '  harry-potter  ', 'harry-potter'):
-            self.post(slug=slug)
-            assert not self.form.is_valid()
-            assert self.form.errors == {
-                'slug': ['This slug is already in use. '
-                         'Please choose another.']}
-
-    def test_slug_required(self):
-        self.post(slug='')
-        assert not self.form.is_valid()
-        assert self.form.errors == {'slug': ['This field is required.']}
-
-    def test_slug_length(self):
-        self.post(slug='a' * 31)
-        assert not self.form.is_valid()
-        assert self.form.errors == {
-            'slug': ['Ensure this value has at most 30 characters '
-                     '(it has 31).']}
-
-    def test_description_optional(self):
-        self.post(description='')
-        assert self.form.is_valid()
-
-    def test_description_length(self):
-        self.post(description='a' * 501)
-        assert not self.form.is_valid()
-        assert self.form.errors == (
-            {'description': ['Ensure this value has at most '
-                             '500 characters (it has 501).']})
-
-    def test_categories_required(self):
-        self.post(category='')
-        assert not self.form.is_valid()
-        assert self.form.errors == {'category': ['This field is required.']}
-
-    def test_license_required(self):
-        self.post(license='')
-        assert not self.form.is_valid()
-        assert self.form.errors == {'license': ['A license must be selected.']}
-
-    def test_header_hash_required(self):
-        self.post(header_hash='')
-        assert not self.form.is_valid()
-        assert self.form.errors == {'header_hash': ['This field is required.']}
-
-    def test_accentcolor_optional(self):
-        self.post(accentcolor='')
-        assert self.form.is_valid()
-
-    def test_accentcolor_invalid(self):
-        self.post(accentcolor='#BALLIN')
-        assert not self.form.is_valid()
-        assert self.form.errors == (
-            {'accentcolor': ['This must be a valid hex color code, '
-                             'such as #000000.']})
-
-    def test_textcolor_optional(self):
-        self.post(textcolor='')
-        assert self.form.is_valid(), self.form.errors
-
-    def test_textcolor_invalid(self):
-        self.post(textcolor='#BALLIN')
-        assert not self.form.is_valid()
-        assert self.form.errors == (
-            {'textcolor': ['This must be a valid hex color code, '
-                           'such as #000000.']})
-
-    def get_img_urls(self):
-        return reverse('devhub.personas.upload_persona',
-                       args=['persona_header'])
-
-    def test_img_attrs(self):
-        header_url = self.get_img_urls()
-
-        self.post()
-        assert self.form.fields['header'].widget.attrs == (
-            {'data-allowed-types': amo.SUPPORTED_IMAGE_TYPES,
-             'data-upload-url': header_url})
-
-    @mock.patch('olympia.addons.tasks.make_checksum')
-    @mock.patch('olympia.addons.tasks.create_persona_preview_images')
-    @mock.patch('olympia.addons.tasks.save_persona_image')
-    @pytest.mark.skipif(not hasattr(Image.core, 'jpeg_encoder'),
-                        reason='Not having a jpeg encoder makes test sad')
-    def test_success(self, save_persona_image_mock,
-                     create_persona_preview_images_mock, make_checksum_mock):
-        make_checksum_mock.return_value = 'hashyourselfbeforeyoucrashyourself'
-
-        self.request.user = UserProfile.objects.get(pk=2519)
-
-        data = self.get_dict()
-        header_url = self.get_img_urls()
-
-        # Upload header image.
-        img = open(get_image_path('persona-header.jpg'), 'rb')
-        r_ajax = self.client.post(header_url, {'upload_image': img})
-        data.update(header_hash=json.loads(r_ajax.content)['upload_hash'])
-
-        # Populate and save form.
-        self.post()
-        assert self.form.is_valid(), self.form.errors
-        self.form.save()
-
-        addon = Addon.objects.filter(type=amo.ADDON_PERSONA).order_by('-id')[0]
-        persona = addon.persona
-
-        # Test for correct Addon and Persona values.
-        assert six.text_type(addon.name) == data['name']
-        assert addon.slug == data['slug']
-        self.assertSetEqual(set(addon.categories.values_list('id', flat=True)),
-                            {self.cat.id})
-        self.assertSetEqual(set(addon.tags.values_list('tag_text', flat=True)),
-                            set(data['tags'].split(', ')))
-        assert persona.persona_id == 0
-        assert persona.license == data['license']
-        assert persona.accentcolor == data['accentcolor'].lstrip('#')
-        assert persona.textcolor == data['textcolor'].lstrip('#')
-        assert persona.author == self.request.user.username
-        assert persona.display_username == self.request.user.name
-        assert not persona.dupe_persona
-
-        v = addon.versions.all()
-        assert len(v) == 1
-        assert v[0].version == '0'
-
-        # Test for header and preview images.
-        dst = os.path.join(user_media_path('addons'), str(addon.id))
-
-        header_src = os.path.join(settings.TMP_PATH, 'persona_header',
-                                  u'b4ll1n')
-
-        assert save_persona_image_mock.mock_calls == (
-            [mock.call(src=header_src,
-                       full_dst=os.path.join(dst, 'header.png'))])
-
-        create_persona_preview_images_mock.assert_called_with(
-            src=header_src,
-            full_dst=[os.path.join(dst, 'preview.png'),
-                      os.path.join(dst, 'icon.png')],
-            set_modified_on=addon.serializable_reference())
-
-    @mock.patch('olympia.addons.tasks.create_persona_preview_images')
-    @mock.patch('olympia.addons.tasks.save_persona_image')
-    @mock.patch('olympia.addons.tasks.make_checksum')
-    def test_dupe_persona(self, make_checksum_mock, mock1, mock2):
-        """
-        Submitting persona with checksum already in db should be marked
-        duplicate.
-        """
-        make_checksum_mock.return_value = 'cornhash'
-
-        self.request.user = UserProfile.objects.get(pk=2519)
-
-        self.post()
-        assert self.form.is_valid(), self.form.errors
-        self.form.save()
-
-        self.post(name='whatsinaname', slug='metalslug')
-        assert self.form.is_valid(), self.form.errors
-        self.form.save()
-
-        personas = Persona.objects.order_by('addon__name')
-        assert personas[0].checksum == personas[1].checksum
-        assert personas[1].dupe_persona == personas[0]
-        assert personas[0].dupe_persona is None
-
-
-class TestEditThemeForm(TestCase):
-    fixtures = ['base/user_2519']
-
-    def setUp(self):
-        super(TestEditThemeForm, self).setUp()
-        self.populate()
-        self.request = mock.Mock()
-        self.request.user = mock.Mock()
-        self.request.user.groups_list = []
-        self.request.user.username = 'swagyismymiddlename'
-        self.request.user.name = 'Sir Swag A Lot'
-        self.request.user.is_authenticated = True
-
-    def populate(self):
-        self.instance = Addon.objects.create(
-            type=amo.ADDON_PERSONA, status=amo.STATUS_PUBLIC,
-            slug='swag-overload', name='Bands Make Me Dance',
-            description='tha description')
-        self.cat = Category.objects.create(type=amo.ADDON_PERSONA)
-        self.instance.addoncategory_set.create(category=self.cat)
-        self.license = amo.LICENSE_CC_BY.id
-        self.theme = Persona.objects.create(
-            persona_id=0, addon_id=self.instance.id, license=self.license,
-            accentcolor='C0FFEE', textcolor='EFFFFF')
-        Tag(tag_text='sw').save_tag(self.instance)
-        Tag(tag_text='ag').save_tag(self.instance)
-
-    def get_dict(self, **kw):
-        data = {
-            'accentcolor': '#C0FFEE',
-            'category': self.cat.id,
-            'license': self.license,
-            'slug': self.instance.slug,
-            'tags': 'ag, sw',
-            'textcolor': '#EFFFFF',
-
-            'name_en-us': six.text_type(self.instance.name),
-            'description_en-us': six.text_type(self.instance.description),
-        }
-        data.update(**kw)
-        return data
-
-    def test_initial(self):
-        self.form = EditThemeForm(None, request=self.request,
-                                  instance=self.instance)
-
-        # Compare form initial data with post data.
-        eq_data = self.get_dict()
-        for k in [k for k in self.form.initial.keys()
-                  if k not in ['name', 'description']]:
-            assert self.form.initial[k] == eq_data[k]
-
-    def save_success(self):
-        other_cat = Category.objects.create(type=amo.ADDON_PERSONA)
-        self.data = {
-            'accentcolor': '#EFF0FF',
-            'category': other_cat.id,
-            'license': amo.LICENSE_CC_BY_NC_SA.id,
-            'slug': 'swag-lifestyle',
-            'tags': 'ag',
-            'textcolor': '#CACACA',
-
-            'name_en-us': 'All Day I Dream About Swag',
-            'description_en-us': 'ADIDAS',
-        }
-        self.form = EditThemeForm(self.data, request=self.request,
-                                  instance=self.instance)
-
-        # Compare form initial data with post data.
-        eq_data = self.get_dict()
-        for k in [k for k in self.form.initial.keys()
-                  if k not in ['name', 'description']]:
-            assert self.form.initial[k] == eq_data[k]
-
-        assert self.form.data == self.data
-        assert self.form.is_valid(), self.form.errors
-        self.form.save()
-
-    def test_success(self):
-        self.save_success()
-        self.instance = self.instance.reload()
-        assert six.text_type(self.instance.persona.accentcolor) == (
-            self.data['accentcolor'].lstrip('#'))
-        assert self.instance.categories.all()[0].id == self.data['category']
-        assert self.instance.persona.license == self.data['license']
-        assert six.text_type(self.instance.name) == self.data['name_en-us']
-        assert six.text_type(self.instance.description) == (
-            self.data['description_en-us'])
-        self.assertSetEqual(
-            set(self.instance.tags.values_list('tag_text', flat=True)),
-            {self.data['tags']})
-        assert six.text_type(self.instance.persona.textcolor) == (
-            self.data['textcolor'].lstrip('#'))
-
-    def test_success_twice(self):
-        """Form should be just fine when POSTing twice."""
-        self.save_success()
-        self.form.save()
-
-    def test_localize_name_description(self):
-        data = self.get_dict(name_de='name_de',
-                             description_de='description_de')
-        self.form = EditThemeForm(data, request=self.request,
-                                  instance=self.instance)
-        assert self.form.is_valid(), self.form.errors
-        self.form.save()
-
-    @mock.patch('olympia.addons.tasks.make_checksum')
-    @mock.patch('olympia.addons.tasks.create_persona_preview_images')
-    @mock.patch('olympia.addons.tasks.save_persona_image')
-    def test_reupload(self, save_persona_image_mock,
-                      create_persona_preview_images_mock,
-                      make_checksum_mock):
-        make_checksum_mock.return_value = 'checksumbeforeyouwrecksome'
-        data = self.get_dict(header_hash='y0l0')
-        self.form = EditThemeForm(data, request=self.request,
-                                  instance=self.instance)
-        assert self.form.is_valid()
-        self.form.save()
-
-        dst = os.path.join(user_media_path('addons'), str(self.instance.id))
-        header_src = os.path.join(settings.TMP_PATH, 'persona_header',
-                                  u'y0l0')
-
-        assert save_persona_image_mock.mock_calls == (
-            [mock.call(src=header_src,
-                       full_dst=os.path.join(dst, 'pending_header.png'))])
-
-        rqt = RereviewQueueTheme.objects.filter(theme=self.instance.persona)
-        assert rqt.count() == 1
-        assert rqt[0].header == 'pending_header.png'
-        assert not rqt[0].dupe_persona
-
-    @mock.patch('olympia.addons.tasks.create_persona_preview_images',
-                new=mock.Mock)
-    @mock.patch('olympia.addons.tasks.save_persona_image', new=mock.Mock)
-    @mock.patch('olympia.addons.tasks.make_checksum')
-    def test_reupload_duplicate(self, make_checksum_mock):
-        make_checksum_mock.return_value = 'checksumbeforeyouwrecksome'
-
-        theme = amo.tests.addon_factory(type=amo.ADDON_PERSONA)
-        theme.persona.checksum = 'checksumbeforeyouwrecksome'
-        theme.persona.save()
-
-        data = self.get_dict(header_hash='head')
-        self.form = EditThemeForm(data, request=self.request,
-                                  instance=self.instance)
-        assert self.form.is_valid()
-        self.form.save()
-
-        rqt = RereviewQueueTheme.objects.get(theme=self.instance.persona)
-        assert rqt.dupe_persona == theme.persona
-
-    @mock.patch('olympia.addons.tasks.make_checksum')
-    @mock.patch('olympia.addons.tasks.create_persona_preview_images',
-                new=mock.Mock)
-    @mock.patch('olympia.addons.tasks.save_persona_image', new=mock.Mock)
-    def test_reupload_legacy_header_only(self, make_checksum_mock):
-        """
-        STR the bug this test fixes:
-
-        - Reupload a legacy theme (/w footer == leg.png) legacy, header only.
-        - The header would get saved as 'pending_header.png'.
-        - The footer would get saved as 'footer.png'.
-        - On approving, it would see 'footer.png' !== 'leg.png'
-        - It run move_stored_file('footer.png', 'leg.png').
-        - But footer.png does not exist. BAM BUG.
-
-        Footer has been removed in Issue #5379
-        https://github.com/mozilla/addons-server/issues/5379
-        """
-        make_checksum_mock.return_value = 'comechecksome'
-
-        self.theme.header = 'Legacy-header3H.png'
-        self.theme.save()
-
-        data = self.get_dict(header_hash='arthro')
-        self.form = EditThemeForm(data, request=self.request,
-                                  instance=self.instance)
-        assert self.form.is_valid()
-        self.form.save()
-
-        rqt = RereviewQueueTheme.objects.get()
-        assert rqt.header == 'pending_header.png'
-
-
-class TestEditThemeOwnerForm(TestCase):
-    fixtures = ['base/users']
-
-    def setUp(self):
-        super(TestEditThemeOwnerForm, self).setUp()
-        self.instance = Addon.objects.create(
-            type=amo.ADDON_PERSONA,
-            status=amo.STATUS_PUBLIC, slug='swag-overload',
-            name='Bands Make Me Dance', description='tha description')
-        Persona.objects.create(
-            persona_id=0, addon_id=self.instance.id,
-            license=amo.LICENSE_CC_BY.id, accentcolor='C0FFEE',
-            textcolor='EFFFFF')
-
-    def test_initial(self):
-        self.form = EditThemeOwnerForm(None, instance=self.instance)
-        assert self.form.initial == {}
-
-        self.instance.addonuser_set.create(user_id=999)
-        assert self.instance.addonuser_set.all()[0].user.email == (
-            'regular@mozilla.com')
-        self.form = EditThemeOwnerForm(None, instance=self.instance)
-        assert self.form.initial == {'owner': 'regular@mozilla.com'}
-
-    def test_success_change_from_no_owner(self):
-        self.form = EditThemeOwnerForm({'owner': 'regular@mozilla.com'},
-                                       instance=self.instance)
-        assert self.form.is_valid(), self.form.errors
-        self.form.save()
-        assert self.instance.addonuser_set.all()[0].user.email == (
-            'regular@mozilla.com')
-
-    def test_success_replace_owner(self):
-        self.instance.addonuser_set.create(user_id=999)
-        self.form = EditThemeOwnerForm({'owner': 'regular@mozilla.com'},
-                                       instance=self.instance)
-        assert self.form.is_valid(), self.form.errors
-        self.form.save()
-        assert self.instance.addonuser_set.all()[0].user.email == (
-            'regular@mozilla.com')
-
-    def test_error_invalid_user(self):
-        self.form = EditThemeOwnerForm({'owner': 'omg@org.yes'},
-                                       instance=self.instance)
-        assert not self.form.is_valid()
+        assert pngcrush_image_mock.call_count == 1  # the thumbnail isn't a png now
+        assert pngcrush_image_mock.call_args_list[0][0][0] == (preview.image_path)
 
 
 class TestDistributionChoiceForm(TestCase):
-
     @pytest.mark.needs_locales_compilation
     def test_lazy_choice_labels(self):
         """Tests that the labels in `choices` are still lazy
@@ -752,24 +635,79 @@ class TestDistributionChoiceForm(TestCase):
             label = form.fields['channel'].choices[0][1]
 
             expected = 'On this site.'
-            label = six.text_type(label)
+            label = str(label)
             assert label.startswith(expected)
 
-        with translation.override('de'):
+        with translation.override('fr'):
             form = forms.DistributionChoiceForm()
             label = form.fields['channel'].choices[0][1]
 
-            expected = 'Auf dieser Website.'
-            label = six.text_type(label)
+            expected = 'Gestion via le site.'
+            label = str(label)
             assert label.startswith(expected)
+
+    def test_choices_addon(self):
+        # No add-on passed, all choices are present.
+        form = forms.DistributionChoiceForm()
+        assert len(form.fields['channel'].choices) == 2
+        assert form.fields['channel'].choices[0][0] == 'listed'
+        assert form.fields['channel'].choices[1][0] == 'unlisted'
+
+        # Regular add-on, all choices are present.
+        addon = addon_factory()
+        form = forms.DistributionChoiceForm(addon=addon)
+        assert len(form.fields['channel'].choices) == 2
+        assert form.fields['channel'].choices[0][0] == 'listed'
+        assert form.fields['channel'].choices[1][0] == 'unlisted'
+
+        # "Invisible" addons don't get to choose "On this site.".
+        addon.disabled_by_user = True
+        form = forms.DistributionChoiceForm(addon=addon)
+        assert len(form.fields['channel'].choices) == 1
+        assert form.fields['channel'].choices[0][0] == 'unlisted'
+
+        # Back to normal.
+        addon.disabled_by_user = False
+        form = forms.DistributionChoiceForm(addon=addon)
+        assert len(form.fields['channel'].choices) == 2
+        assert form.fields['channel'].choices[0][0] == 'listed'
+        assert form.fields['channel'].choices[1][0] == 'unlisted'
+
+        # Rejected add-ons don't get to choose "On this site." either.
+        addon.status = amo.STATUS_REJECTED
+        form = forms.DistributionChoiceForm(addon=addon)
+        assert len(form.fields['channel'].choices) == 1
+        assert form.fields['channel'].choices[0][0] == 'unlisted'
+
+    @override_switch('enterprise-channel', active=True)
+    def test_choices_addon_enterprise(self):
+        # No add-on passed, all choices are present.
+        form = forms.DistributionChoiceForm()
+        assert len(form.fields['channel'].choices) == 3
+        assert form.fields['channel'].choices[0][0] == 'listed'
+        assert form.fields['channel'].choices[1][0] == 'unlisted'
+        assert form.fields['channel'].choices[2][0] == 'enterprise'
+
+        # Themes are not given the enterprise option.
+        form = forms.DistributionChoiceForm(is_theme=True)
+        assert len(form.fields['channel'].choices) == 2
+        assert form.fields['channel'].choices[0][0] == 'listed'
+        assert form.fields['channel'].choices[1][0] == 'unlisted'
+
+        # Regular add-on, all choices are present.
+        addon = addon_factory()
+        form = forms.DistributionChoiceForm(addon=addon)
+        assert len(form.fields['channel'].choices) == 3
+        assert form.fields['channel'].choices[0][0] == 'listed'
+        assert form.fields['channel'].choices[1][0] == 'unlisted'
+        assert form.fields['channel'].choices[2][0] == 'enterprise'
 
 
 class TestDescribeForm(TestCase):
-    fixtures = ('base/addon_3615', 'base/addon_3615_categories',
-                'addons/denied')
+    fixtures = ('base/addon_3615', 'addons/denied')
 
     def setUp(self):
-        super(TestDescribeForm, self).setUp()
+        super().setUp()
         self.existing_name = 'Delicious Bookmarks'
         self.non_existing_name = 'Does Not Exist'
         self.error_msg = 'This name is already in use. Please choose another.'
@@ -778,80 +716,179 @@ class TestDescribeForm(TestCase):
     def test_slug_deny(self):
         delicious = Addon.objects.get()
         form = forms.DescribeForm(
-            {'slug': u'submit'}, request=self.request, instance=delicious)
+            {'slug': 'submit'}, request=self.request, instance=delicious
+        )
         assert not form.is_valid()
         assert form.errors['slug'] == (
-            [u'The slug cannot be "submit". Please choose another.'])
+            ['The slug cannot be "submit". Please choose another.']
+        )
 
     def test_name_trademark_mozilla(self):
         delicious = Addon.objects.get()
         form = forms.DescribeForm(
-            {'name': u'Delicious Mozilla', 'summary': u'foô', 'slug': u'bar'},
+            {'name': 'Delicious Mozilla', 'summary': 'foô', 'slug': 'bar'},
             request=self.request,
-            instance=delicious)
+            instance=delicious,
+        )
 
         assert not form.is_valid()
-        assert form.errors['name'].data[0].message.startswith(
-            u'Add-on names cannot contain the Mozilla or Firefox trademarks.')
+        assert (
+            form.errors['name']
+            .data[0]
+            .message.startswith(
+                'Add-on names cannot contain the Mozilla or Firefox trademarks.'
+            )
+        )
 
     def test_name_trademark_firefox(self):
         delicious = Addon.objects.get()
         form = forms.DescribeForm(
-            {'name': u'Delicious Firefox', 'summary': u'foö', 'slug': u'bar'},
+            {'name': 'Delicious Firefox', 'summary': 'foö', 'slug': 'bar'},
             request=self.request,
-            instance=delicious)
+            instance=delicious,
+        )
         assert not form.is_valid()
-        assert form.errors['name'].data[0].message.startswith(
-            u'Add-on names cannot contain the Mozilla or Firefox trademarks.')
+        assert (
+            form.errors['name']
+            .data[0]
+            .message.startswith(
+                'Add-on names cannot contain the Mozilla or Firefox trademarks.'
+            )
+        )
 
-    @override_switch('content-optimization', active=False)
+    def test_name_not_allowed(self):
+        delicious = Addon.objects.get()
+        form = forms.DescribeForm(
+            {'name': 'I' * 20, 'summary': 'foö', 'slug': 'bar'},
+            request=self.request,
+            instance=delicious,
+        )
+        assert not form.is_valid()
+        assert form.errors['name'].data[0].message == 'This name cannot be used.'
+
+    def test_summary_not_allowed(self):
+        delicious = Addon.objects.get()
+        form = forms.DescribeForm(
+            {'name': 'Ok', 'summary': 'I' * 20, 'slug': 'bar'},
+            request=self.request,
+            instance=delicious,
+        )
+        assert not form.is_valid()
+        assert form.errors['summary'].data[0].message == (
+            'This add-on summary or description cannot be used.'
+        )
+
     def test_name_trademark_allowed_for_prefix(self):
         delicious = Addon.objects.get()
         form = forms.DescribeForm(
-            {'name': u'Delicious for Mozilla', 'summary': u'foø',
-             'slug': u'bar'},
+            {'name': 'Delicious for Mozilla', 'summary': 'foø', 'slug': 'bar'},
             request=self.request,
-            instance=delicious)
+            instance=delicious,
+        )
 
         assert form.is_valid()
 
     def test_name_no_trademark(self):
         delicious = Addon.objects.get()
         form = forms.DescribeForm(
-            {'name': u'Delicious Dumdidum', 'summary': u'đoo', 'slug': u'bar'},
+            {'name': 'Delicious Dumdidum', 'summary': 'đoo', 'slug': 'bar'},
             request=self.request,
-            instance=delicious)
+            instance=delicious,
+        )
 
         assert form.is_valid()
 
     def test_slug_isdigit(self):
         delicious = Addon.objects.get()
         form = forms.DescribeForm(
-            {'slug': u'123'}, request=self.request, instance=delicious)
+            {'slug': '123'}, request=self.request, instance=delicious
+        )
         assert not form.is_valid()
         assert form.errors['slug'] == (
-            [u'The slug cannot be "123". Please choose another.'])
+            ['The slug cannot be "123". Please choose another.']
+        )
 
     def test_bogus_support_url(self):
         form = forms.DescribeForm(
             {'support_url': 'javascript://something.com'},
-            request=self.request, instance=Addon.objects.get())
+            request=self.request,
+            instance=Addon.objects.get(),
+        )
         assert not form.is_valid()
-        assert form.errors['support_url'] == [u'Enter a valid URL.']
+        assert form.errors['support_url'] == ['Enter a valid URL.']
 
     def test_ftp_support_url(self):
         form = forms.DescribeForm(
-            {'support_url': 'ftp://foo.com'}, request=self.request,
-            instance=Addon.objects.get())
+            {'support_url': 'ftp://foo.com'},
+            request=self.request,
+            instance=Addon.objects.get(),
+        )
         assert not form.is_valid()
-        assert form.errors['support_url'] == [u'Enter a valid URL.']
+        assert form.errors['support_url'] == ['Enter a valid URL.']
 
     def test_http_support_url(self):
         form = forms.DescribeForm(
-            {'name': u'Delicious Dumdidum', 'summary': u'foo', 'slug': u'bar',
-             'support_url': 'http://foo.com'},
-            request=self.request, instance=Addon.objects.get())
+            {
+                'name': 'Delicious Dumdidum',
+                'summary': 'foo',
+                'slug': 'bar',
+                'support_url': 'http://foo.com',
+            },
+            request=self.request,
+            instance=Addon.objects.get(),
+        )
         assert form.is_valid(), form.errors
+
+    def test_support_url_too_long(self):
+        form = forms.DescribeForm(
+            {'support_url': f'https://{"s" * 244}.com'},
+            request=self.request,
+            instance=Addon.objects.get(),
+        )
+        assert form.fields['support_url'].max_length == 255
+        assert form.fields['support_url'].widget.attrs['maxlength'] == '255'
+        assert not form.is_valid()
+        assert form.errors['support_url'] == [
+            'Enter a valid URL.',
+            'Ensure this value has at most 255 characters (it has 256).',
+        ]
+
+    def test_support_email_too_long(self):
+        form = forms.DescribeForm(
+            {'support_email': f'{"u" * 89}@support.com'},
+            request=self.request,
+            instance=Addon.objects.get(),
+        )
+        assert form.fields['support_email'].max_length == 100
+        assert form.fields['support_email'].widget.attrs['maxlength'] == '100'
+        assert not form.is_valid()
+        assert form.errors['support_email'] == [
+            'Ensure this value has at most 100 characters (it has 101).',
+        ]
+
+    def test_render_maxlength(self):
+        def _check_output(form):
+            output = str(form.as_p())
+            doc = pq(output)
+            assert doc('input#id_name_0').attr('maxlength') == '50'
+            assert doc('input#id_name.trans-init').attr('maxlength') == '50'
+            assert doc('input#id_support_email_0').attr('maxlength') == '100'
+            assert doc('input#id_support_email.trans-init').attr('maxlength') == '100'
+            assert doc('input#id_support_url_0').attr('maxlength') == '255'
+            assert doc('input#id_support_url.trans-init').attr('maxlength') == '255'
+
+        form = forms.DescribeForm(
+            request=self.request,
+            instance=Addon.objects.get(),
+        )
+        _check_output(form)
+
+        # Check again with an empty instance (no existing translations).
+        form = forms.DescribeForm(
+            request=self.request,
+            instance=Addon(),
+        )
+        _check_output(form)
 
     def test_description_optional(self):
         delicious = Addon.objects.get()
@@ -859,33 +896,41 @@ class TestDescribeForm(TestCase):
 
         with override_switch('content-optimization', active=False):
             form = forms.DescribeForm(
-                {'name': u'Delicious for everyone', 'summary': u'foo',
-                 'slug': u'bar'},
-                request=self.request, instance=delicious)
+                {'name': 'Delicious for everyone', 'summary': 'foo', 'slug': 'bar'},
+                request=self.request,
+                instance=delicious,
+            )
             assert form.is_valid(), form.errors
 
         with override_switch('content-optimization', active=True):
             form = forms.DescribeForm(
-                {'name': u'Delicious for everyone', 'summary': u'foo',
-                 'slug': u'bar'},
-                request=self.request, instance=delicious)
+                {'name': 'Delicious for everyone', 'summary': 'foo', 'slug': 'bar'},
+                request=self.request,
+                instance=delicious,
+            )
             assert not form.is_valid()
 
             # But only extensions are required to have a description
             delicious.update(type=amo.ADDON_STATICTHEME)
             form = forms.DescribeForm(
-                {'name': u'Delicious for everyone', 'summary': u'foo',
-                 'slug': u'bar'},
-                request=self.request, instance=delicious)
+                {'name': 'Delicious for everyone', 'summary': 'foo', 'slug': 'bar'},
+                request=self.request,
+                instance=delicious,
+            )
             assert form.is_valid(), form.errors
 
             #  Do it again, but this time with a description
             delicious.update(type=amo.ADDON_EXTENSION)
             form = forms.DescribeForm(
-                {'name': u'Delicious for everyone', 'summary': u'foo',
-                 'slug': u'bar', 'description': u'its a description'},
+                {
+                    'name': 'Delicious for everyone',
+                    'summary': 'foo',
+                    'slug': 'bar',
+                    'description': 'its a description',
+                },
                 request=self.request,
-                instance=delicious)
+                instance=delicious,
+            )
             assert form.is_valid(), form.errors
 
     def test_description_min_length(self):
@@ -894,86 +939,145 @@ class TestDescribeForm(TestCase):
 
         with override_switch('content-optimization', active=False):
             form = forms.DescribeForm(
-                {'name': u'Delicious for everyone', 'summary': u'foo',
-                 'slug': u'bar', 'description': u'123456789'},
-                request=self.request, instance=delicious)
+                {
+                    'name': 'Delicious for everyone',
+                    'summary': 'foo',
+                    'slug': 'bar',
+                    'description': '123456789',
+                },
+                request=self.request,
+                instance=delicious,
+            )
             assert form.is_valid(), form.errors
 
         with override_switch('content-optimization', active=True):
             form = forms.DescribeForm(
-                {'name': u'Delicious for everyone', 'summary': u'foo',
-                 'slug': u'bar', 'description': u'123456789'},
-                request=self.request, instance=delicious)
+                {
+                    'name': 'Delicious for everyone',
+                    'summary': 'foo',
+                    'slug': 'bar',
+                    'description': '123456789',
+                },
+                request=self.request,
+                instance=delicious,
+            )
             assert not form.is_valid()
 
             # But only extensions have a minimum length
             delicious.update(type=amo.ADDON_STATICTHEME)
             form = forms.DescribeForm(
-                {'name': u'Delicious for everyone', 'summary': u'foo',
-                 'slug': u'bar', 'description': u'123456789'},
-                request=self.request, instance=delicious)
+                {
+                    'name': 'Delicious for everyone',
+                    'summary': 'foo',
+                    'slug': 'bar',
+                    'description': '123456789',
+                },
+                request=self.request,
+                instance=delicious,
+            )
             assert form.is_valid()
 
             #  Do it again, but this time with a longer description
             delicious.update(type=amo.ADDON_EXTENSION)
             form = forms.DescribeForm(
-                {'name': u'Delicious for everyone', 'summary': u'foo',
-                 'slug': u'bar', 'description': u'1234567890'},
+                {
+                    'name': 'Delicious for everyone',
+                    'summary': 'foo',
+                    'slug': 'bar',
+                    'description': '1234567890',
+                },
                 request=self.request,
-                instance=delicious)
+                instance=delicious,
+            )
             assert form.is_valid(), form.errors
+
+    def test_description_too_long(self):
+        delicious = Addon.objects.get()
+        form = forms.DescribeForm(
+            {
+                'name': 'name me',
+                'summary': 'summary me',
+                'slug': 'slugme',
+                'description': 'a' * 15001,
+            },
+            request=self.request,
+            instance=delicious,
+        )
+        assert form.fields['description'].max_length == 15000
+        assert form.fields['description'].widget.attrs['maxlength'] == '15000'
+        assert not form.is_valid()
+        assert form.errors == {
+            'description': [
+                'Ensure this value has at most 15000 characters (it has 15001).'
+            ]
+        }
 
     def test_name_summary_lengths(self):
         delicious = Addon.objects.get()
         short_data = {
-            'name': u'n', 'summary': u's', 'slug': u'bar',
-            'description': u'1234567890'}
+            'name': 'n',
+            'summary': 's',
+            'slug': 'bar',
+            'description': '1234567890',
+        }
         over_70_data = {
-            'name': u'this is a name that hits the 50 char limit almost',
-            'summary': u'this is a summary that doesn`t get close to the '
-                       u'existing 250 limit but is over 70',
-            'slug': u'bar', 'description': u'1234567890'}
+            'name': 'this is a name that hits the 50 char limit almost',
+            'summary': 'this is a summary that doesn`t get close to the '
+            'existing 250 limit but is over 70',
+            'slug': 'bar',
+            'description': '1234567890',
+        }
         under_70_data = {
-            'name': u'this is a name that is over the 50 char limit by a few',
-            'summary': u'ab',
-            'slug': u'bar', 'description': u'1234567890'}
+            'name': 'this is a name that is over the 50 char limit by a few',
+            'summary': 'ab',
+            'slug': 'bar',
+            'description': '1234567890',
+        }
 
         # short name and summary - both allowed with DescribeForm
-        form = forms.DescribeForm(
-            short_data, request=self.request, instance=delicious)
+        form = forms.DescribeForm(short_data, request=self.request, instance=delicious)
         assert form.is_valid()
         # but not with DescribeFormContentOptimization
         form = forms.DescribeFormContentOptimization(
-            short_data, request=self.request, instance=delicious)
+            short_data, request=self.request, instance=delicious
+        )
         assert not form.is_valid()
         assert form.errors['name'] == [
-            u'Ensure this value has at least 2 characters (it has 1).']
+            'Ensure this value has at least 2 characters (it has 1).'
+        ]
         assert form.errors['summary'] == [
-            u'Ensure this value has at least 2 characters (it has 1).']
+            'Ensure this value has at least 2 characters (it has 1).'
+        ]
 
         # As are long names and summaries
         form = forms.DescribeForm(
-            over_70_data, request=self.request, instance=delicious)
+            over_70_data, request=self.request, instance=delicious
+        )
         assert form.is_valid()
         # but together are over 70 chars so no longer allowed
         form = forms.DescribeFormContentOptimization(
-            over_70_data, request=self.request, instance=delicious)
+            over_70_data, request=self.request, instance=delicious
+        )
         assert not form.is_valid()
         assert len(over_70_data['name']) + len(over_70_data['summary']) == 130
         assert form.errors['name'] == [
-            u'Ensure name and summary combined are at most 70 characters '
-            u'(they have 130).']
+            'Ensure name and summary combined are at most 70 characters '
+            '(they have 130).'
+        ]
         assert 'summary' not in form.errors
 
         # DescribeForm has a lower limit for name length
         form = forms.DescribeForm(
-            under_70_data, request=self.request, instance=delicious)
+            under_70_data, request=self.request, instance=delicious
+        )
         assert not form.is_valid()
         assert form.errors['name'] == [
-            u'Ensure this value has at most 50 characters (it has 54).']
+            'Ensure this value has at most 50 characters (it has 54).'
+        ]
         # DescribeFormContentOptimization only cares that the total is <= 70
         form = forms.DescribeFormContentOptimization(
-            under_70_data, request=self.request, instance=delicious)
+            under_70_data, request=self.request, instance=delicious
+        )
         assert form.is_valid()
         assert len(under_70_data['name']) + len(under_70_data['summary']) == 56
 
@@ -982,67 +1086,702 @@ class TestDescribeForm(TestCase):
         assert delicious.default_locale == 'en-US'
 
         summary_needs_cropping = {
-            'name_en-us': u'a' * 25,
-            'name_fr': u'b' * 30,
-            'summary_en-us': u'c' * 45,
-            'summary_fr': u'd' * 45,  # 30 + 45 is > 70
-            'slug': u'slug',
-            'description_en-us': u'z' * 10,
+            'name_en-us': 'a' * 25,
+            'name_fr': 'b' * 30,
+            'summary_en-us': 'c' * 45,
+            'summary_fr': 'd' * 45,  # 30 + 45 is > 70
+            'slug': 'slug',
+            'description_en-us': 'z' * 10,
         }
         form = forms.DescribeFormContentOptimization(
-            summary_needs_cropping, request=self.request, instance=delicious,
-            should_auto_crop=True)
+            summary_needs_cropping,
+            request=self.request,
+            instance=delicious,
+            should_auto_crop=True,
+        )
         assert form.is_valid(), form.errors
-        assert form.cleaned_data['name']['en-us'] == u'a' * 25  # no change
-        assert form.cleaned_data['summary']['en-us'] == u'c' * 45  # no change
-        assert form.cleaned_data['name']['fr'] == u'b' * 30  # no change
-        assert form.cleaned_data['summary']['fr'] == u'd' * 40  # 45 to 40
+        assert form.cleaned_data['name']['en-us'] == 'a' * 25  # no change
+        assert form.cleaned_data['summary']['en-us'] == 'c' * 45  # no change
+        assert form.cleaned_data['name']['fr'] == 'b' * 30  # no change
+        assert form.cleaned_data['summary']['fr'] == 'd' * 40  # 45 to 40
 
         summary_needs_cropping_no_name = {
-            'name_en-us': u'a' * 25,
-            'summary_en-us': u'c' * 45,
-            'summary_fr': u'd' * 50,
-            'slug': u'slug',
-            'description_en-us': u'z' * 10,
+            'name_en-us': 'a' * 25,
+            'summary_en-us': 'c' * 45,
+            'summary_fr': 'd' * 50,
+            'slug': 'slug',
+            'description_en-us': 'z' * 10,
         }
         form = forms.DescribeFormContentOptimization(
-            summary_needs_cropping_no_name, request=self.request,
-            instance=delicious, should_auto_crop=True)
+            summary_needs_cropping_no_name,
+            request=self.request,
+            instance=delicious,
+            should_auto_crop=True,
+        )
         assert form.is_valid(), form.errors
-        assert form.cleaned_data['name']['en-us'] == u'a' * 25
-        assert form.cleaned_data['summary']['en-us'] == u'c' * 45
+        assert form.cleaned_data['name']['en-us'] == 'a' * 25
+        assert form.cleaned_data['summary']['en-us'] == 'c' * 45
         assert 'fr' not in form.cleaned_data['name']  # we've not added it
-        assert form.cleaned_data['summary']['fr'] == u'd' * 45  # 50 to 45
+        assert form.cleaned_data['summary']['fr'] == 'd' * 45  # 50 to 45
 
         name_needs_cropping = {
-            'name_en-us': u'a' * 67,
-            'name_fr': u'b' * 69,
-            'summary_en-us': u'c' * 2,
-            'summary_fr': u'd' * 3,
-            'slug': u'slug',
-            'description_en-us': u'z' * 10,
+            'name_en-us': 'a' * 67,
+            'name_fr': 'b' * 69,
+            'summary_en-us': 'c' * 2,
+            'summary_fr': 'd' * 3,
+            'slug': 'slug',
+            'description_en-us': 'z' * 10,
         }
         form = forms.DescribeFormContentOptimization(
-            name_needs_cropping, request=self.request,
-            instance=delicious, should_auto_crop=True)
+            name_needs_cropping,
+            request=self.request,
+            instance=delicious,
+            should_auto_crop=True,
+        )
         assert form.is_valid(), form.errors
-        assert form.cleaned_data['name']['en-us'] == u'a' * 67  # no change
-        assert form.cleaned_data['summary']['en-us'] == u'c' * 2  # no change
-        assert form.cleaned_data['name']['fr'] == u'b' * 68  # 69 to 68
-        assert form.cleaned_data['summary']['fr'] == u'd' * 2  # 3 to 2
+        assert form.cleaned_data['name']['en-us'] == 'a' * 67  # no change
+        assert form.cleaned_data['summary']['en-us'] == 'c' * 2  # no change
+        assert form.cleaned_data['name']['fr'] == 'b' * 68  # 69 to 68
+        assert form.cleaned_data['summary']['fr'] == 'd' * 2  # 3 to 2
 
         name_needs_cropping_no_summary = {
-            'name_en-us': u'a' * 50,
-            'name_fr': u'b' * 69,
-            'summary_en-us': u'c' * 20,
-            'slug': u'slug',
-            'description_en-us': u'z' * 10,
+            'name_en-us': 'a' * 50,
+            'name_fr': 'b' * 69,
+            'summary_en-us': 'c' * 20,
+            'slug': 'slug',
+            'description_en-us': 'z' * 10,
         }
         form = forms.DescribeFormContentOptimization(
-            name_needs_cropping_no_summary, request=self.request,
-            instance=delicious, should_auto_crop=True)
+            name_needs_cropping_no_summary,
+            request=self.request,
+            instance=delicious,
+            should_auto_crop=True,
+        )
         assert form.is_valid(), form.errors
-        assert form.cleaned_data['name']['en-us'] == u'a' * 50  # no change
-        assert form.cleaned_data['summary']['en-us'] == u'c' * 20  # no change
-        assert form.cleaned_data['name']['fr'] == u'b' * 50  # 69 to 50
+        assert form.cleaned_data['name']['en-us'] == 'a' * 50  # no change
+        assert form.cleaned_data['summary']['en-us'] == 'c' * 20  # no change
+        assert form.cleaned_data['name']['fr'] == 'b' * 50  # 69 to 50
         assert 'fr' not in form.cleaned_data['summary']
+
+
+class TestAdditionalDetailsForm(TestCase):
+    fixtures = ['base/addon_3615', 'base/users']
+
+    def setUp(self):
+        super().setUp()
+        self.addon = Addon.objects.get(pk=3615)
+
+        self.data = {
+            'default_locale': 'en-US',
+            'homepage': str(self.addon.homepage),
+        }
+
+        self.user = self.addon.authors.all()[0]
+        core.set_user(self.user)
+        self.request = req_factory_factory('/')
+
+    def test_locales(self):
+        form = forms.AdditionalDetailsForm(request=self.request, instance=self.addon)
+        assert form.fields['default_locale'].choices[0][0] == settings.LANGUAGES[0][0]
+
+    def _get_tag_text(self):
+        return [t.tag_text for t in self.addon.tags.all()]
+
+    def test_change_tags(self):
+        tag_old = Tag.objects.create(tag_text='old')
+        AddonTag.objects.create(tag=tag_old, addon=self.addon)
+        assert self._get_tag_text() == ['old']
+
+        tag_bar = Tag.objects.create(tag_text='bar')
+        tag_foo = Tag.objects.create(tag_text='foo')
+        data = {**self.data, 'tags': ['bar', 'foo']}
+        form = forms.AdditionalDetailsForm(
+            data=data, request=self.request, instance=self.addon
+        )
+        assert form.is_valid()
+        form.save(self.addon)
+        assert self._get_tag_text() == ['bar', 'foo']
+        assert tag_bar.reload().num_addons == 1
+        assert tag_foo.reload().num_addons == 1
+        assert tag_old.reload().num_addons == 0
+
+    def test_cannot_create_new_tags(self):
+        data = {**self.data, 'tags': ['bar']}
+        form = forms.AdditionalDetailsForm(
+            data=data, request=self.request, instance=self.addon
+        )
+        assert not form.is_valid()
+        assert form.errors['tags'] == [
+            'Select a valid choice. bar is not one of the available choices.'
+        ]
+
+    def test_tags_limit(self):
+        for x in range(amo.MAX_TAGS + 2):
+            Tag.objects.create(tag_text=f'tag{x}')
+
+        extra = Tag.objects.count() - amo.MAX_TAGS
+        data = {**self.data, 'tags': [tag.tag_text for tag in Tag.objects.all()]}
+        form = forms.AdditionalDetailsForm(
+            data=data, request=self.request, instance=self.addon
+        )
+        assert not form.is_valid()
+        assert form.errors['tags'] == [f'You have {extra} too many tags.']
+
+    def test_bogus_homepage(self):
+        form = forms.AdditionalDetailsForm(
+            {'homepage': 'javascript://something.com'},
+            request=self.request,
+            instance=self.addon,
+        )
+        assert not form.is_valid()
+        assert form.errors['homepage'] == ['Enter a valid URL.']
+
+    def test_ftp_homepage(self):
+        form = forms.AdditionalDetailsForm(
+            {'homepage': 'ftp://foo.com'}, request=self.request, instance=self.addon
+        )
+        assert not form.is_valid()
+        assert form.errors['homepage'] == ['Enter a valid URL.']
+
+    def test_homepage_is_not_required(self):
+        form = forms.AdditionalDetailsForm(
+            {'default_locale': 'en-US'}, request=self.request, instance=self.addon
+        )
+        assert form.is_valid()
+
+    def test_homepage_too_long(self):
+        form = forms.AdditionalDetailsForm(
+            {'homepage': f'https://{"a" * 244}.com'},
+            request=self.request,
+            instance=self.addon,
+        )
+        assert form.fields['homepage'].max_length == 255
+        assert form.fields['homepage'].widget.attrs['maxlength'] == '255'
+        assert not form.is_valid()
+        assert form.errors['homepage'] == [
+            'Enter a valid URL.',
+            'Ensure this value has at most 255 characters (it has 256).',
+        ]
+
+
+class TestIconForm(TestCase):
+    fixtures = ['base/addon_3615']
+
+    def setUp(self):
+        super().setUp()
+        self.temp_dir = tempfile.mkdtemp(dir=settings.TMP_PATH)
+        self.addon = Addon.objects.get(pk=3615)
+
+        class DummyRequest:
+            FILES = None
+
+        self.request = DummyRequest()
+        self.icon_path = os.path.join(settings.TMP_PATH, 'icon')
+        if not os.path.exists(self.icon_path):
+            os.makedirs(self.icon_path)
+
+    def tearDown(self):
+        rm_local_tmp_dir(self.temp_dir)
+        super().tearDown()
+
+    def test_default_icons(self):
+        form = forms.AddonFormMedia(request=self.request, instance=self.addon)
+        content = str(form['icon_type'])
+        doc = pq(content)
+        imgs = doc('img')
+        assert len(imgs) == 1  # Only one default icon available atm
+        assert imgs[0].attrib == {
+            'alt': '',
+            'src': 'http://testserver/static/img/addon-icons/default-32.png',
+            'data-src-64': 'http://testserver/static/img/addon-icons/default-64.png',
+            'data-src-128': 'http://testserver/static/img/addon-icons/default-128.png',
+        }
+
+    @mock.patch('olympia.amo.models.ModelBase.update')
+    def test_icon_modified(self, update_mock):
+        name = 'transparent.png'
+        icon_upload_hash = uuid.uuid4().hex
+        form = forms.AddonFormMedia(
+            {'icon_upload_hash': icon_upload_hash},
+            request=self.request,
+            instance=self.addon,
+        )
+        dest = os.path.join(self.icon_path, icon_upload_hash)
+        with (
+            storage.open(dest, 'wb') as f,
+            open(get_image_path(name), 'rb') as copy_src,
+        ):
+            shutil.copyfileobj(copy_src, f)
+        assert form.is_valid()
+        form.save(addon=self.addon)
+        assert update_mock.called
+
+    def test_icon_invalid_hash(self):
+        form = forms.AddonFormMedia(
+            {'icon_upload_hash': 'some-icon.png'},
+            request=self.request,
+            instance=self.addon,
+        )
+        assert not form.is_valid()
+        assert form.errors == {
+            'icon_upload_hash': ['There was an error uploading your image.']
+        }
+
+
+class TestCategoryForm(TestCase):
+    def test_only_one_possible_category_for_dicts(self):
+        addon = addon_factory(type=amo.ADDON_DICT)
+        request = req_factory_factory('/')
+        form = forms.CategoryForm(addon=addon, request=request)
+        assert form.fields['categories'].choices == [(95, 'General')]
+
+
+class TestVersionForm(TestCase):
+    def test_source_field(self):
+        version = addon_factory().current_version
+        mock_point = 'olympia.versions.models.Version.'
+        form = forms.VersionForm
+        with mock.patch(
+            f'{mock_point}pending_rejection', new_callable=mock.PropertyMock
+        ) as pending_mock:
+            assert version.human_review_date is None
+            pending_mock.return_value = False
+            assert form(instance=version).fields['source'].disabled is False
+
+            version.update(human_review_date=datetime.now())
+            assert form(instance=version).fields['source'].disabled is True
+
+            pending_mock.return_value = True
+            assert form(instance=version).fields['source'].disabled is False
+
+
+class TestAddonFormTechnical(TestCase):
+    def test_developer_comments_too_long(self):
+        addon = addon_factory()
+        request = req_factory_factory('/')
+        form = forms.AddonFormTechnical(
+            {'developer_comments': 'a' * 3001},
+            instance=addon,
+            request=request,
+        )
+        assert form.fields['developer_comments'].max_length == 3000
+        assert form.fields['developer_comments'].widget.attrs['maxlength'] == '3000'
+        assert not form.is_valid()
+        assert form.errors == {
+            'developer_comments': [
+                'Ensure this value has at most 3000 characters (it has 3001).'
+            ]
+        }
+
+
+class TestAPIKeyForm(TestCase):
+    def setUp(self):
+        self.user = user_factory()
+
+    def _request(self, action=None, token=None, data=None):
+        url = '/' if token is None else f'/?token={token}'
+        data = {} if data is None else data
+        if action is not None:
+            data['action'] = action
+        return req_factory_factory(url, post=True, user=self.user, data=data)
+
+    def test_fields_without_credentials_or_confirmation(self):
+        request = self._request(action=forms.APIKeyForm.ACTION_CHOICES.CONFIRM)
+        form = forms.APIKeyForm(request.POST, request=request)
+        assert form.available_actions == [
+            forms.APIKeyForm.ACTION_CHOICES.CONFIRM,
+        ]
+        assert form.is_valid(), form.errors
+        assert 'confirmation_token' not in form.fields
+        assert 'recaptcha' not in form.fields
+
+        with override_switch('developer-submit-addon-captcha', active=True):
+            form = forms.APIKeyForm(request.POST, request=request)
+            recaptcha = form.fields['recaptcha']
+            self.assertEqual(recaptcha.label, '')
+            self.assertEqual(recaptcha.help_text, "You don't have any API credentials.")
+            self.assertEqual(recaptcha.required, True)
+            assert not form.is_valid()
+            assert form.errors['recaptcha'] == ['This field is required.']
+
+            request = self._request(
+                action=forms.APIKeyForm.ACTION_CHOICES.CONFIRM,
+                data={'g-recaptcha-response': 'test'},
+            )
+            form = forms.APIKeyForm(request.POST, request=request)
+            assert form.is_valid()
+
+    def test_fields_with_credentials(self):
+        APIKey.new_jwt_credentials(self.user)
+        request = self._request(action=forms.APIKeyForm.ACTION_CHOICES.REVOKE)
+        form = forms.APIKeyForm(request.POST, request=request)
+        assert 'confirmation_token' not in form.fields
+        assert 'recaptcha' not in form.fields
+
+        assert form.is_valid()
+        assert form.available_actions == [
+            forms.APIKeyForm.ACTION_CHOICES.REVOKE,
+        ]
+
+    def test_fields_with_confirmation(self):
+        confirmation = APIKeyConfirmation.objects.create(user=self.user, token='test')
+        request = self._request(action=forms.APIKeyForm.ACTION_CHOICES.GENERATE)
+        form = forms.APIKeyForm(request.POST, request=request)
+        assert 'recaptcha' not in form.fields
+        assert 'confirmation_token' not in form.fields
+
+        form = forms.APIKeyForm(request.POST, request=request)
+        assert not form.is_valid()
+        assert form.available_actions == [
+            forms.APIKeyForm.ACTION_CHOICES.RESEND_CONFIRM,
+        ]
+
+        request = self._request(
+            action=forms.APIKeyForm.ACTION_CHOICES.GENERATE,
+            token=confirmation.token,
+        )
+        form = forms.APIKeyForm(request.POST, request=request)
+        assert form.is_valid()
+        assert form.available_actions == [
+            forms.APIKeyForm.ACTION_CHOICES.GENERATE,
+        ]
+
+        confirmation.update(confirmed_once=True)
+        request = self._request(
+            action=forms.APIKeyForm.ACTION_CHOICES.GENERATE,
+            token=None,
+        )
+        form = forms.APIKeyForm(request.POST, request=request)
+        assert form.is_valid()
+        assert form.available_actions == [
+            forms.APIKeyForm.ACTION_CHOICES.GENERATE,
+        ]
+
+    def test_fields_with_credentials_and_confirmation(self):
+        APIKey.new_jwt_credentials(self.user)
+        confirmation = APIKeyConfirmation.objects.create(
+            user=self.user, token='test', confirmed_once=True
+        )
+        request = self._request(action=forms.APIKeyForm.ACTION_CHOICES.REVOKE)
+        form = forms.APIKeyForm(request.POST, request=request)
+        assert 'recaptcha' not in form.fields
+        assert 'confirmation_token' not in form.fields
+        assert form.is_valid()
+        assert form.available_actions == [
+            forms.APIKeyForm.ACTION_CHOICES.REVOKE,
+            forms.APIKeyForm.ACTION_CHOICES.REGENERATE,
+        ]
+
+        confirmation.update(confirmed_once=False)
+        form = forms.APIKeyForm(request.POST, request=request)
+        assert form.is_valid()
+        assert form.available_actions == [
+            forms.APIKeyForm.ACTION_CHOICES.REVOKE,
+        ]
+
+    def test_revoke_credentials(self):
+        APIKey.new_jwt_credentials(self.user)
+        credentials = APIKey.get_jwt_key(user=self.user)
+        assert credentials.is_active is True
+        request = self._request(action=forms.APIKeyForm.ACTION_CHOICES.REVOKE)
+        form = forms.APIKeyForm(request.POST, request=request)
+        assert form.is_valid()
+        form.save()
+        assert credentials.reload().is_active is None
+
+    def test_generate_credentials(self):
+        APIKeyConfirmation.objects.create(user=self.user, token='test')
+        confirmation = APIKeyConfirmation.objects.get(user=self.user)
+        assert confirmation.confirmed_once is False
+        request = self._request(
+            action=forms.APIKeyForm.ACTION_CHOICES.GENERATE, token=confirmation.token
+        )
+        form = forms.APIKeyForm(request.POST, request=request)
+        assert form.is_valid()
+        form.save()
+        assert confirmation.reload().confirmed_once is True
+        assert form.credentials == APIKey.get_jwt_key(user=self.user)
+
+    def test_send_confirmation(self):
+        request = self._request(action=forms.APIKeyForm.ACTION_CHOICES.CONFIRM)
+        form = forms.APIKeyForm(request.POST, request=request)
+        assert form.confirmation is None
+        assert form.is_valid()
+        form.save()
+        confirmation = APIKeyConfirmation.objects.get(user=self.user)
+        assert confirmation.token is not None
+        assert confirmation.user == self.user
+
+
+@override_switch('version-rollback', active=True)
+class TestRollbackVersionForm(TestCase):
+    def test_only_unlisted_version_choices(self):
+        """Should default the channel to unlisted, and disable
+        the option to switch."""
+        addon = addon_factory(version_kw={'channel': amo.CHANNEL_UNLISTED})
+        v1 = addon.versions.get()
+        v2 = version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        form = forms.RollbackVersionForm(addon=addon)
+        assert form.fields['channel'].initial == amo.CHANNEL_UNLISTED
+        assert [str(lab) for _, lab in form.fields['unlisted_version'].choices] == [
+            v2.version,
+            v1.version,
+        ]
+        assert form.fields['listed_version'].choices == []
+        assert form.fields['enterprise_version'].choices == []
+        assert form.fields['channel'].initial == amo.CHANNEL_UNLISTED
+        assert form.fields['channel'].disabled
+
+    def test_only_listed_version_choices(self):
+        """Should default the channel to listed, and disable
+        the option to switch."""
+        addon = addon_factory()
+        v2 = version_factory(addon=addon)
+        version_factory(addon=addon)
+        form = forms.RollbackVersionForm(addon=addon)
+        assert form.fields['channel'].initial == amo.CHANNEL_LISTED
+        assert [str(lab) for _, lab in form.fields['listed_version'].choices] == [
+            v2.version,
+        ]
+        assert form.fields['unlisted_version'].choices == []
+        assert form.fields['enterprise_version'].choices == []
+        assert form.fields['channel'].initial == amo.CHANNEL_LISTED
+        assert form.fields['channel'].disabled
+
+    def test_only_enterprise_version_choices(self):
+        """Should default the channel to enterprise, and disable
+        the option to switch."""
+        addon = addon_factory(version_kw={'channel': amo.CHANNEL_ENTERPRISE})
+        v1 = addon.versions.get()
+        v2 = version_factory(addon=addon, channel=amo.CHANNEL_ENTERPRISE)
+        version_factory(addon=addon, channel=amo.CHANNEL_ENTERPRISE)
+        form = forms.RollbackVersionForm(addon=addon)
+        assert form.fields['channel'].initial == amo.CHANNEL_ENTERPRISE
+        assert [str(lab) for _, lab in form.fields['enterprise_version'].choices] == [
+            v2.version,
+            v1.version,
+        ]
+        assert form.fields['listed_version'].choices == []
+        assert form.fields['unlisted_version'].choices == []
+        assert form.fields['channel'].initial == amo.CHANNEL_ENTERPRISE
+        assert form.fields['channel'].disabled
+
+    def test_all_version_choices(self):
+        addon = addon_factory()
+        lv2 = version_factory(addon=addon)
+        version_factory(addon=addon)
+        uv1 = version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        uv2 = version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        # Notably, only one enterprise version.
+        ev1 = version_factory(addon=addon, channel=amo.CHANNEL_ENTERPRISE)
+
+        form = forms.RollbackVersionForm(addon=addon)
+        assert [str(lab) for _, lab in form.fields['listed_version'].choices] == [
+            lv2.version,
+        ]
+        assert [str(lab) for _, lab in form.fields['unlisted_version'].choices] == [
+            uv2.version,
+            uv1.version,
+        ]
+        # Only one enterprise version, so no option to rollback.
+        assert form.fields['enterprise_version'].choices == []
+        # Defaults to last used channel that is a valid option (i.e not enterprise)
+        assert form.fields['channel'].initial is amo.CHANNEL_UNLISTED
+
+        version_factory(addon=addon, channel=amo.CHANNEL_ENTERPRISE)
+        form = forms.RollbackVersionForm(addon=addon)
+        assert [str(lab) for _, lab in form.fields['listed_version'].choices] == [
+            lv2.version,
+        ]
+        assert [str(lab) for _, lab in form.fields['unlisted_version'].choices] == [
+            uv2.version,
+            uv1.version,
+        ]
+        assert [str(lab) for _, lab in form.fields['enterprise_version'].choices] == [
+            ev1.version,
+        ]
+        # Enterprise is now the last used channel and a valid option.
+        assert form.fields['channel'].initial is amo.CHANNEL_ENTERPRISE
+
+    def test_listed_and_unlisted_version_choices(self):
+        """Both listed and unlisted version choices should be available."""
+        addon = addon_factory()
+        lv2 = version_factory(addon=addon)
+        version_factory(addon=addon)
+        uv1 = version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        uv2 = version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        form = forms.RollbackVersionForm(addon=addon)
+        assert form.fields['channel'].initial is amo.CHANNEL_UNLISTED
+        assert [str(lab) for _, lab in form.fields['listed_version'].choices] == [
+            lv2.version,
+        ]
+        assert [str(lab) for _, lab in form.fields['unlisted_version'].choices] == [
+            uv2.version,
+            uv1.version,
+        ]
+
+    def test_clean_new_version_string_for_existing_versions(self):
+        def check_already_exists_error(version):
+            form = forms.RollbackVersionForm(
+                {**data, 'new_version_string': version.version}, addon=addon
+            )
+            assert not form.is_valid()
+            assert form.errors == {
+                'new_version_string': [
+                    f'Version {version.version} already exists.'
+                    if not version.deleted
+                    else f'Version {version.version} was uploaded before and deleted.'
+                ]
+            }
+
+        addon = addon_factory()
+        lv1 = addon.current_version
+        lv1.delete()
+        lv2 = version_factory(addon=addon)
+        lv3 = version_factory(addon=addon)
+        uv1 = version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        uv1.delete()
+        uv2 = version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        uv3 = version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+
+        data = {
+            'channel': amo.CHANNEL_LISTED,
+            'listed_version': lv2.id,
+            'unlisted_version': uv2.id,
+        }
+        for version in (lv1, lv2, lv3, uv1, uv2, uv3):
+            check_already_exists_error(version)
+        data['channel'] = amo.CHANNEL_UNLISTED
+        for version in (lv1, lv2, lv3, uv1, uv2, uv3):
+            check_already_exists_error(version)
+
+    def test_clean_new_version_string_for_listed_greater_than_existing(self):
+        addon = addon_factory(
+            version_kw={'version': '1.29'}, file_kw={'is_signed': True}
+        )
+        addon.current_version.delete()  # deleted shouldn't matter, just it was signed
+        lv2 = version_factory(addon=addon)
+        version_factory(addon=addon, version='1.31.0')
+        version_factory(
+            addon=addon,
+            channel=amo.CHANNEL_UNLISTED,
+            version='1.28',
+            file_kw={'is_signed': True},
+        )
+        uv2 = version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+
+        # 1.3 is not greater than 1.29
+        version_string = '1.3'
+        data = {
+            'channel': amo.CHANNEL_LISTED,
+            'listed_version': lv2.id,
+            'unlisted_version': uv2.id,
+            'new_version_string': version_string,
+        }
+
+        form = forms.RollbackVersionForm(data, addon=addon)
+        assert not form.is_valid()
+        assert form.errors == {
+            'new_version_string': [
+                f'Version {version_string} must be greater than the previous approved '
+                f'version 1.29.'
+            ]
+        }
+
+        # There are no restrictions on greater/less than for unlisted
+        form = forms.RollbackVersionForm(
+            {**data, 'channel': amo.CHANNEL_UNLISTED}, addon=addon
+        )
+        assert form.is_valid()
+
+    def test_clean_adds_version_for_listed(self):
+        addon = addon_factory()
+        lv1 = addon.current_version
+        version_factory(addon=addon)
+        uv1 = version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        data = {
+            'channel': amo.CHANNEL_LISTED,
+            'listed_version': lv1.id,
+            'unlisted_version': uv1.id,
+            'new_version_string': '111111',
+        }
+        # test we're selecting the listed channel
+        form = forms.RollbackVersionForm(data, addon=addon)
+        assert [str(lab) for _, lab in form.fields['listed_version'].choices] == [
+            lv1.version,
+        ]
+        assert form.is_valid(), form.errors
+        # the listed version is added, and as the chosen version
+        assert form.clean() == {
+            'channel': amo.CHANNEL_LISTED,
+            'new_version_string': '111111',
+            'unlisted_version': uv1,
+            'listed_version': lv1,
+            'enterprise_version': None,
+            'version': lv1,
+            'release_notes': {'en-us': None},
+        }
+
+    def test_clean_adds_version_for_unlisted(self):
+        addon = addon_factory()
+        lv1 = addon.current_version
+        version_factory(addon=addon)
+        uv1 = version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        data = {
+            'channel': amo.CHANNEL_UNLISTED,
+            'listed_version': lv1.id,
+            'unlisted_version': uv1.id,
+            'new_version_string': '111111',
+        }
+        form = forms.RollbackVersionForm(data, addon=addon)
+        assert form.is_valid(), form.errors
+        # the selected unlisted version is added as the chosen version
+        assert form.clean() == {
+            'channel': amo.CHANNEL_UNLISTED,
+            'new_version_string': '111111',
+            'unlisted_version': uv1,
+            'listed_version': lv1,
+            'enterprise_version': None,
+            'version': uv1,
+            'release_notes': {'en-us': None},
+        }
+
+    def test_clean_errors_when_no_version_for_channel(self):
+        addon = addon_factory()
+        version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        data = {
+            'channel': amo.CHANNEL_LISTED,
+            'new_version_string': '111111',
+        }
+        form = forms.RollbackVersionForm(data, addon=addon)
+        assert not form.is_valid()
+        assert form.errors == {
+            '__all__': ['You must select a channel and version to rollback to.'],
+        }
+
+    def test_can_rollback(self):
+        addon = addon_factory()
+        lv2 = version_factory(addon=addon)
+        version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        uv2 = version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        form = forms.RollbackVersionForm(addon=addon)
+        assert form.can_rollback() is True
+
+        with override_switch('version-rollback', active=False):
+            form = forms.RollbackVersionForm(addon=addon)
+            assert form.can_rollback() is False
+
+        lv2.file.update(status=amo.STATUS_DISABLED)
+        form = forms.RollbackVersionForm(addon=addon)
+        assert form.can_rollback() is True
+
+        uv2.file.update(status=amo.STATUS_DISABLED)
+        form = forms.RollbackVersionForm(addon=addon)
+        assert form.can_rollback() is False

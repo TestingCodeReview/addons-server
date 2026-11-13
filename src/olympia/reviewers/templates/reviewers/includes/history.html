@@ -1,14 +1,85 @@
 <tr>
   <th>
     {{ record.log.short|default }}
-  </th>
-  <td>
-    {% trans user = record.user|user_link, date = record.created|datetime %}
-      <div>By {{ user }} on {{ date }}</div>
-    {% endtrans %}
-    {% if record.details %}
-      {# <pre> rather than <div> so that white space is preserved on copy #}
-      <pre class="light history-comment">{{ record.details.comments }}</pre>
+    {% if record.details and record.details.channel %}
+      ({{ amo.CHANNEL_CHOICES.get(record.details.channel) }})
     {% endif %}
+  </th>
+  <td class="record-container">
+      <div>
+        <div>By {{ record.user|user_link }} on {{ record.created|datetime }}</div>
+        {% if record.details %}
+          {% if record.details.versions %}
+            {% set affected = record.details.versions|count %}
+            {% if affected > 1 or show_long_format_fallback %}
+              <details>
+                <summary>{{ affected }} version(s) affected</summary>
+                <ul>
+                  {% for version in record.details.versions[:MAX_VERSIONS_SHOWN_INLINE] %}
+                    <li>{{ version }}</li>
+                  {% endfor %}
+                  {% if affected > MAX_VERSIONS_SHOWN_INLINE %}
+                    <li>...</li>
+                  {% endif %}
+                </ul>
+              </details>
+            {% endif %}
+          {% endif %}
+          <ul>
+          {% for policy_text in record.details.policy_texts %}
+            <li class="light history-comment">{{ policy_text }}</li>
+          {% endfor %}
+          </ul>
+          {% if record.details.comments %}
+            {# <pre> rather than <div> so that white space is preserved on copy #}
+            <pre class="light history-comment">{{ record.details.comments }}</pre>
+          {% endif %}
+          {% if restriction_history_by_id is defined and record.details.restriction_history_ids %}
+            <ul class="restriction-matches">
+              {% for history_id in record.details.restriction_history_ids %}
+                {% set entry = restriction_history_by_id.get(history_id) %}
+                {% if entry %}
+                  <li class="light">
+                    {{ entry.get_restriction_display() }}:
+                    {% if entry.restriction_instance %}
+                      {% if entry.admin_url and is_advanced_admin %}
+                        <a href="{{ entry.admin_url }}">{{ entry.restriction_instance }}</a>
+                      {% else %}
+                        {{ entry.restriction_instance }}
+                      {% endif %}
+                    {% elif entry.restriction_object_id %}
+                      (restriction since removed)
+                    {% else %}
+                      (no specific restriction matched)
+                    {% endif %}
+                  </li>
+                {% endif %}
+              {% endfor %}
+            </ul>
+          {% endif %}
+          {% if record.details.reason %}
+            <pre class="light history-comment">Reason: {{ record.details.reason }}</pre>
+          {% endif %}
+        {% elif show_long_format_fallback %}
+          {% spaceless %}
+            <pre class="light history-comment">
+              {{ record.to_string('reviewer') }}
+              {% if record.action == amo.LOG.EDIT_ADDON_PROPERTY.id %}
+                <div class="property-changes">{{ activity_changes(record) }}</div>
+              {% endif -%}
+            </pre>
+          {% endspaceless %}
+        {% endif %}
+      </div>
+      {% if switch_is_active('enable-activity-log-attachments') %}
+          {% if record.attachmentlog %}
+            {% with attachment=record.attachmentlog.file %}
+            <div>
+              <a class="download-reply-attachment" href="{{ url('activity.attachment', record.pk) }}" download>Download Attachment</a> ({{attachment.size|filesizeformat}})
+            </div>
+            {% endwith %}
+          {% endif %}
+      {% endif %}
   </td>
+  
 </tr>

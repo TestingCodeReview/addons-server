@@ -2,30 +2,49 @@ import base64
 import binascii
 import functools
 import os
+import time
+from urllib.parse import quote_plus
 
 from django.conf import settings
 from django.contrib.auth import login, logout
-from django.contrib.auth.signals import user_logged_in
-from django.core import signing
+from django.core.signing import (
+    BadSignature,
+    SignatureExpired,
+    TimestampSigner,
+    constant_time_compare,
+)
 from django.db.models import Q
-from django.http import Http404, HttpResponseRedirect
+from django.http import HttpResponseNotAllowed, HttpResponseRedirect, QueryDict
+from django.template.response import TemplateResponse
 from django.urls import reverse
-from django.utils.encoding import force_bytes, force_text
+from django.utils.decorators import method_decorator
+from django.utils.encoding import force_bytes, force_str
 from django.utils.html import format_html
-from django.utils.http import is_safe_url
-from django.utils.translation import ugettext, ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
+from django.views.decorators.cache import never_cache
 
-import six
-import waffle
-
-from rest_framework import serializers
+import jwt
+import requests
+from corsheaders.conf import conf as corsheaders_conf
+from corsheaders.middleware import (
+    ACCESS_CONTROL_ALLOW_CREDENTIALS,
+    ACCESS_CONTROL_ALLOW_HEADERS,
+    ACCESS_CONTROL_ALLOW_METHODS,
+    ACCESS_CONTROL_ALLOW_ORIGIN,
+    ACCESS_CONTROL_MAX_AGE,
+)
+from django_statsd.clients import statsd
+from rest_framework import exceptions, serializers
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.decorators import action
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.generics import GenericAPIView
 from rest_framework.mixins import (
-    DestroyModelMixin, ListModelMixin, RetrieveModelMixin, UpdateModelMixin)
-from rest_framework.permissions import (
-    AllowAny, BasePermission, IsAuthenticated)
+    DestroyModelMixin,
+    ListModelMixin,
+    RetrieveModelMixin,
+    UpdateModelMixin,
+)
+from rest_framework.permissions import AllowAny, BasePermission, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.status import HTTP_204_NO_CONTENT
 from rest_framework.views import APIView
@@ -33,25 +52,42 @@ from rest_framework.viewsets import GenericViewSet
 from waffle.decorators import waffle_switch
 
 import olympia.core.logger
-
 from olympia import amo
 from olympia.access import acl
 from olympia.access.models import GroupUser
-from olympia.amo import messages
-from olympia.amo.decorators import use_primary_db
-from olympia.amo.utils import fetch_subscribed_newsletters
+from olympia.accounts.decorators import two_factor_auth_required
+from olympia.activity.models import ActivityLog
+from olympia.amo.decorators import login_required, use_primary_db
+from olympia.amo.reverse import get_url_prefix
+from olympia.amo.utils import fetch_subscribed_newsletters, is_safe_url, use_fake_fxa
 from olympia.api.authentication import (
-    JWTKeyAuthentication, WebTokenAuthentication)
+    JWTKeyAuthentication,
+    SessionIDAuthentication,
+    UnsubscribeTokenAuthentication,
+)
 from olympia.api.permissions import AnyOf, ByHttpMethod, GroupPermission
 from olympia.users.models import UserNotification, UserProfile
 from olympia.users.notifications import (
-    NOTIFICATIONS_COMBINED, REMOTE_NOTIFICATIONS_BY_BASKET_ID)
+    NOTIFICATIONS_COMBINED,
+    REMOTE_NOTIFICATIONS_BY_BASKET_ID,
+)
 
 from . import verify
 from .serializers import (
-    AccountSuperCreateSerializer, PublicUserProfileSerializer,
-    UserNotificationSerializer, UserProfileSerializer)
-from .utils import fxa_login_url, generate_fxa_state
+    AccountSuperCreateSerializer,
+    FullUserProfileSerializer,
+    LookupUserProfileSerializer,
+    MinimalUserProfileSerializer,
+    SelfUserProfileSerializer,
+    UserNotificationSerializer,
+)
+from .tasks import clear_sessions_event, delete_user_event, primary_email_change_event
+from .utils import (
+    get_fxa_config,
+    get_fxa_config_name,
+    redirect_for_login,
+    redirect_for_login_with_2fa_enforced,
+)
 
 
 log = olympia.core.logger.getLogger('accounts')
@@ -61,88 +97,92 @@ ERROR_NO_CODE = 'no-code'
 ERROR_NO_PROFILE = 'no-profile'
 ERROR_NO_USER = 'no-user'
 ERROR_STATE_MISMATCH = 'state-mismatch'
-ERROR_STATUSES = {
-    ERROR_AUTHENTICATED: 400,
-    ERROR_NO_CODE: 422,
-    ERROR_NO_PROFILE: 401,
-    ERROR_STATE_MISMATCH: 400,
-}
-LOGIN_ERROR_MESSAGES = {
-    ERROR_AUTHENTICATED: _(u'You are already logged in.'),
-    ERROR_NO_CODE:
-        _(u'Your login attempt could not be parsed. Please try again.'),
-    ERROR_NO_PROFILE:
-        _(u'Your Firefox Account could not be found. Please try again.'),
-    ERROR_STATE_MISMATCH: _(u'You could not be logged in. Please try again.'),
-}
-
-# Name of the cookie that contains the auth token for the API. It used to be
-# "api_auth_token" but we had to change it because it wasn't set on the right
-# domain, and we couldn't clear both the old and new versions at the same time,
-# since sending multiple Set-Cookie headers with the same name is not allowed
-# by the spec, even if they have a distinct domain attribute.
-API_TOKEN_COOKIE = 'frontend_auth_token'
+ERROR_FXA_ERROR = 'error-fxa'
+ERROR_RESTORE_POST_MISSING_DATA = 'error-restore-post-missing-data'
+ERROR_RESTORE_POST_EXPIRED_SIGNATURE = 'error-restore-post-expired-signature'
+ERROR_RESTORE_POST_INVALID_SIGNATURE = 'error-restore-post-invalid-signature'
+ERROR_RESTORE_POST_UNSAFE_URL = 'error-restore-post-unsafe-url'
 
 
-def safe_redirect(url, action):
-    if not is_safe_url(url):
+def safe_redirect(request, url, action):
+    if not is_safe_url(url, request):
         url = reverse('home')
-    log.info(u'Redirecting after {} to: {}'.format(action, url))
+    log.info(f'Redirecting after {action} to: {url}')
     return HttpResponseRedirect(url)
 
 
 def find_user(identity):
-    """Try to find a user for a Firefox Accounts profile. If the account
-    hasn't been migrated we'll need to do the lookup by email but we should
-    use the ID after that so check both.
+    """Try to find a user for a Mozilla accounts profile. Try fxa_id first, but
+    if no account is found that way fall back on email (user hasn't logged in
+    since the introduction of FxA).
 
-    If we get multiple users we're in some weird state where the accounts need
-    to be merged but that behaviour hasn't been defined so let it raise.
+    If the user email belongs to a banned user, raise an error, they shouldn't
+    be able to bypass the ban with another FxA with the same email.
 
-    If the user is deleted but we were still able to find them using their
-    email or fxa_id, throw an error - they are banned, they shouldn't be able
-    to log in anymore.
+    Ther user returned can be a deleted (not banned) user: they will be
+    undeleted by the authenticate view.
     """
     try:
-        user = UserProfile.objects.get(
-            Q(fxa_id=identity['uid']) | Q(email=identity['email']))
-        is_task_user = user.id == settings.TASK_USER_ID
-        if user.deleted or is_task_user:
-            # If the user was found through its email/fxa_id but is deleted, it
-            # means we wanted to ban them. Raise a 403, it's not the prettiest
-            # but should be enough.
-            # Alternatively if someone tried to log in as the task user then
-            # prevent that because that user "owns" a number of important
-            # addons and collections, and it's actions are special cased.
-            raise PermissionDenied()
-        return user
+        user = UserProfile.objects.get(fxa_id=identity['uid'])
     except UserProfile.DoesNotExist:
-        return None
-    except UserProfile.MultipleObjectsReturned:
-        # This shouldn't happen, so let it raise.
-        log.error(
-            'Found multiple users for {email} and {uid}'.format(**identity))
-        raise
+        try:
+            # Fall back to email for old accounts that never used FxA before.
+            user = UserProfile.objects.get(fxa_id=None, email=identity['email'])
+        except UserProfile.DoesNotExist:
+            return None
 
+        # It's technically possible to raise MultipleObjectsReturned here, if
+        # somehow multiple accounts are sharing the same email while having no
+        # FxA id. In practice we used to have an uniqueness constraint on
+        # email before FxA was introduced, and even for a long time after, so
+        # this shouldn't happen.
 
-def register_user(sender, request, identity):
-    user = UserProfile.objects.create_user(
-        email=identity['email'], username=None, fxa_id=identity['uid'])
-    log.info('Created user {} from FxA'.format(user))
-    login_user(sender, request, user, identity)
+    is_task_user = user.id == settings.TASK_USER_ID
+    # If we find anyone with that email that has ever been banned, we want to
+    # prevent them from logging in no matter what.
+    is_banned = UserProfile.objects.filter(
+        Q(email=identity['email']) | Q(fxa_id=identity['uid']), banned__isnull=False
+    ).exists()
+    if is_banned or is_task_user:
+        # If the user was banned raise a 403, it's not the prettiest
+        # but should be enough.
+        # Alternatively if someone tried to log in as the task user then
+        # prevent that because that user "owns" a number of important
+        # addons and collections, and it's actions are special cased.
+        raise exceptions.PermissionDenied()
     return user
+
+
+def register_user(identity):
+    user = UserProfile.objects.create_user(
+        email=identity['email'], fxa_id=identity['uid']
+    )
+    log.info(f'Created user {user} from FxA')
+    statsd.incr('accounts.account_created_from_fxa')
+    return user
+
+
+def reregister_user(user):
+    user.update(deleted=False)
+    log.info(f'Re-created deleted user {user} from FxA')
+    statsd.incr('accounts.account_created_from_fxa')
+    statsd.incr('accounts.account_recreated_from_fxa')
 
 
 def update_user(user, identity):
     """Update a user's info from FxA if needed, as well as generating the id
     that is used as part of the session/api token generation."""
-    if (user.fxa_id != identity['uid'] or
-            user.email != identity['email']):
+    if user.fxa_id != identity['uid'] or user.email != identity['email']:
         log.info(
             'Updating user info from FxA for {pk}. Old {old_email} {old_uid} '
             'New {new_email} {new_uid}'.format(
-                pk=user.pk, old_email=user.email, old_uid=user.fxa_id,
-                new_email=identity['email'], new_uid=identity['uid']))
+                pk=user.pk,
+                old_email=user.email,
+                old_uid=user.fxa_id,
+                new_email=identity['email'],
+                new_uid=identity['uid'],
+            )
+        )
         user.update(fxa_id=identity['uid'], email=identity['email'])
     if user.auth_id is None:
         # If the user didn't have an auth id (old user account created before
@@ -150,243 +190,280 @@ def update_user(user, identity):
         user.update(auth_id=UserProfile._meta.get_field('auth_id').default())
 
 
-def login_user(sender, request, user, identity):
+def login_user(sender, request, user, identity, token_data=None):
     update_user(user, identity)
-    log.info('Logging in user {} from FxA'.format(user))
-    user_logged_in.send(sender=sender, request=request, user=user)
+    log.info('Logging in user %s from FxA', user)
     login(request, user)
+    request.session['has_two_factor_authentication'] = identity.get(
+        'twoFactorAuthentication'
+    )
+    if user.groups_list:
+        # Users with permissions get shorter session expiry when logging in.
+        request.session.set_expiry(settings.SESSION_EXPIRY_PRIVILEGED_USER)
+    if token_data:
+        # auth_at is a UTC timestamp
+        request.session['fxa_auth_at'] = token_data.get('auth_at')
+        request.session['fxa_access_token'] = token_data['access_token']
+        request.session['fxa_access_token_expiry'] = token_data['access_token_expiry']
+        request.session['fxa_refresh_token'] = token_data['refresh_token']
+        request.session['fxa_config_name'] = token_data['config_name']
 
 
 def fxa_error_message(message, login_help_url):
     return format_html(
-        u'{error} <a href="{url}">{help_text}</a>',
-        url=login_help_url, help_text=_(u'Need help?'),
-        error=message)
+        '{error} <a href="{url}">{help_text}</a>',
+        url=login_help_url,
+        help_text=_('Need help?'),
+        error=message,
+    )
 
 
-LOGIN_HELP_URL = (
-    'https://support.mozilla.org/kb/access-your-add-ons-firefox-accounts')
+LOGIN_HELP_URL = 'https://support.mozilla.org/kb/access-your-add-ons-firefox-accounts'
 
 
-def render_error(request, error, next_path=None, format=None):
-    if format == 'json':
-        status = ERROR_STATUSES.get(error, 422)
-        response = Response({'error': error}, status=status)
-    else:
-        if not is_safe_url(next_path):
-            next_path = None
-        messages.error(
-            request,
-            fxa_error_message(LOGIN_ERROR_MESSAGES[error], LOGIN_HELP_URL),
-            extra_tags='fxa')
-        if next_path is None:
-            response = HttpResponseRedirect(reverse('users.login'))
-        else:
-            response = HttpResponseRedirect(next_path)
-    return response
-
-
-def parse_next_path(state_parts):
+def parse_next_path(state_parts, request=None):
     next_path = None
     if len(state_parts) == 2:
         # The = signs will be stripped off so we need to add them back
         # but it only cares if there are too few so add 4 of them.
         encoded_path = state_parts[1] + '===='
         try:
-            next_path = base64.urlsafe_b64decode(
-                force_bytes(encoded_path)).decode('utf-8')
+            next_path = base64.urlsafe_b64decode(force_bytes(encoded_path)).decode(
+                'utf-8'
+            )
         except (TypeError, ValueError):
-            log.info('Error decoding next_path {}'.format(
-                encoded_path))
-            pass
-    if not is_safe_url(next_path):
+            log.info(f'Error decoding next_path {encoded_path}')
+    if not is_safe_url(next_path, request):
         next_path = None
     return next_path
 
 
-def with_user(format, config=None):
+def with_user(f):
+    @functools.wraps(f)
+    @use_primary_db
+    def inner(self, request):
+        # If we get an error, we want a new session without the 2FA enforcement
+        # requirement active and with a fresh state for future authentication
+        # attempts, so pop them.
+        enforce_2fa_for_this_session = request.session.pop('enforce_2fa', False)
+        fxa_state_session = request.session.pop('fxa_state', None)
 
-    def outer(fn):
-        @functools.wraps(fn)
-        @use_primary_db
-        def inner(self, request):
-            if config is None:
-                if hasattr(self, 'get_fxa_config'):
-                    fxa_config = self.get_fxa_config(request)
-                else:
-                    fxa_config = (
-                        settings.FXA_CONFIG[settings.DEFAULT_FXA_CONFIG_NAME])
+        fxa_config = get_fxa_config(request)
+        if request.method == 'GET':
+            data = request.query_params
+        else:
+            data = request.data
+        state_parts = data.get('state', '').split(':', 1)
+        state = state_parts[0]
+        next_path = parse_next_path(state_parts, request)
+
+        if not fxa_state_session or fxa_state_session != state:
+            log.info(
+                'FxA Auth State mismatch: {state} Session: {fxa_state_session}'.format(
+                    state=data.get('state'),
+                    fxa_state_session=fxa_state_session,
+                )
+            )
+            # Redirect to / as the state mismatch indicates the next path might
+            # not be reliable.
+            return safe_redirect(request, '/', ERROR_STATE_MISMATCH)
+        elif data.get('error'):
+            if enforce_2fa_for_this_session:
+                # If we're trying to enforce 2FA, we should try again without
+                # prompt=none (and a new state), maybe there is a mismatch
+                # between what user we currently have logged in and what
+                # Mozilla account the browser is logged into.
+                return redirect_for_login_with_2fa_enforced(
+                    request,
+                    config=fxa_config,
+                    next_path=next_path,
+                )
             else:
-                fxa_config = config
-
-            if request.method == 'GET':
-                data = request.query_params
+                return safe_redirect(request, next_path, ERROR_FXA_ERROR)
+        elif not data.get('code'):
+            log.info('No code provided.')
+            return safe_redirect(request, next_path, ERROR_NO_CODE)
+        elif request.user.is_authenticated and not enforce_2fa_for_this_session:
+            return safe_redirect(request, next_path, ERROR_AUTHENTICATED)
+        try:
+            if use_fake_fxa(fxa_config) and 'fake_fxa_email' in data:
+                # Bypassing real authentication, we take the email provided
+                # and grab the first corresponding fxa_id we can find (or
+                # generate a random one if we couldn't find any).
+                fxa_id = (
+                    UserProfile.objects.filter(email=data['fake_fxa_email'])
+                    .values_list('fxa_id', flat=True)
+                    .order_by('pk')
+                    .first()
+                ) or 'fake_fxa_id-%s' % force_str(binascii.b2a_hex(os.urandom(16)))
+                identity = {
+                    'email': data['fake_fxa_email'],
+                    'uid': fxa_id,
+                    'twoFactorAuthentication': data.get(
+                        'fake_two_factor_authentication'
+                    ),
+                }
+                id_token, token_data = (
+                    identity['email'],
+                    {
+                        'auth_at': int(time.time()),
+                        'access_token': 'fake_access_token',
+                        'access_token_expiry': 0,
+                        'refresh_token': 'fake_refresh_token',
+                        'config_name': get_fxa_config_name(request),
+                    },
+                )
             else:
-                data = request.data
+                identity, token_data = verify.fxa_identify(
+                    data['code'], config=fxa_config
+                )
+                token_data['config_name'] = get_fxa_config_name(request)
+                id_token = token_data.get('id_token')
+        except verify.IdentificationError:
+            log.info('Profile not found. Code: {}'.format(data['code']))
+            return safe_redirect(request, next_path, ERROR_NO_PROFILE)
+        else:
+            # The following log statement is used by foxsec-pipeline.
+            log.info(
+                'Logging in FxA user %s',
+                identity['email'],
+                extra={'sensitive': True},
+            )
+            user = find_user(identity)
+            if (
+                user
+                and not identity.get('twoFactorAuthentication')
+                and (
+                    user.is_addon_developer
+                    or user.groups_list
+                    or enforce_2fa_for_this_session
+                )
+            ):
+                # https://github.com/mozilla/addons/issues/732
+                # https://github.com/mozilla/addons-server/issues/20943
+                # The user is an add-on developer (with other types of add-ons
+                # than just themes) or part of any group (so they are special
+                # in some way, may be an admin or a reviewer), or trying to
+                # access a page restricted to users with 2FA and they have
+                # successfully logged in from FxA, but without a second factor.
+                # Immediately redirect them to start the FxA flow again, this
+                # time requesting 2FA to be present:
+                # They should be automatically logged in FxA with the existing
+                # id_token, and should be prompted to create the second factor
+                # before coming back to AMO.
+                log.info('Redirecting user %s to enforce 2FA', user)
+                # There wasn't any error, we can keep the original state.
+                request.session['fxa_state'] = fxa_state_session
+                return redirect_for_login_with_2fa_enforced(
+                    request,
+                    next_path=next_path,
+                    id_token_hint=id_token,
+                )
+            return f(
+                self,
+                request,
+                user=user,
+                identity=identity,
+                next_path=next_path,
+                token_data=token_data,
+            )
 
-            state_parts = data.get('state', '').split(':', 1)
-            state = state_parts[0]
-            next_path = parse_next_path(state_parts)
-            if not data.get('code'):
-                log.info('No code provided.')
-                return render_error(
-                    request, ERROR_NO_CODE, next_path=next_path, format=format)
-            elif (not request.session.get('fxa_state') or
-                    request.session['fxa_state'] != state):
-                log.info(
-                    'State mismatch. URL: {url} Session: {session}'.format(
-                        url=data.get('state'),
-                        session=request.session.get('fxa_state'),
-                    ))
-                return render_error(
-                    request, ERROR_STATE_MISMATCH, next_path=next_path,
-                    format=format)
-            elif request.user.is_authenticated:
-                response = render_error(
-                    request, ERROR_AUTHENTICATED, next_path=next_path,
-                    format=format)
-                # If the api token cookie is missing but we're still
-                # authenticated using the session, add it back.
-                if API_TOKEN_COOKIE not in request.COOKIES:
-                    log.info('User %s was already authenticated but did not '
-                             'have an API token cookie, adding one.',
-                             request.user.pk)
-                    response = add_api_token_to_response(
-                        response, request.user)
-                return response
-            try:
-                identity = verify.fxa_identify(data['code'], config=fxa_config)
-            except verify.IdentificationError:
-                log.info('Profile not found. Code: {}'.format(data['code']))
-                return render_error(
-                    request, ERROR_NO_PROFILE, next_path=next_path,
-                    format=format)
-            else:
-                user = find_user(identity)
-                if (waffle.switch_is_active('2fa-for-developers') and
-                        user and user.is_addon_developer and
-                        not identity.get('twoFactorAuthentication')):
-                    # https://github.com/mozilla/addons/issues/732
-                    # The user is an add-on developer (with other types of
-                    # add-ons than just themes), but hasn't logged in with a
-                    # second factor. Immediately redirect them to start the FxA
-                    # flow again, this time requesting 2FA to be present.
-                    return HttpResponseRedirect(
-                        fxa_login_url(
-                            config=fxa_config,
-                            state=request.session['fxa_state'],
-                            next_path=next_path,
-                            action='signin',
-                            force_two_factor=True
-                        )
-                    )
-                return fn(
-                    self, request, user=user, identity=identity,
-                    next_path=next_path)
-        return inner
-    return outer
+    return inner
 
 
-def generate_api_token(user):
-    """Generate a new API token for a given user."""
-    data = {
-        'auth_hash': user.get_session_auth_hash(),
-        'user_id': user.pk,
-    }
-    return signing.dumps(data, salt=WebTokenAuthentication.salt)
-
-
-def add_api_token_to_response(response, user):
-    """Generate API token and add it to the response (both as a `token` key in
-    the response if it was json and by setting a cookie named API_TOKEN_COOKIE.
-    """
-    token = generate_api_token(user)
-    if hasattr(response, 'data'):
-        response.data['token'] = token
-    # Also include the API token in a session cookie, so that it is
-    # available for universal frontend apps.
-    response.set_cookie(
-        API_TOKEN_COOKIE,
-        token,
-        domain=settings.SESSION_COOKIE_DOMAIN,
-        max_age=settings.SESSION_COOKIE_AGE,
-        secure=settings.SESSION_COOKIE_SECURE,
-        httponly=settings.SESSION_COOKIE_HTTPONLY)
-
-    return response
-
-
-class FxAConfigMixin(object):
-
-    def get_config_name(self, request):
-        return request.GET.get('config', self.DEFAULT_FXA_CONFIG_NAME)
-
-    def get_allowed_configs(self):
-        return getattr(
-            self, 'ALLOWED_FXA_CONFIGS', [self.DEFAULT_FXA_CONFIG_NAME])
-
-    def get_fxa_config(self, request):
-        config_name = self.get_config_name(request)
-        if config_name in self.get_allowed_configs():
-            return settings.FXA_CONFIG[config_name]
-        log.info('Using default FxA config instead of {}'.format(config_name))
-        return settings.FXA_CONFIG[self.DEFAULT_FXA_CONFIG_NAME]
-
-
-class LoginStartBaseView(FxAConfigMixin, APIView):
-
+class LoginStartView(APIView):
+    @method_decorator(never_cache)
     def get(self, request):
-        request.session.setdefault('fxa_state', generate_fxa_state())
-        return HttpResponseRedirect(
-            fxa_login_url(
-                config=self.get_fxa_config(request),
-                state=request.session['fxa_state'],
-                next_path=request.GET.get('to'),
-                action=request.GET.get('action', 'signin')))
+        return redirect_for_login(request, next_path=request.GET.get('to', ''))
 
 
-class LoginStartView(LoginStartBaseView):
-    DEFAULT_FXA_CONFIG_NAME = settings.DEFAULT_FXA_CONFIG_NAME
-    ALLOWED_FXA_CONFIGS = settings.ALLOWED_FXA_CONFIGS
-
-
-class AuthenticateView(FxAConfigMixin, APIView):
-    DEFAULT_FXA_CONFIG_NAME = settings.DEFAULT_FXA_CONFIG_NAME
-    ALLOWED_FXA_CONFIGS = settings.ALLOWED_FXA_CONFIGS
-
+class AuthenticateView(APIView):
     authentication_classes = (SessionAuthentication,)
 
-    @with_user(format='html')
-    def get(self, request, user, identity, next_path):
+    @method_decorator(never_cache)
+    @with_user
+    def get(self, request, user, identity, next_path, token_data):
         # At this point @with_user guarantees that we have a valid fxa
         # identity. We are proceeding with either registering the user or
         # logging them on.
-        if user is None:
-            user = register_user(self.__class__, request, identity)
-            fxa_config = self.get_fxa_config(request)
-            if fxa_config.get('skip_register_redirect'):
-                response = safe_redirect(next_path, 'register')
+        if user is None or user.deleted:
+            action = 'register'
+            if user is None:
+                user = register_user(identity)
             else:
-                response = safe_redirect(reverse('users.edit'), 'register')
+                reregister_user(user)
+            if not is_safe_url(next_path, request):
+                next_path = None
+            # If we just reverse() directly, we'd use a prefixer instance
+            # initialized from the current view, which would not contain the
+            # app information since it's a generic callback, the same for
+            # everyone. To ensure the user stays on the app/locale they were
+            # on, we extract that information from the next_path if present
+            # and set locale/app on the prefixer instance that reverse() will
+            # use automatically.
+            if next_path and (prefixer := get_url_prefix()):
+                splitted = prefixer.split_path(next_path)
+                prefixer.locale = splitted[0]
+                prefixer.app = splitted[1]
+            edit_page = reverse('users.edit')
+            if next_path:
+                next_path = f'{edit_page}?to={quote_plus(next_path)}'
+            else:
+                next_path = edit_page
         else:
-            login_user(self.__class__, request, user, identity)
-            response = safe_redirect(next_path, 'login')
-        add_api_token_to_response(response, user)
-        return response
+            action = 'login'
+
+        login_user(self.__class__, request, user, identity, token_data)
+        return safe_redirect(request, next_path, action)
 
 
 def logout_user(request, response):
+    if request.user and request.user.is_authenticated:
+        # Logging out invalidates *all* user sessions. A new auth_id will be
+        # generated during the next login.
+        request.user.update(auth_id=None)
     logout(request)
-    response.delete_cookie(
-        API_TOKEN_COOKIE, domain=settings.SESSION_COOKIE_DOMAIN)
 
 
+# This view is not covered by the CORS middleware, see:
+# https://github.com/mozilla/addons-server/issues/11100
 class SessionView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [
+        ByHttpMethod(
+            {
+                'options': AllowAny,  # Needed for CORS.
+                'delete': IsAuthenticated,
+            }
+        ),
+    ]
+
+    def options(self, request, *args, **kwargs):
+        response = Response()
+        response['Content-Length'] = '0'
+        origin = request.META.get('HTTP_ORIGIN')
+        if not origin:
+            return response
+        response[ACCESS_CONTROL_ALLOW_ORIGIN] = origin
+        response[ACCESS_CONTROL_ALLOW_CREDENTIALS] = 'true'
+        # Mimics the django-cors-headers middleware.
+        response[ACCESS_CONTROL_ALLOW_HEADERS] = ', '.join(
+            corsheaders_conf.CORS_ALLOW_HEADERS
+        )
+        response[ACCESS_CONTROL_ALLOW_METHODS] = ', '.join(
+            corsheaders_conf.CORS_ALLOW_METHODS
+        )
+        if corsheaders_conf.CORS_PREFLIGHT_MAX_AGE:
+            response[ACCESS_CONTROL_MAX_AGE] = corsheaders_conf.CORS_PREFLIGHT_MAX_AGE
+        return response
 
     def delete(self, request, *args, **kwargs):
         response = Response({'ok': True})
         logout_user(request, response)
+        origin = request.META.get('HTTP_ORIGIN')
+        if not origin:
+            return response
+        response[ACCESS_CONTROL_ALLOW_ORIGIN] = origin
+        response[ACCESS_CONTROL_ALLOW_CREDENTIALS] = 'true'
         return response
 
 
@@ -398,19 +475,21 @@ class AllowSelf(BasePermission):
         return request.user.is_authenticated and obj == request.user
 
 
-class AccountViewSet(RetrieveModelMixin, UpdateModelMixin, DestroyModelMixin,
-                     GenericViewSet):
+class AccountViewSet(
+    RetrieveModelMixin, UpdateModelMixin, DestroyModelMixin, GenericViewSet
+):
+    authentication_classes = [JWTKeyAuthentication, SessionIDAuthentication]
     permission_classes = [
-        ByHttpMethod({
-            'get': AllowAny,
-            'head': AllowAny,
-            'options': AllowAny,  # Needed for CORS.
-            # To edit a profile it has to yours, or be an admin.
-            'patch': AnyOf(AllowSelf, GroupPermission(
-                amo.permissions.USERS_EDIT)),
-            'delete': AnyOf(AllowSelf, GroupPermission(
-                amo.permissions.USERS_EDIT)),
-        }),
+        ByHttpMethod(
+            {
+                'get': AllowAny,
+                'head': AllowAny,
+                'options': AllowAny,  # Needed for CORS.
+                # To edit a profile it has to yours, or be an admin.
+                'patch': AnyOf(AllowSelf, GroupPermission(amo.permissions.USERS_EDIT)),
+                'delete': AnyOf(AllowSelf, GroupPermission(amo.permissions.USERS_EDIT)),
+            }
+        ),
     ]
     # Periods are not allowed in username, but we still have some in the
     # database so relax the lookup regexp to allow them to load their profile.
@@ -425,17 +504,8 @@ class AccountViewSet(RetrieveModelMixin, UpdateModelMixin, DestroyModelMixin,
         identifier = self.kwargs.get('pk')
         self.lookup_field = self.get_lookup_field(identifier)
         self.kwargs[self.lookup_field] = identifier
-        self.instance = super(AccountViewSet, self).get_object()
-        # action won't exist for other classes that are using this ViewSet.
-        can_view_instance = (
-            not getattr(self, 'action', None) or
-            self.self_view or
-            self.admin_viewing or
-            self.instance.is_public)
-        if can_view_instance:
-            return self.instance
-        else:
-            raise Http404
+        self.instance = super().get_object()
+        return self.instance
 
     def get_lookup_field(self, identifier):
         lookup_field = 'pk'
@@ -448,30 +518,31 @@ class AccountViewSet(RetrieveModelMixin, UpdateModelMixin, DestroyModelMixin,
     @property
     def self_view(self):
         return (
-            self.request.user.is_authenticated and
-            self.get_object() == self.request.user)
+            self.request.user.is_authenticated
+            and self.get_object() == self.request.user
+        )
 
     @property
     def admin_viewing(self):
-        return acl.action_allowed_user(
-            self.request.user, amo.permissions.USERS_EDIT)
+        return acl.action_allowed_for(self.request.user, amo.permissions.USERS_EDIT)
+
+    @property
+    def lookup_viewing(self):
+        return acl.action_allowed_for(self.request.user, amo.permissions.USERS_LOOKUP)
 
     def get_serializer_class(self):
         if self.self_view or self.admin_viewing:
-            return UserProfileSerializer
+            return SelfUserProfileSerializer
+        elif self.lookup_viewing:
+            return LookupUserProfileSerializer
+        elif self.get_object().has_full_profile:
+            return FullUserProfileSerializer
         else:
-            return PublicUserProfileSerializer
-
-    def perform_destroy(self, instance):
-        if instance.is_developer:
-            raise serializers.ValidationError(ugettext(
-                u'Developers of add-ons or themes cannot delete their '
-                u'account. You must delete all add-ons and themes linked to '
-                u'this account, or transfer them to other users.'))
-        return super(AccountViewSet, self).perform_destroy(instance)
+            return MinimalUserProfileSerializer
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
+        ActivityLog.objects.create(amo.LOG.USER_DELETED, instance)
         self.perform_destroy(instance)
         response = Response(status=HTTP_204_NO_CONTENT)
         if instance == request.user:
@@ -480,24 +551,59 @@ class AccountViewSet(RetrieveModelMixin, UpdateModelMixin, DestroyModelMixin,
 
     @action(
         detail=True,
-        methods=['delete'], permission_classes=[
-            AnyOf(AllowSelf, GroupPermission(amo.permissions.USERS_EDIT))])
+        methods=['delete'],
+        permission_classes=[
+            AnyOf(AllowSelf, GroupPermission(amo.permissions.USERS_EDIT))
+        ],
+    )
     def picture(self, request, pk=None):
         user = self.get_object()
         user.delete_picture()
-        log.debug(u'User (%s) deleted photo' % user)
+        log.info('User (%s) deleted photo' % user)
         return self.retrieve(request)
+
+    @action(
+        detail=False,
+        methods=['get'],
+        authentication_classes=[JWTKeyAuthentication],
+        permission_classes=[GroupPermission(amo.permissions.USERS_LOOKUP)],
+        url_path='lookup',
+    )
+    def lookup(self, request):
+        """Look up accounts by email address.
+
+        Requires authentication and Users:Lookup permission.
+        Returns a list since multiple accounts can share the same email.
+        """
+        email = request.query_params.get('email')
+        if not email:
+            raise exceptions.ValidationError(
+                {'email': 'This query parameter is required.'}
+            )
+        users = UserProfile.objects.exclude(deleted=True).filter(
+            email=email, fxa_id__isnull=False
+        )
+        if not users.exists():
+            raise exceptions.NotFound()
+        serializer = LookupUserProfileSerializer(
+            users, many=True, context={'request': request}
+        )
+        return Response(serializer.data)
 
 
 class ProfileView(APIView):
-    authentication_classes = [JWTKeyAuthentication, WebTokenAuthentication]
+    authentication_classes = [
+        JWTKeyAuthentication,
+        SessionIDAuthentication,
+    ]
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         account_viewset = AccountViewSet(
             request=request,
             permission_classes=self.permission_classes,
-            kwargs={'pk': six.text_type(self.request.user.pk)})
+            kwargs={'pk': str(self.request.user.pk)},
+        )
         account_viewset.format_kwarg = self.format_kwarg
         return account_viewset.retrieve(request)
 
@@ -506,29 +612,30 @@ class AccountSuperCreate(APIView):
     authentication_classes = [JWTKeyAuthentication]
     permission_classes = [
         IsAuthenticated,
-        GroupPermission(amo.permissions.ACCOUNTS_SUPER_CREATE)]
+        GroupPermission(amo.permissions.ACCOUNTS_SUPER_CREATE),
+    ]
 
     @waffle_switch('super-create-accounts')
     def post(self, request):
         serializer = AccountSuperCreateSerializer(data=request.data)
         if not serializer.is_valid():
-            return Response({'errors': serializer.errors},
-                            status=422)
+            return Response({'errors': serializer.errors}, status=422)
 
         data = serializer.data
 
         group = serializer.validated_data.get('group', None)
-        user_token = force_text(binascii.b2a_hex(os.urandom(4)))
-        username = data.get('username', 'super-created-{}'.format(user_token))
+        user_token = force_str(binascii.b2a_hex(os.urandom(4)))
+        username = data.get('username', f'super-created-{user_token}')
         fxa_id = data.get('fxa_id', None)
-        email = data.get('email', '{}@addons.mozilla.org'.format(username))
+        email = data.get('email', f'{username}@addons.mozilla.org')
 
         user = UserProfile.objects.create(
             username=username,
             email=email,
             fxa_id=fxa_id,
-            display_name='Super Created {}'.format(user_token),
-            notes='auto-generated from API')
+            display_name=f'Super Created {user_token}',
+            notes='auto-generated from API',
+        )
         user.save()
 
         if group:
@@ -538,11 +645,12 @@ class AccountSuperCreate(APIView):
         login_user(self.__class__, request, user, identity)
         request.session.save()
 
-        log.info(u'API user {api_user} created and logged in a user from '
-                 u'the super-create API: user_id: {user.pk}; '
-                 u'user_name: {user.username}; fxa_id: {user.fxa_id}; '
-                 u'group: {group}'
-                 .format(user=user, api_user=request.user, group=group))
+        log.info(
+            f'API user {request.user} created and logged in a user from '
+            f'the super-create API: user_id: {user.pk}; '
+            f'user_name: {user.username}; fxa_id: {user.fxa_id}; '
+            f'group: {group}'
+        )
 
         cookie = {
             'name': settings.SESSION_COOKIE_NAME,
@@ -550,46 +658,33 @@ class AccountSuperCreate(APIView):
         }
         cookie['encoded'] = '{name}={value}'.format(**cookie)
 
-        return Response({
-            'user_id': user.pk,
-            'username': user.username,
-            'email': user.email,
-            'display_name': user.display_name,
-            'groups': list((g.pk, g.name, g.rules) for g in user.groups.all()),
-            'fxa_id': user.fxa_id,
-            'session_cookie': cookie,
-        }, status=201)
+        return Response(
+            {
+                'user_id': user.pk,
+                'username': user.username,
+                'email': user.email,
+                'display_name': user.display_name,
+                'groups': [(g.pk, g.name, g.rules) for g in user.groups.all()],
+                'fxa_id': user.fxa_id,
+                'session_cookie': cookie,
+            },
+            status=201,
+        )
 
 
-class AccountNotificationViewSet(ListModelMixin, GenericViewSet):
-    """Returns account notifications.
-
-    If not already set by the user, defaults will be returned.
-    """
-
-    permission_classes = [IsAuthenticated]
-    # We're pushing the primary permission checking to AccountViewSet for ease.
-    account_permission_classes = [
-        AnyOf(AllowSelf, GroupPermission(amo.permissions.USERS_EDIT))]
-    serializer_class = UserNotificationSerializer
-    paginator = None
-
-    def get_account_viewset(self):
-        if not hasattr(self, 'account_viewset'):
-            self.account_viewset = AccountViewSet(
-                request=self.request,
-                permission_classes=self.account_permission_classes,
-                kwargs={'pk': self.kwargs['user_pk']})
-        return self.account_viewset
+class AccountNotificationMixin:
+    def get_user(self):
+        raise NotImplementedError
 
     def _get_default_object(self, notification):
         return UserNotification(
-            user=self.get_account_viewset().get_object(),
+            user=self.get_user(),
             notification_id=notification.id,
-            enabled=notification.default_checked)
+            enabled=notification.default_checked,
+        )
 
-    def get_queryset(self):
-        user = self.get_account_viewset().get_object()
+    def get_queryset(self, dev=False):
+        user = self.get_user()
         queryset = UserNotification.objects.filter(user=user)
 
         # Fetch all `UserNotification` instances and then,
@@ -597,8 +692,10 @@ class AccountNotificationViewSet(ListModelMixin, GenericViewSet):
 
         # Put it into a dict so we can easily check for existence.
         set_notifications = {
-            user_nfn.notification.short: user_nfn for user_nfn in queryset
-            if user_nfn.notification}
+            user_nfn.notification.short: user_nfn
+            for user_nfn in queryset
+            if user_nfn.notification
+        }
         out = []
 
         newsletters = None  # Lazy - fetch the first time needed.
@@ -613,24 +710,233 @@ class AccountNotificationViewSet(ListModelMixin, GenericViewSet):
             user_notification.enabled = basket_id in newsletters
             set_notifications[notification.short] = user_notification
 
+        include_dev = dev or user.is_developer
         for notification in NOTIFICATIONS_COMBINED:
-            if notification.group == 'dev' and not user.is_developer:
+            if notification.group == 'dev' and not include_dev:
                 # We only return dev notifications for developers.
                 continue
-            out.append(set_notifications.get(
-                notification.short,  # It's been set by the user.
-                self._get_default_object(notification)))  # Or, default.
+            out.append(
+                set_notifications.get(
+                    notification.short,  # It's been set by the user.
+                    self._get_default_object(notification),
+                )
+            )  # Or, default.
         return out
+
+
+class AccountNotificationViewSet(
+    AccountNotificationMixin, ListModelMixin, GenericViewSet
+):
+    """Returns account notifications.
+
+    If not already set by the user, defaults will be returned.
+    """
+
+    permission_classes = [IsAuthenticated]
+    # We're pushing the primary permission checking to AccountViewSet for ease.
+    account_permission_classes = [
+        AnyOf(AllowSelf, GroupPermission(amo.permissions.USERS_EDIT))
+    ]
+    serializer_class = UserNotificationSerializer
+    paginator = None
+
+    def get_user(self):
+        return self.get_account_viewset().get_object()
+
+    def get_account_viewset(self):
+        if not hasattr(self, 'account_viewset'):
+            self.account_viewset = AccountViewSet(
+                request=self.request,
+                permission_classes=self.account_permission_classes,
+                kwargs={'pk': self.kwargs['user_pk']},
+            )
+        return self.account_viewset
 
     def create(self, request, *args, **kwargs):
         # Loop through possible notifications.
         queryset = self.get_queryset()
         for notification in queryset:
-            # Careful with ifs.  Enabled will be None|True|False.
+            # Careful with ifs.  `enabled` will be None|True|False.
             enabled = request.data.get(notification.notification.short)
             if enabled is not None:
                 serializer = self.get_serializer(
-                    notification, partial=True, data={'enabled': enabled})
+                    notification, partial=True, data={'enabled': enabled}
+                )
                 serializer.is_valid(raise_exception=True)
                 serializer.save()
         return Response(self.get_serializer(queryset, many=True).data)
+
+
+class AccountNotificationUnsubscribeView(AccountNotificationMixin, GenericAPIView):
+    authentication_classes = (UnsubscribeTokenAuthentication,)
+    permission_classes = ()
+    serializer_class = UserNotificationSerializer
+
+    def get_user(self):
+        return self.request.user
+
+    def post(self, request):
+        notification_name = request.data.get('notification')
+        serializer = None
+        for notification in self.get_queryset(dev=True):
+            if notification_name == notification.notification.short:
+                serializer = self.get_serializer(
+                    notification, partial=True, data={'enabled': False}
+                )
+                serializer.is_valid(raise_exception=True)
+                serializer.save()
+
+        if not serializer:
+            raise serializers.ValidationError(
+                _('Notification [%s] does not exist') % notification_name
+            )
+        return Response(serializer.data)
+
+
+class FxaNotificationView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    FXA_PROFILE_CHANGE_EVENT = (
+        'https://schemas.accounts.firefox.com/event/profile-change'
+    )
+    FXA_DELETE_EVENT = 'https://schemas.accounts.firefox.com/event/delete-user'
+    FXA_PASSWORDCHANGE_EVENT = (
+        'https://schemas.accounts.firefox.com/event/password-change'
+    )
+
+    @classmethod
+    def get_fxa_verifying_keys(cls):
+        if not hasattr(cls, 'fxa_verifying_keys'):
+            response = requests.get(f'{settings.FXA_OAUTH_HOST}/jwks')
+            cls.fxa_verifying_keys = (
+                response.json().get('keys') if response.status_code == 200 else []
+            )
+
+        if not cls.fxa_verifying_keys:
+            log.error(
+                'FxA webhook: verifying keys are not available (response was %s).',
+                response.status_code,
+            )
+            raise exceptions.AuthenticationFailed(
+                'FxA verifying keys are not available.'
+            )
+
+        return cls.fxa_verifying_keys
+
+    def get_jwt_payload(self, request):
+        client_id = get_fxa_config(request)['client_id']
+        authenticated_jwt = None
+
+        auth_header_split = request.headers.get('Authorization', '').split('Bearer ')
+        if len(auth_header_split) == 2 and auth_header_split[1]:
+            for verifying_key in self.get_fxa_verifying_keys():
+                if verifying_key.get('alg') != 'RS256':
+                    # we only support RS256
+                    continue
+                request_jwt = auth_header_split[1]
+                try:
+                    algorithm = jwt.algorithms.RSAAlgorithm.from_jwk(verifying_key)
+                    authenticated_jwt = jwt.decode(
+                        request_jwt,
+                        algorithm,
+                        audience=client_id,
+                        leeway=1,
+                        algorithms=[verifying_key['alg']],
+                    )
+                except (ValueError, TypeError, jwt.exceptions.PyJWTError) as e:
+                    # We raise when `not authenticated_jwt` below, but log the
+                    # error anyway
+                    log.exception('FxA webhook: uncaught exception', exc_info=e)
+                break
+
+        if not authenticated_jwt:
+            raise exceptions.AuthenticationFailed(
+                'Could not authenticate JWT with FxA key.'
+            )
+
+        return authenticated_jwt
+
+    def process_event(self, uid, event_key, event_data):
+        timestamp = (
+            change_time / 1000
+            if (change_time := event_data.get('changeTime'))
+            else time.time()
+        )
+        if event_key == self.FXA_PROFILE_CHANGE_EVENT:
+            log.info(f'Fxa Webhook: Got profile change event for {uid}')
+            new_email = event_data.get('email')
+            if not new_email:
+                log.info(
+                    'Email property missing/empty for "%s" event; ignoring' % event_key
+                )
+            else:
+                primary_email_change_event.delay(uid, timestamp, new_email)
+        elif event_key == self.FXA_DELETE_EVENT:
+            log.info(f'Fxa Webhook: Got delete event for {uid}')
+            delete_user_event.delay(uid, timestamp)
+        elif event_key == self.FXA_PASSWORDCHANGE_EVENT:
+            log.info(f'Fxa Webhook: Got password-change event for {uid}')
+            clear_sessions_event.delay(uid, timestamp, 'password-change')
+        else:
+            log.info('Fxa Webhook: Ignoring unknown event type %r', event_key)
+
+    def post(self, request):
+        payload = self.get_jwt_payload(request)
+        events = payload.get('events', {})
+        uid = payload.get('sub')
+        for event_key, event_data in events.items():
+            self.process_event(uid, event_key, event_data)
+
+        return Response('202 Accepted', status=202)
+
+
+@never_cache
+# Note: this view lives under /api/auth/ to make it easily accessible and
+# because it's technically part of the auth flow after a 2fa reprompt. It has
+# access to regular session auth because AuthenticationMiddlewareWithoutAPI has
+# a special exception for it, like it does for /api/auth/authenticate/
+@two_factor_auth_required
+@login_required
+def restore_post(request):
+    """Restore post data from session after 2fa reprompt.
+
+    Requires the right data to be set in the session and a valid signature
+    proving this is the last request (since the signature needs to match a
+    unique key that gets overwritten each time) and that the request isn't too
+    old.
+    """
+    if request.method != 'GET':
+        return HttpResponseNotAllowed(['GET'])
+    if '_post_data_after_2fa_reprompt' not in request.session:
+        # Redirect to / as we don't even have the url
+        return safe_redirect(request, '/', ERROR_RESTORE_POST_MISSING_DATA)
+    key = request.session['_post_data_after_2fa_reprompt'].get('key')
+    url = request.session['_post_data_after_2fa_reprompt'].get('url')
+    data = request.session['_post_data_after_2fa_reprompt'].get('data')
+    signature = request.GET.get('s')
+    if not url or not is_safe_url(url, request):
+        return safe_redirect(request, '/', ERROR_RESTORE_POST_UNSAFE_URL)
+    if not signature or not key or data is None:
+        return safe_redirect(request, url, ERROR_RESTORE_POST_MISSING_DATA)
+    try:
+        key_from_signature = TimestampSigner().unsign(
+            signature, max_age=settings.FXA_MAX_AUTH_TIME_BEFORE_MFA_REPROMPT
+        )
+        if not constant_time_compare(key, key_from_signature):
+            raise BadSignature
+    except BadSignature:
+        return safe_redirect(request, url, ERROR_RESTORE_POST_INVALID_SIGNATURE)
+    except SignatureExpired:
+        return safe_redirect(request, url, ERROR_RESTORE_POST_EXPIRED_SIGNATURE)
+    # Remove data from session now that we are rendering the form, user should
+    # not get the opportunity to try again to prevent replay attacks.
+    del request.session['_post_data_after_2fa_reprompt']
+    return TemplateResponse(
+        request,
+        'accounts/restore-post.html',
+        context={
+            'qdict': QueryDict(data),
+            'url': url,
+        },
+    )

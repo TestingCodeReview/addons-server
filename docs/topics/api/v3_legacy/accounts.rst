@@ -2,6 +2,12 @@
 Accounts
 ========
 
+.. warning::
+
+    These v3 APIs are now deprecated and you should switch to a newer version before
+    it is removed. See :ref:`the API versions available<api-versions-list>` for details
+    of the different API versions available and the deprecation timeline.
+
 The following API endpoints cover a users account.
 
 
@@ -80,18 +86,16 @@ If you have `Users:Edit` permission you will see these extra fields for all user
     The following are some commonly tested permissions; see https://github.com/mozilla/addons-server/blob/master/src/olympia/constants/permissions.py
     for the full list.
 
-    ==================  ==========================================================
-                 Value  Description
-    ==================  ==========================================================
-     `AdminTools:View`  Can access the website admin interface index page.  Inner
-                        pages may require other/additional permissions.
-         `Addons:Edit`  Allows viewing and editing of any add-ons details in
-                        developer tools.
-       `Addons:Review`  Can access the add-on reviewer tools to approve/reject
-                        add-on submissions.
-     `Personas:Review`  Can access the theme reviewer tools to approve/reject
-                        theme submissions.
-    ==================  ==========================================================
+    =====================  =======================================================
+                    Value  Description
+    =====================  =======================================================
+            `Addons:Edit`  Allows viewing and editing of any add-ons details in
+                           developer tools.
+          `Addons:Review`  Can access the add-on reviewer tools to approve/reject
+                           add-on submissions.
+     `Addons:ThemeReview`  Can access the theme reviewer tools to approve/reject
+                           theme submissions.
+    =====================  =======================================================
 
 
 -------
@@ -149,7 +153,7 @@ Other :ref:`editable values <v3-account-edit-request>` can be set at the same ti
 
         curl "https://addons.mozilla.org/api/v3/accounts/account/12345/"
             -g -XPATCH --form "picture_upload=@photo.png"
-            -H "Authorization: Bearer <token>"
+            -H "Authorization: JWT <token>"
 
     :param user-id: The numeric user id.
     :form picture_upload: The user's picture to upload.
@@ -177,7 +181,7 @@ Delete
 
 .. note::
     Accounts of users who are authors of Add-ons can't be deleted.
-    All Add-ons (and Themes) must be deleted or transfered to other users first.
+    All Add-ons (and Themes) must be deleted or transferred to other users first.
 
 This endpoint allows the account to be deleted. The reviews and ratings
 created by the user will not be deleted; but all the user's details are
@@ -317,7 +321,7 @@ sessions.
     .. sourcecode:: bash
 
         curl "https://addons.mozilla.org/api/v3/accounts/session/"
-            -H "Authorization: Bearer <jwt-token>" -X DELETE
+            -H "Authorization: Session <sessionid>" -X DELETE
 
     **Response:**
 

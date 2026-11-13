@@ -2,10 +2,14 @@
 Add-ons
 =======
 
-.. note::
+.. warning::
 
-    These APIs are experimental and are currently being worked on. Endpoints
-    may change without warning. The only authentication method available at
+    These v3 APIs are now deprecated and you should switch to a newer version before
+    it is removed. See :ref:`the API versions available<api-versions-list>` for details
+    of the different API versions available and the deprecation timeline.
+
+.. note::
+    The only authentication method available at
     the moment is :ref:`the internal one <v3-api-auth-internal>`.
 
 --------
@@ -159,7 +163,7 @@ This endpoint allows you to fetch a specific add-on by id, slug or guid.
     :>json object current_version: Object holding the current :ref:`version <v3-version-detail-object>` of the add-on. For performance reasons the ``license`` field omits the ``text`` property from the detail endpoint. In addition, ``license`` and ``release_notes`` are omitted entirely from the search endpoint.
     :>json string default_locale: The add-on default locale for translations.
     :>json string|object|null description: The add-on description (See :ref:`translated fields <v3-api-overview-translations>`).
-    :>json string|object|null developer comments: Additional information about the add-on provided by the developer. (See :ref:`translated fields <v3-api-overview-translations>`).
+    :>json string|object|null developer_comments: Additional information about the add-on provided by the developer. (See :ref:`translated fields <v3-api-overview-translations>`).
     :>json string edit_url: The URL to the developer edit page for the add-on.
     :>json string guid: The add-on `extension identifier <https://developer.mozilla.org/en-US/Add-ons/Install_Manifests#id>`_.
     :>json boolean has_eula: The add-on has an End-User License Agreement that the user needs to agree with before installing (See :ref:`add-on EULA and privacy policy <v3-addon-eula-policy>`).
@@ -181,7 +185,6 @@ This endpoint allows you to fetch a specific add-on by id, slug or guid.
     :>json string previews[].image_url: The URL (including a cachebusting query string) to the preview image.
     :>json int previews[].thumbnail_size[]: width, height dimensions of of the preview image thumbnail.
     :>json string previews[].thumbnail_url: The URL (including a cachebusting query string) to the preview image thumbnail.
-    :>json boolean public_stats: Boolean indicating whether the add-on stats are public or not.
     :>json object ratings: Object holding ratings summary information about the add-on.
     :>json int ratings.count: The total number of user ratings for the add-on.
     :>json int ratings.text_count: The number of user ratings with review text for the add-on.
@@ -199,6 +202,7 @@ This endpoint allows you to fetch a specific add-on by id, slug or guid.
     :>json object theme_data: Object holding `lightweight theme (Persona) <https://developer.mozilla.org/en-US/Add-ons/Themes/Lightweight_themes>`_ data. Only present for themes (Persona).
     :>json string type: The :ref:`add-on type <v3-addon-detail-type>`.
     :>json string url: The (absolute) add-on detail URL.
+    :>json string versions_url: The URL to the version history page for the add-on.
     :>json int weekly_downloads: The number of downloads for the add-on in the last week. Not present for lightweight themes.
 
 
@@ -238,8 +242,7 @@ This endpoint allows you to fetch a specific add-on by id, slug or guid.
     ==============  ==========================================================
 
     .. note::
-        For possible version values per application, see
-        `valid application versions`_.
+        See the :ref:`supported versions <applications-version-list>`.
 
 .. _v3-addon-detail-platform:
 
@@ -345,8 +348,8 @@ This endpoint allows you to fetch a single version belonging to a specific add-o
     :>json string channel: The version channel, which determines its visibility on the site. Can be either ``unlisted`` or ``listed``.
     :>json object compatibility:
         Object detailing which :ref:`applications <v3-addon-detail-application>` the version is compatible with.
-        The exact min/max version numbers in the object correspond to
-        `valid application versions`_. Example:
+        The exact min/max version numbers in the object correspond to the :ref:`supported versions<applications-version-list>`.
+        Example:
 
             .. code-block:: json
 
@@ -376,7 +379,7 @@ This endpoint allows you to fetch a single version belonging to a specific add-o
     :>json boolean files[].is_restart_required: Whether the file requires a browser restart to work once installed or not.
     :>json boolean files[].is_webextension: Whether the file is a WebExtension or not.
     :>json int files[].status: The :ref:`status <v3-addon-detail-status>` for a file.
-    :>json string files[].url: The (absolute) URL to download a file. Clients using this API can append an optional ``src`` query parameter to the url which would indicate the source of the request (See :ref:`download sources <v3-download-sources>`).
+    :>json string files[].url: The (absolute) URL to download a file.
     :>json array files[].permissions[]: Array of the webextension permissions for this File, as strings.  Empty for non-webextensions.
     :>json object license: Object holding information about the license for the version. For performance reasons this field is omitted from add-on search endpoint.
     :>json string|object|null license.name: The name of the license (See :ref:`translated fields <v3-api-overview-translations>`).
@@ -446,8 +449,6 @@ on AMO.
     :>json string results[].type: The :ref:`add-on type <v3-addon-detail-type>`.
     :>json string results[].url: The (absolute) add-on detail URL.
 
-.. _`valid application versions`: https://addons.mozilla.org/en-US/firefox/pages/appversions/
-
 
 -------------------
 Replacement Add-ons
@@ -455,7 +456,7 @@ Replacement Add-ons
 
 .. _v3-addon-replacement-addons:
 
-This endpoint returns a list of suggested replacements for legacy add-ons that are unsupported in Firefox 57.  Added to support the TAAR recommendation service.
+This endpoint returns a list of suggested replacements for legacy add-ons that are unsupported in Firefox 57.
 
 .. http:get:: /api/v3/addons/replacement-addon/
 
@@ -476,7 +477,7 @@ Compat Override
 .. _v3-addon-compat-override:
 
 This endpoint allows compatibility overrides specified by AMO admins to be searched.
-Compatibilty overrides are used within Firefox i(and other toolkit applications e.g. Thunderbird) to change compatibility of installed add-ons where they have stopped working correctly in new release of Firefox, etc.
+Compatibility overrides are used within Firefox i(and other toolkit applications e.g. Thunderbird) to change compatibility of installed add-ons where they have stopped working correctly in new release of Firefox, etc.
 
 .. http:get:: /api/v3/addons/compat-override/
 
@@ -498,7 +499,7 @@ Compatibilty overrides are used within Firefox i(and other toolkit applications 
     :>json int results[].version_ranges[].applications[].id: Application id on AMO.
     :>json string results[].version_ranges[].applications[].min_version: minimum version of the application to be disabled in.
     :>json string results[].version_ranges[].applications[].max_version: maximum version of the application to be disabled in.
-    :>json string results[].version_ranges[].applications[].guid: Application `guid <https://addons.mozilla.org/en-US/firefox/pages/appversions/>`_.
+    :>json string results[].version_ranges[].applications[].guid: Application :ref:`guid<applications-version-list>`.
 
 
 ---------------
@@ -507,16 +508,15 @@ Recommendations
 
 .. _v3-addon-recommendations:
 
-This endpoint provides recommendations of other addons to install, fetched from the `recommendation service <https://github.com/mozilla/taar>`_.
-Four recommendations are fetched, but only valid, publicly available addons are shown (so max 4 will be returned, and possibly less).
+This endpoint provides recommendations of other addons to install. Maximum four recommendations will be returned.
 
 .. http:get:: /api/v3/addons/recommendations/
 
     :query string guid: Fetch recommendations for this add-on guid.
     :query string lang: Activate translations in the specific language for that query. (See :ref:`translated fields <v3-api-overview-translations>`)
-    :query boolean recommended: Fetch recommendations from the recommendation service, or return a curated fallback list instead.
-    :>json string outcome: Outcome of the response returned.  Will be either: ``recommended`` - responses from recommendation service; ``recommended_fallback`` - service timed out or returned empty results so we returned fallback; ``curated`` - ``recommended=False`` was requested so fallback returned.
-    :>json string|null fallback_reason: if ``outcome`` was ``recommended_fallback`` then the reason why.  Will be either: ``timeout`` or ``no_results``.
+    :query boolean recommended: Ignored.
+    :>json string outcome: Outcome of the response returned. Will always be ``curated``.
+    :>json null fallback_reason: Always null.
     :>json int count: The number of results for this query.
     :>json string next: The URL of the next page of results.
     :>json string previous: The URL of the previous page of results.

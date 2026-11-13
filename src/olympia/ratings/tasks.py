@@ -1,18 +1,16 @@
-from django.db.models import Avg, Count, F
-from django.conf import settings
-import six
+from collections import defaultdict
 
-import waffle
+from django.core.cache import cache
+from django.db.models import Avg, Count, F, Q
 
 import olympia.core.logger
-
+from olympia.abuse.utils import reject_and_block_addons
 from olympia.addons.models import Addon
 from olympia.amo.celery import task
 from olympia.amo.decorators import use_primary_db
-from olympia.lib.akismet.models import AkismetReport
-from olympia.lib.cache import cache_get_or_set
+from olympia.reviewers.models import NeedsHumanReview, UsageTier
 
-from .models import GroupedRating, Rating
+from .models import Rating, RatingAggregate
 
 
 log = olympia.core.logger.getLogger('z.task')
@@ -25,71 +23,106 @@ def update_denorm(*pairs, **kw):
     Takes a bunch of (addon, user) pairs and sets the denormalized fields for
     all reviews matching that pair.
     """
-    log.info('[%s@%s] Updating review denorms.' %
-             (len(pairs), update_denorm.rate_limit))
+    log.info(f'[{len(pairs)}@{update_denorm.rate_limit}] Updating review denorms.')
     for addon, user in pairs:
-        reviews = list(Rating.without_replies.all()
-                       .filter(addon=addon, user=user).order_by('created'))
+        reviews = list(
+            Rating.without_replies.all()
+            .filter(addon=addon, user=user)
+            .order_by('created')
+        )
         if not reviews:
             continue
 
+        data = {}
         for idx, review in enumerate(reviews):
-            review.previous_count = idx
-            review.is_latest = False
-        reviews[-1].is_latest = True
+            data[review.pk] = {
+                'previous_count': idx,
+                'is_latest': False,
+            }
+        data[reviews[-1].pk]['is_latest'] = True
 
         for review in reviews:
-            review.save()
+            # Update the review, without sending post_save as it would do it
+            # again needlessly.
+            review.update(_signal=False, **data[review.pk])
 
 
 @task
 @use_primary_db
 def addon_rating_aggregates(addons, **kw):
-    if isinstance(addons, six.integer_types):  # Got passed a single addon id.
+    if isinstance(addons, int):  # Got passed a single addon id.
         addons = [addons]
-    log.info('[%s@%s] Updating total reviews and average ratings.' %
-             (len(addons), addon_rating_aggregates.rate_limit))
+    log.info(
+        '[%s@%s] Updating total reviews and average ratings.'
+        % (len(addons), addon_rating_aggregates.rate_limit)
+    )
     addon_objs = list(Addon.objects.filter(pk__in=addons))
-    # The following returns something like
-    # [{'rating': 2.0, 'addon': 7, 'count': 5},
-    #  {'rating': 3.75, 'addon': 6, 'count': 8}, ...]
-    qs = (Rating.without_replies.all()
-          .filter(addon__in=addons, is_latest=True)
-          .values('addon')  # Group by addon id.
-          .annotate(rating=Avg('rating'), count=Count('addon'))  # Aggregates.
-          .order_by())  # Reset order by so that `created` is not included.
-    stats = {x['addon']: (x['rating'], x['count']) for x in qs}
 
-    text_qs = (Rating.without_replies.all()
-               .filter(addon__in=addons, is_latest=True)
-               .exclude(body=None)
-               .values('addon')  # Group by addon id.
-               .annotate(count=Count('addon'))
-               .order_by())
+    text_qs = (
+        Rating.without_replies.all()
+        .filter(addon__in=addons, is_latest=True)
+        .exclude(body=None)
+        .values('addon')  # Group by addon id.
+        .annotate(count=Count('addon'))
+        .order_by()
+    )
     text_stats = {x['addon']: x['count'] for x in text_qs}
 
+    grouped_qs = (
+        Rating.without_replies.all()
+        .filter(addon__in=addons, is_latest=True)
+        .values_list('addon_id', 'rating')
+        .annotate(Count('rating'))
+        .order_by()
+    )
+    grouped_counts = defaultdict(dict)
+    for addon_id, rating, count in grouped_qs:
+        grouped_counts[addon_id][rating] = count
+
     for addon in addon_objs:
-        rating, reviews = stats.get(addon.id, [0, 0])
-        reviews_with_text = text_stats.get(addon.id, 0)
-        addon.update(total_ratings=reviews, average_rating=rating,
-                     text_ratings_count=reviews_with_text)
+        counts = grouped_counts.get(addon.id, {})
+        total = sum(count for score, count in counts.items() if score)
+        average = (
+            round(
+                sum(score * count for score, count in counts.items() if score and count)
+                / total,
+                4,
+            )
+            if total
+            else 0
+        )
+
+        reviews_with_text = text_stats.get(addon.pk, 0)
+        addon.update(
+            total_ratings=total,
+            average_rating=average,
+            text_ratings_count=reviews_with_text,
+        )
+
+        # Update grouped ratings
+        RatingAggregate.objects.update_or_create(
+            addon=addon,
+            defaults={f'count_{idx}': counts.get(idx, 0) for idx in range(1, 6)},
+        )
 
     # Delay bayesian calculations to avoid slave lag.
     addon_bayesian_rating.apply_async(args=addons, countdown=5)
-    addon_grouped_rating.apply_async(args=addons)
 
 
 @task
 @use_primary_db
 def addon_bayesian_rating(*addons, **kw):
     def addon_aggregates():
-        return Addon.objects.valid().aggregate(rating=Avg('average_rating'),
-                                               reviews=Avg('total_ratings'))
+        return Addon.objects.valid().aggregate(
+            rating=Avg('average_rating'), reviews=Avg('total_ratings')
+        )
 
-    log.info('[%s@%s] Updating bayesian ratings.' %
-             (len(addons), addon_bayesian_rating.rate_limit))
+    log.info(
+        '[%s@%s] Updating bayesian ratings.'
+        % (len(addons), addon_bayesian_rating.rate_limit)
+    )
 
-    avg = cache_get_or_set('task.bayes.avg', addon_aggregates, 60 * 60 * 60)
+    avg = cache.get_or_set('task.bayes.avg', addon_aggregates, 60 * 60 * 60)
     # Rating can be NULL in the DB, so don't update it if it's not there.
     if avg['rating'] is None:
         return
@@ -103,7 +136,7 @@ def addon_bayesian_rating(*addons, **kw):
 
         # Update the addon bayesian_rating atomically using F objects (unless
         # it has no reviews, in which case directly set it to 0).
-        qs = Addon.objects.filter(id=addon.id)
+        qs = Addon.objects.filter(pk=addon.pk)
         if addon.total_ratings:
             num = mc + F('total_ratings') * F('average_rating')
             denom = avg['reviews'] + F('total_ratings')
@@ -113,29 +146,38 @@ def addon_bayesian_rating(*addons, **kw):
 
 
 @task
-@use_primary_db
-def addon_grouped_rating(*addons, **kw):
-    """Roll up add-on ratings for the bar chart."""
-    # We stick this all in memcached since it's not critical.
-    log.info('[%s@%s] Updating addon grouped ratings.' %
-             (len(addons), addon_grouped_rating.rate_limit))
-    for addon in addons:
-        GroupedRating.set(addon, using='default')
+def flag_high_rating_addons_according_to_review_tier():
+    usage_tiers_qs = UsageTier.objects.filter(
+        # Tiers with no upper adu threshold are special cases with their own
+        # way of flagging add-ons for review (either notable or promoted).
+        upper_adu_threshold__isnull=False
+    )
+    addons_qs = UsageTier.get_base_addons().alias(
+        ratings_count=UsageTier.get_rating_count_subquery()
+    )
 
+    # Need a ratings ratio threshold to be set for the tier.
+    disabling_tiers = usage_tiers_qs.filter(
+        ratings_ratio_threshold_before_blocking__isnull=False
+    )
+    disabling_tier_filters = Q()
+    for usage_tier in disabling_tiers:
+        disabling_tier_filters |= usage_tier.get_rating_threshold_q_object(block=True)
+    if disabling_tier_filters:
+        reject_and_block_addons(
+            addons_qs.filter(disabling_tier_filters), reject_reason='high rating count'
+        )
 
-@task
-def check_akismet_reports(report_ids):
-    from olympia.ratings.models import RatingFlag  # circular import
+    # Need a ratings ratio threshold to be set for the tier.
+    flagging_tiers = usage_tiers_qs.filter(
+        ratings_ratio_threshold_before_flagging__isnull=False
+    )
+    flagging_tier_filters = Q()
+    for usage_tier in flagging_tiers:
+        flagging_tier_filters |= usage_tier.get_rating_threshold_q_object(block=False)
 
-    flag_rating_if_spam = waffle.switch_is_active('akismet-rating-action')
-    reports = AkismetReport.objects.filter(id__in=report_ids)
-    for report in reports:
-        outcome = report.comment_check()
-        is_spammy = outcome in (
-            AkismetReport.DEFINITE_SPAM, AkismetReport.MAYBE_SPAM)
-        if is_spammy and flag_rating_if_spam:
-            rating = report.rating_instance
-            RatingFlag.objects.get_or_create(
-                rating=rating, user_id=settings.TASK_USER_ID,
-                flag=RatingFlag.SPAM)
-            rating.update(editorreview=True)
+    if flagging_tier_filters:
+        NeedsHumanReview.set_on_addons_latest_signed_versions(
+            addons_qs.filter(flagging_tier_filters),
+            NeedsHumanReview.REASONS.RATINGS_THRESHOLD,
+        )

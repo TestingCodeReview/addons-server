@@ -38,14 +38,13 @@
         "model": "files.file",
         "fields": {
             "status": 1,
-            "is_restart_required": true,
             "hash": "sha256:1a496e35dd56fb377bb3dea306e285f0a3ff3e684fb758aaa04018e86da2ffaa",
             "created": "2010-08-27 21:15:32",
             "modified": "2010-08-27 21:15:32",
-            "filename": "quick_link_to_the_world-0.1-fx.xpi",
-            "platform": 1,
+            "file": "97/2197/222197/quick_link_to_the_world-0.1.xpi",
             "version": 116367,
             "datestatuschanged": "2010-08-27 21:14:17",
+            "manifest_version": 2,
             "size": 24
         }
     },
@@ -54,8 +53,6 @@
         "model": "addons.addon",
         "fields": {
             "last_updated": "2010-08-27 21:15:32",
-            "view_source": false,
-            "total_downloads": 9,
             "developer_comments": 1277089,
             "_current_version": 116367,
             "guid": "qlt@vik.josh",
@@ -67,7 +64,6 @@
             "bayesian_rating": 0.0,
             "homepage": null,
             "support_email": null,
-            "public_stats": false,
             "status": 4,
             "description": null,
             "default_locale": "en-US",

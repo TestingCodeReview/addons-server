@@ -1,32 +1,55 @@
-# -*- coding: utf-8 -*-
 from collections import Counter
 
 from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.db import transaction
+from django.utils.functional import cached_property
 
-import six
-
+import waffle
 from django_statsd.clients import statsd
 
 import olympia.core.logger
-
 from olympia import amo
-from olympia.files.utils import atomic_lock
+from olympia.abuse.models import CinderPolicy, ContentDecision
+from olympia.abuse.tasks import report_decision_to_cinder_and_notify
+from olympia.amo.decorators import use_primary_db
+from olympia.constants.abuse import DECISION_ACTIONS
+from olympia.files.utils import lock
+from olympia.lib.crypto.signing import SigningError
 from olympia.reviewers.models import (
-    AutoApprovalNotEnoughFilesError, AutoApprovalNoValidationResultError,
-    AutoApprovalSummary, clear_reviewing_cache, set_reviewing_cache)
+    AutoApprovalNoValidationResultError,
+    AutoApprovalSummary,
+    NeedsHumanReview,
+    clear_reviewing_cache,
+    set_reviewing_cache,
+)
 from olympia.reviewers.utils import ReviewHelper
+from olympia.scanners.models import ScannerResult
+from olympia.scanners.tasks import run_narc_on_version
 from olympia.versions.models import Version
 
 
 log = olympia.core.logger.getLogger('z.reviewers.auto_approve')
 
-LOCK_NAME = 'auto-approve'  # Name of the atomic_lock() used.
+LOCK_NAME = 'auto-approve'  # Name of the lock() used.
+
+
+class ApprovalNotAvailableError(Exception):
+    pass
 
 
 class Command(BaseCommand):
-    help = 'Auto-approve add-ons based on predefined criteria'
+    help = 'Auto-approve add-on versions based on predefined criteria'
+
+    # The comment is not translated on purpose, to behave like
+    # regular human approval does.
+    LISTED_COMMENT = (
+        'This version has been screened and approved for the '
+        'public. Keep in mind that other reviewers may look into '
+        'this version in the future and determine that it '
+        'requires changes or should be taken down.'
+    )
+    UNLISTED_COMMENT = 'automatic validation'
 
     def add_arguments(self, parser):
         """Handle command arguments."""
@@ -35,50 +58,49 @@ class Command(BaseCommand):
             action='store_true',
             dest='dry_run',
             default=False,
-            help='Do everything except actually approving add-ons.')
+            help='Fetch version candidates and perform all checks but do not '
+            'actually approve anything.',
+        )
 
     def fetch_candidates(self):
-        """Return a queryset with the Version instances that should be
-        considered for auto approval."""
-        return (Version.objects.filter(
-            addon__type__in=(
-                amo.ADDON_EXTENSION, amo.ADDON_LPAPP, amo.ADDON_DICT),
-            addon__disabled_by_user=False,
-            addon__status__in=(amo.STATUS_PUBLIC, amo.STATUS_NOMINATED),
-            files__status=amo.STATUS_AWAITING_REVIEW,
-            files__is_webextension=True)
-            .order_by('nomination', 'created').distinct())
+        """Return a queryset with the Version ids that should be considered for
+        auto approval."""
+        return (
+            Version.objects.auto_approvable()
+            .order_by('created')
+            .values_list('id', flat=True)
+        )
 
+    @use_primary_db
     def handle(self, *args, **options):
         """Command entry point."""
         self.dry_run = options.get('dry_run', False)
 
         self.successful_verdict = (
-            amo.WOULD_HAVE_BEEN_AUTO_APPROVED if self.dry_run
-            else amo.AUTO_APPROVED)
+            amo.WOULD_HAVE_BEEN_AUTO_APPROVED if self.dry_run else amo.AUTO_APPROVED
+        )
 
         self.stats = Counter()
 
         # Get a lock before doing anything, we don't want to have multiple
         # instances of the command running in parallel.
-        lock = atomic_lock(settings.TMP_PATH, LOCK_NAME, lifetime=15 * 60)
-        with lock as lock_attained:
+        with lock(settings.TMP_PATH, LOCK_NAME) as lock_attained:
             if lock_attained:
                 qs = self.fetch_candidates()
                 self.stats['total'] = len(qs)
 
-                for version in qs:
-                    self.process(version)
+                for version_id in qs:
+                    self.process(version_id)
 
                 self.log_final_summary(self.stats)
             else:
                 # We didn't get the lock...
                 log.error('auto-approve lock present, aborting.')
 
-    @transaction.atomic
-    def process(self, version):
-        """Process a single version, figuring out if it should be auto-approved
-        and calling the approval code if necessary."""
+    def process(self, version_id):
+        """Process a single version by id, figuring out if it should be
+        auto-approved and calling the approval code if necessary."""
+        version = Version.objects.get(pk=version_id)
         already_locked = AutoApprovalSummary.check_is_locked(version)
         if not already_locked:
             # Lock the addon for ourselves if possible. Even though
@@ -87,62 +109,215 @@ class Command(BaseCommand):
             # we have to do it now to prevent overwriting an existing lock with
             # our own.
             set_reviewing_cache(version.addon.pk, settings.TASK_USER_ID)
-        try:
-            log.info('Processing %s version %s...',
-                     six.text_type(version.addon.name),
-                     six.text_type(version.version))
-            summary, info = AutoApprovalSummary.create_summary_for_version(
-                version, dry_run=self.dry_run)
-            log.info('Auto Approval for %s version %s: %s',
-                     six.text_type(version.addon.name),
-                     six.text_type(version.version),
-                     summary.get_verdict_display())
-            self.stats.update({k: int(v) for k, v in info.items()})
-            if summary.verdict == self.successful_verdict:
-                self.stats['auto_approved'] += 1
-                if summary.verdict == amo.AUTO_APPROVED:
-                    self.approve(version)
 
-        except (AutoApprovalNotEnoughFilesError,
-                AutoApprovalNoValidationResultError):
+        try:
+            with transaction.atomic():
+                log.info(
+                    'Processing %s version %s...',
+                    str(version.addon.name),
+                    str(version.version),
+                )
+
+                summary = AutoApprovalSummary.objects.filter(version=version).first()
+
+                # We want to execute `run_narc()` only once (when there is no
+                # summary yet).
+                # NARC scanner rules depend on the Add-on and can't be
+                # run reliably at validation as it might not be
+                # attached to the upload at that point.
+                # This needs to be run before run_actions() and before
+                # auto-approval is attempted, and has to be triggered
+                # synchronously (no .delay()). In this case we pass
+                # run_actions_on_match=False since we're going to call
+                # ScannerResult.run_actions() below.
+                if waffle.switch_is_active('enable-narc') and not summary:
+                    run_narc_on_version(version.pk, run_actions_on_match=False)
+
+                scanner_actions_executed = False
+                # NULL means the summary predates this field, back when
+                # run_actions() was always executed on the first run.
+                already_executed = (
+                    summary is not None
+                    and summary.scanner_actions_executed is not False
+                )
+                if already_executed:
+                    log.info(
+                        'Not running run_actions() on version %s because it '
+                        'has already been executed',
+                        version.pk,
+                    )
+                elif AutoApprovalSummary.check_is_waiting_on_scanners(version):
+                    log.info(
+                        'Not running run_actions() on version %s because it '
+                        'is still waiting on scanners',
+                        version.pk,
+                    )
+                else:
+                    scanner_actions_executed = ScannerResult.run_actions(version)
+
+                version.autoapprovalsummary, info = (
+                    AutoApprovalSummary.create_summary_for_version(
+                        version, dry_run=self.dry_run
+                    )
+                )
+                if scanner_actions_executed:
+                    # The summary might not have existed before, so we can only
+                    # record that we have executed the actions now.
+                    version.autoapprovalsummary.update(scanner_actions_executed=True)
+                self.stats.update({k: int(v) for k, v in info.items()})
+                if version.autoapprovalsummary.verdict == self.successful_verdict:
+                    if version.autoapprovalsummary.verdict == amo.AUTO_APPROVED:
+                        self.approve(version)
+                    self.stats['auto_approved'] += 1
+                    verdict_string = version.autoapprovalsummary.get_verdict_display()
+                else:
+                    if version.autoapprovalsummary.verdict == amo.NOT_AUTO_APPROVED:
+                        self.disapprove(version)
+                    verdict_string = '{} ({})'.format(
+                        version.autoapprovalsummary.get_verdict_display(),
+                        ', '.join(
+                            version.autoapprovalsummary.verdict_info_prettifier(info)
+                        ),
+                    )
+                log.info(
+                    'Auto Approval for %s version %s: %s',
+                    str(version.addon.name),
+                    str(version.version),
+                    verdict_string,
+                )
+
+        # At this point, any exception should have rolled back the transaction,
+        # so even if we did create/update an AutoApprovalSummary instance that
+        # should have been rolled back. This ensures that, for instance, a
+        # signing error doesn't leave the version and its autoapprovalsummary
+        # in conflicting states.
+        except AutoApprovalNoValidationResultError:
             log.info(
                 'Version %s was skipped either because it had no '
-                'file or because it had no validation attached.', version)
+                'files or because it had no validation attached.',
+                version,
+            )
+            self.stats['error'] += 1
+        except ApprovalNotAvailableError:
+            statsd.incr('reviewers.auto_approve.approve.failure')
+            log.info(
+                'Version %s was skipped because approval action was not available',
+                version,
+            )
+            self.stats['error'] += 1
+        except SigningError:
+            statsd.incr('reviewers.auto_approve.approve.failure')
+            log.info('Version %s was skipped because of a signing error', version)
             self.stats['error'] += 1
         finally:
             # Always clear our own lock no matter what happens (but only ours).
             if not already_locked:
                 clear_reviewing_cache(version.addon.pk)
 
+    @statsd.timer('reviewers.auto_approve.approve')
     def approve(self, version):
+        """Approve a version, either by calling ReviewHelper or by creating a
+        ContentDecision and calling its execute_action() method."""
+        if waffle.switch_is_active('enable-policy-review-selection'):
+            self.approve_with_action_class(version)
+        else:
+            self.approve_with_reviewer_helper(version)
+
+    def approve_with_reviewer_helper(self, version):
         """Do the approval itself, caling ReviewHelper to change the status,
         sign the files, send the e-mail, etc."""
-        # Note: this should automatically use the TASK_USER_ID user.
-        helper = ReviewHelper(addon=version.addon, version=version)
-        helper.handler.data = {
-            # The comment is not translated on purpose, to behave like regular
-            # human approval does.
-            'comments': u'This version has been screened and approved for the '
-                        u'public. Keep in mind that other reviewers may look '
-                        u'into this version in the future and determine that '
-                        u'it requires changes or should be taken down. In '
-                        u'that case, you will be notified again with details '
-                        u'and next steps.'
-                        u'\r\n\r\nThank you!'
+        helper = ReviewHelper(
+            addon=version.addon,
+            version=version,
+            human_review=False,
+            channel=version.channel,
+        )
+        approve_action = helper.actions.get('public')
+        if not approve_action:
+            raise ApprovalNotAvailableError
+        if version.channel == amo.CHANNEL_LISTED:
+            helper.handler.data = {'comments': self.LISTED_COMMENT}
+        else:
+            helper.handler.data = {'comments': 'automatic validation'}
+        approve_action['method']()
+        statsd.incr('reviewers.auto_approve.approve.success')
+
+    @cached_property
+    def approve_policy(self):
+        return CinderPolicy.objects.filter(
+            enforcement_actions=DECISION_ACTIONS.AMO_APPROVE_VERSION
+        ).first()
+
+    def approve_with_action_class(self, version):
+        """Do the approval itself, caling the report_decision_to_cinder_and_notify,
+        which changes the status, signs the files, sends the e-mail, etc."""
+        decision = ContentDecision.objects.create(
+            addon=version.addon,
+            action=DECISION_ACTIONS.AMO_APPROVE_VERSION,
+            reasoning=(
+                self.LISTED_COMMENT
+                if version.channel == amo.CHANNEL_LISTED
+                else self.UNLISTED_COMMENT
+            ),
+            reviewer_user_id=settings.TASK_USER_ID,
+        )
+        if self.approve_policy:
+            decision.policies.set([self.approve_policy])
+        decision.target_versions.set([version])
+        decision.execute_action()
+        report_decision_to_cinder_and_notify.delay(decision_id=decision.id)
+        statsd.incr('reviewers.auto_approve.approve.success')
+
+    def disapprove(self, version):
+        """Handle a version we are not auto-approving, setting NeedsHumanReview
+        if necessary to "transfer" it to the reviewers queue.
+
+        Note that auto-approval might still be re-attempted later still, as
+        flags might change etc."""
+        verdicts_to_reasons = {
+            'is_promoted_prereview': NeedsHumanReview.REASONS.BELONGS_TO_PROMOTED_GROUP,
+            'has_auto_approval_disabled': (
+                NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+            ),
         }
-        helper.handler.process_public()
-        statsd.incr('reviewers.auto_approve.approve')
+        # For the specific reasons that cause an add-on to be added to the
+        # (human) review queue, we add the corresponding NeedsHumanReview flag
+        # if there isn't an active one already - if there is, that means it is
+        # already in the queue and there is no need to do it again.
+        # Note that we are checking for an active one, because a given version
+        # could leave the review queue and re-enter it multiple times.
+        for key, reason in verdicts_to_reasons.items():
+            was_not_auto_approved_because_of_that_reason = getattr(
+                version.autoapprovalsummary, key
+            )
+            has_decision_waiting_for_2nd_level_approval = (
+                version.contentdecision_set.awaiting_action().exists()
+            )
+            already_has_same_active_nhr = version.needshumanreview_set.filter(
+                reason=reason, is_active=True
+            ).exists()
+            if (
+                was_not_auto_approved_because_of_that_reason
+                and not version.pending_rejection
+                and not has_decision_waiting_for_2nd_level_approval
+                and not already_has_same_active_nhr
+            ):
+                NeedsHumanReview.objects.create(version=version, reason=reason)
 
     def log_final_summary(self, stats):
         """Log a summary of what happened."""
-        log.info('There were %d webextensions add-ons in the queue.',
-                 stats['total'])
+        log.info('There were %d webextensions add-ons in the queue.', stats['total'])
         if stats['error']:
             log.info(
                 '%d versions were skipped because they had no files or had '
-                'no validation attached to their files.', stats['error'])
+                'no validation attached to their files, or signing failed on '
+                'their files.',
+                stats['error'],
+            )
         if self.dry_run:
-            log.info('%d versions were marked as would have been approved.',
-                     stats['auto_approved'])
+            log.info(
+                '%d versions were marked as would have been approved.',
+                stats['auto_approved'],
+            )
         else:
             log.info('%d versions were approved.', stats['auto_approved'])

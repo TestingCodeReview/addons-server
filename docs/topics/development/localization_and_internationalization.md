@@ -1,0 +1,150 @@
+# Localization and Internationalization
+
+Localization and internationalization are important aspects of the **addons-server** project, ensuring that the application can support multiple languages and locales. This section covers the key concepts and processes for managing localization and internationalization.
+
+## Locale Availibility
+
+Locales are defined in two parts. In [`src/olympia/core/languages.py`](https://github.com/mozilla/addons-server/blob/master/src/olympia/core/languages.py):
+
+1. Entirely new locales are added via the `ALL_LANGUAGES` list.
+2. Enabled locales are defined separately via the `PROD_LANGUAGES` list.
+
+These lists should always be kept in sync with `addons-frontend`. See the documentation [here](https://github.com/mozilla/addons-frontend/blob/master/docs/i18n.md) for details.
+
+Dev shows the full language list defined by `ALL_LANGUAGES`. Stage and production only show locales explicitly enabled by `PROD_LANGUAGES`. Locales are enabled when their completion rate for both [AMO](https://pontoon.mozilla.org/projects/amo/) and [AMO Frontend](https://pontoon.mozilla.org/projects/amo-frontend/) projects on [Pontoon](https://pontoon.mozilla.org/) are high enough.
+
+## Using locales in a local environment
+
+Locale files are stored in an external repository that you need to clone into the locale/ directory inside your addons-server clone in order to build the files needed for those locales to work.
+
+```sh
+git clone https://github.com/mozilla-l10n/addons-server-l10n.git locale/
+```
+
+You should also update that clone whenever you want to test fresh translations locally:
+
+```sh
+cd locale/
+git pull
+cd -
+```
+
+CI automatically pulls the latest version when building a new image for dev/stage/prod environments and when running tests.
+
+## Locale Management
+
+Locale management involves compiling and updating translation files. The **addons-server** project uses a structured approach to handle localization files efficiently.
+
+1. **Compiling Locales**:
+
+   The Makefile provides commands to compile locale files, ensuring that translations are up-to-date.
+
+   Make sure you followed the instructions in the previous section to clone and pull the repository with the translations in `locale/`, then use the following command to compile locales:
+
+     ```sh
+     make compile_locales
+     ```
+
+2. **Updating Locale Files**:
+
+   Locales are updated automatically as a part of our CI. On every push to master `make extract_locales` and `make push_locales` are run which extracts locale strings from our codebase, merges any changes to the source language files, commits the changes to a branch on `https://github.com/mozilla-l10n/addons-server-l10n` and creates a pull request from that branch.
+
+   That PR can then be reviewed and approved by a manager from the l10n team, and Pontoon automatically imports the resulting `.po` files and commits back to that dedicated l10n repo.
+
+## Adding New Translations
+
+We write the english translations of our strings directly in the code, using the `gettext` function. For example:
+
+```python
+from django.utils.translation import gettext_lazy as _
+
+def my_view(request):
+    output = _('Welcome to my site.')
+    return HttpResponse(output)
+```
+
+When developing locally you should not really need to do anything special to see the translations. The `gettext` function will return the string as is if it can't find a translation for it. In CI translation strings are automatically extracted and uploaded to Pontoon for translation.
+
+## Translation Management
+
+Translation management involves handling translation strings and merging them as needed. The **addons-server** project follows best practices to ensure that translations are accurate and consistent.
+
+1. **Handling Translation Strings**:
+   - Translation strings are extracted from the source code and stored in `.po` files.
+   - The `.po` file format is used to manage locale strings, providing a standard way to handle translations.
+
+2. **Merging Translation Strings**:
+   - To extract new locales from the codebase, use the following command:
+
+     ```sh
+     make extract_locales
+     ```
+
+   - This command scans the codebase and updates the `.po` files with new or changed translation strings.
+   - After extraction, scripts are used to merge new or updated translation strings into the existing locale files.
+   - This process ensures that all translations are properly integrated and maintained.
+
+## Additional Tools and Practices
+
+1. **Pontoon**:
+   - The **addons-server** project uses Pontoon, Mozilla's localization service, to manage translations.
+   - Pontoon provides an interface for translators to contribute translations and review changes, ensuring high-quality localization.
+
+2. **.po File Format**:
+   - The `.po` file format is a widely used standard for managing translation strings.
+   - It allows for easy editing and updating of translations, facilitating collaboration among translators.
+
+## Translating Fields on Models
+
+The `olympia.translations` app defines a `olympia.translations.models.Translation` model, but for the most part, you shouldn't have to use that directly. When you want to create a foreign key to the `translations` table, use `olympia.translations.fields.TranslatedField`. This subclasses Django's `django.db.models.ForeignKey` to make it work with our special handling of translation rows.
+
+### Minimal Model Example
+
+A minimal model with translations in addons-server would look like this:
+
+```python
+from django.db import models
+
+from olympia.amo.models import ModelBase
+from olympia.translations.fields import TranslatedField, save_signal
+
+class MyModel(ModelBase):
+    description = TranslatedField()
+
+models.signals.pre_save.connect(save_signal,
+                                sender=MyModel,
+                                dispatch_uid='mymodel_translations')
+```
+
+### How It Works Behind the Scenes
+
+Rows in the translations table have an `autoid` primary key and an `id` key that is
+shared between different translations of the same string in multiple languages.
+
+That `id` is generated from a dedicated sequence table `translations_seq` every time
+a new string to be translated is saved.
+
+A `TranslatedField` is actually a `ForeignKey` to the `translations` table. To support multiple languages, these have `db_constraint` set to `False`, and the FK points to the `id` key.
+
+#### When Querying
+
+Our base manager has a `_with_translations()` method that is automatically called when you instantiate a queryset. It does two things:
+
+- Adds an extra `lang=lang` in the query to prevent query caching from returning objects in the wrong language.
+- Calls `olympia.translations.transformers.get_trans()` which builds a custom SQL query to fetch translations in the current language and fallback language.
+
+This custom query ensures that only the specified languages are considered and uses a double join with `IF`/`ELSE` for each field. The results are fetched using a replica database connection to improve performance.
+
+#### When Setting
+
+Every time you set a translated field to a string value, the `TranslationDescriptor` `__set__` method is called. It determines whether it's a new translation or an update to an existing translation and updates the relevant `Translation` objects accordingly. These objects are queued for saving, which happens on the `pre_save` signal to avoid foreign key constraint errors.
+
+#### When Deleting
+
+Deleting all translations for a field is done using `olympia.translations.models.delete_translation()`, which sets the field to `NULL` and deletes all attached translations. Deleting a specific translation is possible but not recommended due to potential issues with fallback languages and foreign key constraints.
+
+### Ordering by a Translated Field
+
+`olympia.translations.query.order_by_translation` allows you to order a `QuerySet` by a translated field, honoring the current and fallback locales like when querying.
+
+By following these practices, the **addons-server** project ensures that the application can support multiple languages and locales effectively. For more detailed instructions, refer to the project's Makefile and locale management scripts in the repository.

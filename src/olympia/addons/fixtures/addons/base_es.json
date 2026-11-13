@@ -5,8 +5,6 @@
   "fields": {
     "eula": null,
     "last_updated": "2011-07-06T13:29:18",
-    "view_source": true,
-    "total_downloads": 0,
     "developer_comments": null,
     "_current_version": 1,
     "target_locale": null,
@@ -19,7 +17,6 @@
     "bayesian_rating": 1.28657399683251,
     "homepage": null,
     "support_email": null,
-    "public_stats": false,
     "status": 4,
     "privacy_policy": null,
     "description": null,
@@ -41,8 +38,6 @@
   "fields": {
     "eula": null,
     "last_updated": "2011-04-28T07:38:27",
-    "view_source": true,
-    "total_downloads": 0,
     "developer_comments": null,
     "_current_version": 2,
     "target_locale": null,
@@ -55,7 +50,6 @@
     "bayesian_rating": 4.62977323542687,
     "homepage": null,
     "support_email": null,
-    "public_stats": false,
     "status": 5,
     "privacy_policy": null,
     "description": null,
@@ -77,8 +71,6 @@
   "fields": {
     "eula": null,
     "last_updated": "2011-02-15T11:33:40",
-    "view_source": true,
-    "total_downloads": 0,
     "developer_comments": null,
     "_current_version": 3,
     "target_locale": null,
@@ -91,7 +83,6 @@
     "bayesian_rating": 4.53931552224925,
     "homepage": null,
     "support_email": null,
-    "public_stats": false,
     "status": 3,
     "privacy_policy": null,
     "description": null,
@@ -113,8 +104,6 @@
   "fields": {
     "eula": null,
     "last_updated": "2011-05-22T11:06:50",
-    "view_source": true,
-    "total_downloads": 0,
     "developer_comments": null,
     "_current_version": 4,
     "target_locale": null,
@@ -127,7 +116,6 @@
     "bayesian_rating": 3.48031119110043,
     "homepage": null,
     "support_email": null,
-    "public_stats": false,
     "status": 4,
     "privacy_policy": null,
     "description": null,
@@ -149,8 +137,6 @@
   "fields": {
     "eula": null,
     "last_updated": "2011-11-25T07:59:20",
-    "view_source": true,
-    "total_downloads": 0,
     "developer_comments": null,
     "_current_version": 5,
     "target_locale": null,
@@ -163,7 +149,6 @@
     "bayesian_rating": 1.0053223682018,
     "homepage": null,
     "support_email": null,
-    "public_stats": false,
     "status": 4,
     "privacy_policy": null,
     "description": null,
@@ -185,8 +170,6 @@
   "fields": {
     "eula": null,
     "last_updated": "2011-10-13T15:26:57",
-    "view_source": true,
-    "total_downloads": 0,
     "developer_comments": null,
     "_current_version": 6,
     "target_locale": null,
@@ -199,7 +182,6 @@
     "bayesian_rating": 4.08202535488486,
     "homepage": null,
     "support_email": null,
-    "public_stats": false,
     "status": 4,
     "privacy_policy": null,
     "description": null,
@@ -227,8 +209,6 @@
     "modified": "2014-12-08T06:39:45",
     "deleted": false,
     "version": "0.4",
-    "version_int": 40000200100,
-    "reviewed": null,
     "nomination": "2014-12-08T06:39:45",
     "addon": 1
   }
@@ -245,8 +225,6 @@
     "modified": "2014-12-08T06:40:07",
     "deleted": false,
     "version": "1.2",
-    "version_int": 1020000200100,
-    "reviewed": null,
     "nomination": null,
     "addon": 2
   }
@@ -263,8 +241,6 @@
     "modified": "2014-12-08T06:40:16",
     "deleted": false,
     "version": "1.9",
-    "version_int": 1090000200100,
-    "reviewed": null,
     "nomination": "2014-12-08T06:40:16",
     "addon": 3
   }
@@ -281,8 +257,6 @@
     "modified": "2014-12-08T06:40:23",
     "deleted": false,
     "version": "1.8",
-    "version_int": 1080000200100,
-    "reviewed": null,
     "nomination": "2014-12-08T06:40:23",
     "addon": 4
   }
@@ -299,8 +273,6 @@
     "modified": "2014-12-08T06:40:24",
     "deleted": false,
     "version": "1.1",
-    "version_int": 1010000200100,
-    "reviewed": null,
     "nomination": "2014-12-08T06:40:25",
     "addon": 5
   }
@@ -317,8 +289,6 @@
     "modified": "2014-12-08T06:40:25",
     "deleted": false,
     "version": "0.3",
-    "version_int": 30000200100,
-    "reviewed": null,
     "nomination": "2014-12-08T06:40:25",
     "addon": 6
   }
@@ -411,19 +381,13 @@
   "fields": {
     "status": 4,
     "hash": "",
-    "binary_components": false,
     "created": "2014-12-08T06:39:45",
     "modified": "2014-12-08T06:39:45",
     "strict_compatibility": false,
-    "filename": "1-1",
-    "binary": false,
-    "platform": 1,
+    "file": "01/0001/1/1-1.xpi",
     "version": 1,
-    "reviewed": null,
-    "jetpack_version": null,
-    "requires_chrome": false,
     "datestatuschanged": "2014-12-08T06:39:45",
-    "is_restart_required": true,
+    "manifest_version": 2,
     "size": 0
   }
 },
@@ -433,19 +397,13 @@
   "fields": {
     "status": 4,
     "hash": "",
-    "binary_components": false,
     "created": "2014-12-08T06:40:07",
     "modified": "2014-12-08T06:40:07",
     "strict_compatibility": false,
-    "filename": "2-2",
-    "binary": false,
-    "platform": 1,
+    "file": "02/0002/2/2-2.xpi",
     "version": 2,
-    "reviewed": null,
-    "jetpack_version": null,
-    "requires_chrome": false,
     "datestatuschanged": "2014-12-08T06:40:07",
-    "is_restart_required": true,
+    "manifest_version": 2,
     "size": 0
   }
 },
@@ -455,19 +413,13 @@
   "fields": {
     "status": 4,
     "hash": "",
-    "binary_components": false,
     "created": "2014-12-08T06:40:16",
     "modified": "2014-12-08T06:40:16",
     "strict_compatibility": false,
-    "filename": "3-3",
-    "binary": false,
-    "platform": 1,
+    "file": "03/0003/3/3-3.xpi",
     "version": 3,
-    "reviewed": null,
-    "jetpack_version": null,
-    "requires_chrome": false,
     "datestatuschanged": "2014-12-08T06:40:16",
-    "is_restart_required": true,
+    "manifest_version": 2,
     "size": 0
   }
 },
@@ -477,19 +429,13 @@
   "fields": {
     "status": 4,
     "hash": "",
-    "binary_components": false,
     "created": "2014-12-08T06:40:23",
     "modified": "2014-12-08T06:40:23",
     "strict_compatibility": false,
-    "filename": "4-4",
-    "binary": false,
-    "platform": 1,
+    "file": "04/0004/4/4-4.xpi",
     "version": 4,
-    "reviewed": null,
-    "jetpack_version": null,
-    "requires_chrome": false,
     "datestatuschanged": "2014-12-08T06:40:23",
-    "is_restart_required": true,
+    "manifest_version": 2,
     "size": 0
   }
 },
@@ -499,19 +445,13 @@
   "fields": {
     "status": 4,
     "hash": "",
-    "binary_components": false,
     "created": "2014-12-08T06:40:24",
     "modified": "2014-12-08T06:40:24",
     "strict_compatibility": false,
-    "filename": "5-5",
-    "binary": false,
-    "platform": 1,
+    "file": "05/0005/5/5-5.xpi",
     "version": 5,
-    "reviewed": null,
-    "jetpack_version": null,
-    "requires_chrome": false,
     "datestatuschanged": "2014-12-08T06:40:24",
-    "is_restart_required": true,
+    "manifest_version": 2,
     "size": 0
   }
 },
@@ -521,19 +461,13 @@
   "fields": {
     "status": 4,
     "hash": "",
-    "binary_components": false,
     "created": "2014-12-08T06:40:25",
     "modified": "2014-12-08T06:40:25",
     "strict_compatibility": false,
-    "filename": "6-6",
-    "binary": false,
-    "platform": 1,
+    "file": "06/0006/6/6-6.xpi",
     "version": 6,
-    "reviewed": null,
-    "jetpack_version": null,
-    "requires_chrome": false,
     "datestatuschanged": "2014-12-08T06:40:25",
-    "is_restart_required": true,
+    "manifest_version": 2,
     "size": 0
   }
 },

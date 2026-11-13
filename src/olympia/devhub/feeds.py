@@ -4,14 +4,15 @@ from django import http
 from django.contrib.syndication.views import Feed
 from django.shortcuts import get_object_or_404
 from django.utils.feedgenerator import Rss201rev2Feed
-from django.utils.translation import ugettext
+from django.utils.translation import gettext
+
+from justhtml import JustHTML, SanitizationPolicy, Sanitize
 
 from olympia import amo
 from olympia.activity.models import ActivityLog
-from olympia.addons.models import Addon
 from olympia.amo.templatetags.jinja_helpers import absolutify, url
+from olympia.amo.utils import clean_nl
 from olympia.devhub.models import RssKey
-from olympia.translations.templatetags.jinja_helpers import clean as clean_html
 
 
 class ActivityFeedRSS(Feed):
@@ -21,8 +22,8 @@ class ActivityFeedRSS(Feed):
         try:
             rsskey = request.GET.get('privaterss')
             rsskey = uuid.UUID(rsskey)
-        except ValueError:
-            raise http.Http404
+        except ValueError as exc:
+            raise http.Http404 from exc
 
         key = get_object_or_404(RssKey, key=rsskey.hex)
         return key
@@ -31,20 +32,38 @@ class ActivityFeedRSS(Feed):
         if key.addon:
             addons = key.addon
         else:  # We are showing all the add-ons
-            addons = Addon.objects.filter(authors=key.user)
+            addons = key.user.addons.all()
 
-        return (ActivityLog.objects.for_addons(addons)
-                           .exclude(action__in=amo.LOG_HIDE_DEVELOPER))[:20]
+        return (
+            ActivityLog.objects.for_addons(addons).exclude(
+                action__in=amo.LOG_HIDE_DEVELOPER
+            )
+        )[:20]
+
+    def clean_html(self, string):
+        fragment = JustHTML(
+            str(string),
+            fragment=True,
+            transforms=[
+                Sanitize(
+                    policy=SanitizationPolicy(
+                        allowed_tags=[],
+                        allowed_attributes={'*': []},
+                    )
+                )
+            ],
+        )
+        return clean_nl(fragment.to_html(pretty=False)).strip()
 
     def item_title(self, item):
-        return clean_html(item.to_string(), True)
+        return self.clean_html(item.to_string())
 
     def title(self, key):
         """Title for the feed as a whole"""
         if key.addon:
-            return ugettext(u'Recent Changes for %s') % key.addon
+            return gettext('Recent Changes for %s') % key.addon
         else:
-            return ugettext(u'Recent Changes for My Add-ons')
+            return gettext('Recent Changes for My Add-ons')
 
     def link(self):
         """Link for the feed as a whole"""

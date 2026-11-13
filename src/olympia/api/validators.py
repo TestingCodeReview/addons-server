@@ -1,17 +1,27 @@
 from django.core.exceptions import ValidationError as DjangoValidationError
 
-from olympia.amo.validators import OneOrMorePrintableCharacterValidator
+from rest_framework import exceptions
 
-from rest_framework import serializers
+from olympia.amo.utils import verify_no_urls
+from olympia.amo.validators import OneOrMoreLetterOrNumberCharacterValidator
 
 
-class OneOrMorePrintableCharacterAPIValidator(
-        OneOrMorePrintableCharacterValidator):
-    """Like OneOrMorePrintableCharacterValidator, but for the API - raises
+class OneOrMoreLetterOrNumberCharacterAPIValidator(
+    OneOrMoreLetterOrNumberCharacterValidator
+):
+    """Like OneOrMoreLetterOrNumberCharacterValidator, but for the API - raises
     a DRF ValidationError instead of a django one."""
+
     def __call__(self, value):
         try:
-            return super(
-                OneOrMorePrintableCharacterAPIValidator, self).__call__(value)
-        except DjangoValidationError:
-            raise serializers.ValidationError(self.message)
+            return super().__call__(value)
+        except DjangoValidationError as exc:
+            raise exceptions.ValidationError(self.message) from exc
+
+
+class NoURLsValidator:
+    def __call__(self, value):
+        try:
+            verify_no_urls(value)
+        except DjangoValidationError as exc:
+            raise exceptions.ValidationError(exc.message) from exc

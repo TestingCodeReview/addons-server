@@ -1,18 +1,12 @@
-from django.core.paginator import (
-    EmptyPage, InvalidPage, PageNotAnInteger, Paginator)
+from unittest.mock import MagicMock, Mock
+
+from django.core.paginator import EmptyPage, InvalidPage, PageNotAnInteger, Paginator
 
 import pytest
 
-from mock import MagicMock, Mock
-
-from olympia.addons.models import Addon
 from olympia.amo.pagination import ESPaginator
 from olympia.amo.templatetags.jinja_helpers import PaginationRenderer
-from olympia.amo.tests import TestCase, ESTestCase, addon_factory
-from olympia.amo.utils import paginate
-
-
-pytestmark = pytest.mark.django_db
+from olympia.amo.tests import TestCase
 
 
 def mock_pager(page_number, num_pages, count):
@@ -26,7 +20,7 @@ def mock_pager(page_number, num_pages, count):
 
 def assert_range(page_number, num_pages, expected):
     p = PaginationRenderer(mock_pager(page_number, num_pages, 100))
-    assert p.range() == expected
+    assert list(p.range()) == expected
 
 
 def test_page_range():
@@ -69,16 +63,15 @@ def test_dots():
 
 
 class TestSearchPaginator(TestCase):
-
     def test_single_hit(self):
         """Test the ESPaginator only queries ES one time."""
         mocked_qs = MagicMock()
-        mocked_qs.count.return_value = 42
+        mocked_qs.__len__.return_value = 42
         paginator = Paginator(mocked_qs, 5)
         # With the base paginator, requesting any page forces a count.
         paginator.page(1)
         assert paginator.count == 42
-        assert mocked_qs.count.call_count == 1
+        assert mocked_qs.count.call_count + mocked_qs.__len__.call_count == 1
 
         mocked_qs = MagicMock()
         mocked_qs.__getitem__().execute().hits.total = 666
@@ -90,23 +83,23 @@ class TestSearchPaginator(TestCase):
         assert mocked_qs.count.call_count == 0
 
     def test_invalid_page(self):
+        total = 50000
+        page_size = 5
         mocked_qs = MagicMock()
-        mocked_qs.__getitem__().execute().hits.total = 30000
-        paginator = ESPaginator(mocked_qs, 5)
+        mocked_qs.__getitem__().execute().hits.total = total
+        paginator = ESPaginator(mocked_qs, page_size)
 
-        assert ESPaginator.max_result_window == 25000
+        assert ESPaginator.max_result_window == 30000
 
         with pytest.raises(InvalidPage) as exc:
-            # We're fetching 5 items per page, so requesting page 5001 should
-            # fail, since the max result window should is set to 25000.
-            paginator.page(5000 + 1)
+            paginator.page(ESPaginator.max_result_window / page_size + 1)
 
         # Make sure we raise exactly `InvalidPage`, this is needed
         # unfortunately since `pytest.raises` won't check the exact
         # instance but also accepts parent exceptions inherited.
         assert (
-            exc.value.message ==
-            'That page number is too high for the current page size')
+            str(exc.value) == 'That page number is too high for the current page size'
+        )
         assert isinstance(exc.value, InvalidPage)
 
         with self.assertRaises(EmptyPage):
@@ -116,42 +109,16 @@ class TestSearchPaginator(TestCase):
             paginator.page('lol')
 
     def test_no_pages_beyond_max_window_result(self):
+        total = 50000
+        page_size = 5
         mocked_qs = MagicMock()
-        mocked_qs.__getitem__().execute().hits.total = 30000
-        paginator = ESPaginator(mocked_qs, 5)
+        mocked_qs.__getitem__().execute().hits.total = total
+        paginator = ESPaginator(mocked_qs, page_size)
 
-        assert ESPaginator.max_result_window == 25000
+        assert ESPaginator.max_result_window == 30000
 
-        page = paginator.page(4999)
+        page = paginator.page(ESPaginator.max_result_window / page_size - 1)
         assert page.has_next() is True
 
-        page = paginator.page(5000)
+        page = paginator.page(ESPaginator.max_result_window / page_size)
         assert page.has_next() is False
-
-    def test_paginate_returns_this_paginator(self):
-        request = MagicMock()
-        request.GET.get.return_value = 1
-        request.GET.urlencode.return_value = ''
-        request.path = ''
-
-        qs = Addon.search()
-        pager = paginate(request, qs)
-        assert isinstance(pager.paginator, ESPaginator)
-
-
-class TestNonDSLMode(ESTestCase):
-
-    def test_count_non_dsl_mode(self):
-        addon_factory()
-        addon_factory()
-        addon_factory()
-
-        self.refresh()
-
-        p = ESPaginator(Addon.search(), 20, use_elasticsearch_dsl=False)
-
-        assert p.count == 3
-
-        p.page(1)
-        assert p.count == 3
-        assert p.count == Addon.search().count()

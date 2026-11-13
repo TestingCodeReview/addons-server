@@ -1,43 +1,45 @@
 {% if user.is_authenticated %}
-  {% if tools_links and tools_links|count > 1 %}
-    <ul class="tools">
-      <li>
-        <a href="#" class="controller">{{ tools_title }}</a>
-        <ul>
-          {% for link in tools_links %}
+  <li class="account">
+    <a href="{{ user.get_url_path() }}" class="user" title="{{ user.email }}">
+      {{ user.welcome_name }}</a>
+    <ul>
+      {% if account_links %}
+        {% for link in account_links %}
+          {% if not loop.last %}
             <li><a href="{{ link.href }}">{{ link.text }}</a></li>
-          {% endfor %}
-        </ul>
+          {% endif %}
+        {% endfor %}
+      {% endif %}
+      <li class="nomenu logout">
+         {% if devhub_backlink %}
+           <a href="{{ url('devhub.logout') }}?to={{ url('devhub.index') }}">{{ _('Log out') }}</a>
+         {% else %}
+           <a href="{{ url('devhub.logout') }}">{{ _('Log out') }}</a>
+         {% endif %}
       </li>
     </ul>
-  {% else %}
-    <p class="context tools">
-      <a href="{{ tools_links[0].href }}">{{ tools_links[0].text }}</a>
-    </p>
-  {% endif %}
-  <ul class="account">
-      <li>
-      <a href="#" class="controller" title="{{ user.email }}">
-        {{ _('My Account') }}</a>
-        {% if account_links %}
-          <ul>
-            {% for link in account_links %}
-              <li><a href="{{ link.href }}">{{ link.text }}</a></li>
-            {% endfor %}
-          </ul>
-        {% endif %}
-      </li>
-  </ul>
+  </li>
+{% elif request.session %}
+  <li class="account anonymous nomenu login legacy">
+    {% trans reg=login_link(), login=login_link() %}
+        <a href="{{ reg }}">Register</a> or <a href="{{ login }}">Log in</a>
+    {% endtrans %}
+  </li>
 {% endif %}
 
-<p class="context">
-  {% if user.is_authenticated %}
-    <span class="greeting">
-      {{ _('Welcome, {0}')|format_html(user.welcome_name) }}
-    </span>
-  {% else %}
-    {% trans reg=register_link(), login=login_link() %}
-      <a href="{{ reg }}">Register</a> or <a href="{{ login }}">Log in</a>
-    {% endtrans %}
+{% if user.is_authenticated %}
+  {% if tools_links|count > 1 %}
+    <li class="tools">
+      <a href="#">{{ tools_title }}</a>
+      <ul>
+        {% for link in tools_links %}
+          <li><a href="{{ link.href }}">{{ link.text }}</a></li>
+        {% endfor %}
+      </ul>
+    </li>
+  {% elif tools_links %}
+    <li class="context tools nomenu">
+      <a href="{{ tools_links[0].href }}">{{ tools_links[0].text }}</a>
+    </li>
   {% endif %}
-</p>
+{% endif %}

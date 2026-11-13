@@ -1,267 +1,456 @@
-# -*- coding: utf-8 -*-
-import json
-import mock
-import time
-
 from base64 import urlsafe_b64decode, urlsafe_b64encode
-from datetime import datetime
-from six.moves.urllib_parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse
 
+from django.conf import settings
 from django.contrib.auth.models import AnonymousUser
 from django.test import RequestFactory
 from django.test.utils import override_settings
-from django.utils.encoding import force_text
+from django.urls import reverse
+from django.utils.encoding import force_str
 
+from waffle.testutils import override_switch
+
+from olympia import amo
 from olympia.accounts import utils
-from olympia.accounts.utils import process_fxa_event
+from olympia.activity.models import ActivityLog
 from olympia.amo.tests import TestCase, user_factory
-from olympia.users.models import UserProfile
 
 
-FXA_CONFIG = {
-    'default': {
-        'client_id': 'foo',
-        'client_secret': 'bar',
-        'oauth_host': 'https://accounts.firefox.com/oauth',
-        'redirect_url': 'https://testserver/fxa',
-        'scope': 'profile',
-    },
-}
-
-
-@override_settings(FXA_CONFIG=FXA_CONFIG)
-def test_fxa_config_anonymous():
-    request = RequestFactory().get('/en-US/firefox/addons')
-    request.session = {'fxa_state': 'thestate!'}
-    request.user = AnonymousUser()
-    assert utils.fxa_config(request) == {
-        'clientId': 'foo',
-        'state': 'thestate!',
-        'oauthHost': 'https://accounts.firefox.com/oauth',
-        'redirectUrl': 'https://testserver/fxa',
-        'scope': 'profile',
-    }
-
-
-@override_settings(FXA_CONFIG=FXA_CONFIG)
-def test_fxa_config_logged_in():
-    request = RequestFactory().get('/en-US/firefox/addons')
-    request.session = {'fxa_state': 'thestate!'}
-    request.user = UserProfile(email='me@mozilla.org')
-    assert utils.fxa_config(request) == {
-        'clientId': 'foo',
-        'state': 'thestate!',
-        'email': 'me@mozilla.org',
-        'oauthHost': 'https://accounts.firefox.com/oauth',
-        'redirectUrl': 'https://testserver/fxa',
-        'scope': 'profile',
-    }
-
-
-@override_settings(FXA_CONFIG=FXA_CONFIG)
-def test_default_fxa_login_url_with_state():
-    path = b'/en-US/addons/abp/?source=ddg'
-    request = RequestFactory().get(path)
-    request.session = {'fxa_state': 'myfxastate'}
-    raw_url = utils.default_fxa_login_url(request)
-    url = urlparse(raw_url)
-    base = '{scheme}://{netloc}{path}'.format(
-        scheme=url.scheme, netloc=url.netloc, path=url.path)
-    assert base == 'https://accounts.firefox.com/oauth/authorization'
-    query = parse_qs(url.query)
-    next_path = urlsafe_b64encode(path).rstrip(b'=')
-    assert query == {
-        'action': ['signin'],
-        'client_id': ['foo'],
-        'redirect_url': ['https://testserver/fxa'],
-        'scope': ['profile'],
-        'state': ['myfxastate:{next_path}'.format(
-            next_path=force_text(next_path))],
-    }
-
-
-@override_settings(FXA_CONFIG=FXA_CONFIG)
-def test_default_fxa_register_url_with_state():
-    path = b'/en-US/addons/abp/?source=ddg'
-    request = RequestFactory().get(path)
-    request.session = {'fxa_state': 'myfxastate'}
-    raw_url = utils.default_fxa_register_url(request)
-    url = urlparse(raw_url)
-    base = '{scheme}://{netloc}{path}'.format(
-        scheme=url.scheme, netloc=url.netloc, path=url.path)
-    assert base == 'https://accounts.firefox.com/oauth/authorization'
-    query = parse_qs(url.query)
-    next_path = urlsafe_b64encode(path).rstrip(b'=')
-    assert query == {
-        'action': ['signup'],
-        'client_id': ['foo'],
-        'redirect_url': ['https://testserver/fxa'],
-        'scope': ['profile'],
-        'state': ['myfxastate:{next_path}'.format(
-            next_path=force_text(next_path))],
-    }
-
-
-@override_settings(FXA_CONFIG=FXA_CONFIG)
+@override_settings(FXA_OAUTH_HOST='https://accounts.firefox.com/oauth')
 def test_fxa_login_url_without_requiring_two_factor_auth():
     path = '/en-US/addons/abp/?source=ddg'
     request = RequestFactory().get(path)
     request.session = {'fxa_state': 'myfxastate'}
 
     raw_url = utils.fxa_login_url(
-        config=FXA_CONFIG['default'],
-        state=request.session['fxa_state'], next_path=path, action='signin',
-        force_two_factor=False)
+        config=settings.FXA_CONFIG['default'],
+        state=request.session['fxa_state'],
+        next_path=path,
+        enforce_2fa=False,
+    )
 
     url = urlparse(raw_url)
-    base = '{scheme}://{netloc}{path}'.format(
-        scheme=url.scheme, netloc=url.netloc, path=url.path)
+    base = f'{url.scheme}://{url.netloc}{url.path}'
     assert base == 'https://accounts.firefox.com/oauth/authorization'
     query = parse_qs(url.query)
     next_path = urlsafe_b64encode(path.encode('utf-8')).rstrip(b'=')
     assert query == {
-        'action': ['signin'],
-        'client_id': ['foo'],
-        'redirect_url': ['https://testserver/fxa'],
-        'scope': ['profile'],
-        'state': ['myfxastate:{next_path}'.format(
-            next_path=force_text(next_path))],
+        'client_id': ['amodefault'],
+        'scope': ['profile openid'],
+        'state': [f'myfxastate:{force_str(next_path)}'],
+        'access_type': ['offline'],
     }
 
 
-@override_settings(FXA_CONFIG=FXA_CONFIG)
+@override_settings(FXA_OAUTH_HOST='https://accounts.firefox.com/oauth')
 def test_fxa_login_url_requiring_two_factor_auth():
-    path = u'/en-US/addons/abp/?source=ddg'
+    path = '/en-US/addons/abp/?source=ddg'
     request = RequestFactory().get(path)
     request.session = {'fxa_state': 'myfxastate'}
 
     raw_url = utils.fxa_login_url(
-        config=FXA_CONFIG['default'],
-        state=request.session['fxa_state'], next_path=path, action='signin',
-        force_two_factor=True)
+        config=settings.FXA_CONFIG['default'],
+        state=request.session['fxa_state'],
+        next_path=path,
+        enforce_2fa=True,
+    )
 
     url = urlparse(raw_url)
-    base = u'{scheme}://{netloc}{path}'.format(
-        scheme=url.scheme, netloc=url.netloc, path=url.path)
+    base = f'{url.scheme}://{url.netloc}{url.path}'
     assert base == 'https://accounts.firefox.com/oauth/authorization'
     query = parse_qs(url.query)
     next_path = urlsafe_b64encode(path.encode('utf-8')).rstrip(b'=')
     assert query == {
         'acr_values': ['AAL2'],
-        'action': ['signin'],
-        'client_id': ['foo'],
-        'redirect_url': ['https://testserver/fxa'],
-        'scope': ['profile'],
-        'state': ['myfxastate:{next_path}'.format(
-            next_path=force_text(next_path))],
+        'client_id': ['amodefault'],
+        'scope': ['profile openid'],
+        'state': [f'myfxastate:{force_str(next_path)}'],
+        'access_type': ['offline'],
+        'max_age': ['0'],
+    }
+
+
+@override_settings(FXA_OAUTH_HOST='https://accounts.firefox.com/oauth')
+def test_fxa_login_url_requiring_two_factor_auth_passing_token():
+    path = '/en-US/addons/abp/?source=ddg'
+    request = RequestFactory().get(path)
+    request.session = {'fxa_state': 'myfxastate'}
+
+    raw_url = utils.fxa_login_url(
+        config=settings.FXA_CONFIG['default'],
+        state=request.session['fxa_state'],
+        next_path=path,
+        enforce_2fa=True,
+        id_token_hint='YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo=',
+    )
+
+    url = urlparse(raw_url)
+    base = f'{url.scheme}://{url.netloc}{url.path}'
+    assert base == 'https://accounts.firefox.com/oauth/authorization'
+    query = parse_qs(url.query)
+    next_path = urlsafe_b64encode(path.encode('utf-8')).rstrip(b'=')
+    assert query == {
+        'acr_values': ['AAL2'],
+        'client_id': ['amodefault'],
+        'id_token_hint': ['YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo='],
+        'prompt': ['none'],
+        'scope': ['profile openid'],
+        'state': [f'myfxastate:{force_str(next_path)}'],
+        'access_type': ['offline'],
+    }
+
+
+@override_settings(FXA_OAUTH_HOST='https://accounts.firefox.com/oauth')
+def test_fxa_login_url_requiring_two_factor_auth_passing_request():
+    path = '/en-US/addons/abp/?source=ddg'
+    request = RequestFactory().get(path)
+    request.session = {'fxa_state': 'myfxastate'}
+
+    raw_url = utils.fxa_login_url(
+        config=settings.FXA_CONFIG['default'],
+        state=request.session['fxa_state'],
+        next_path=path,
+        enforce_2fa=True,
+        request=request,
+    )
+
+    url = urlparse(raw_url)
+    base = f'{url.scheme}://{url.netloc}{url.path}'
+    assert base == 'https://accounts.firefox.com/oauth/authorization'
+    query = parse_qs(url.query)
+    next_path = urlsafe_b64encode(path.encode('utf-8')).rstrip(b'=')
+    assert query == {
+        'acr_values': ['AAL2'],
+        'client_id': ['amodefault'],
+        'scope': ['profile openid'],
+        'state': [f'myfxastate:{force_str(next_path)}'],
+        'access_type': ['offline'],
+        'max_age': ['0'],
+    }
+
+
+@override_settings(FXA_OAUTH_HOST='https://accounts.firefox.com/oauth')
+def test_fxa_login_url_requiring_two_factor_auth_passing_login_hint():
+    path = '/en-US/addons/abp/?source=ddg'
+    request = RequestFactory().get(path)
+    request.session = {'fxa_state': 'myfxastate'}
+
+    raw_url = utils.fxa_login_url(
+        config=settings.FXA_CONFIG['default'],
+        state=request.session['fxa_state'],
+        next_path=path,
+        enforce_2fa=True,
+        request=request,
+        login_hint='test@example.com',
+    )
+
+    url = urlparse(raw_url)
+    base = f'{url.scheme}://{url.netloc}{url.path}'
+    assert base == 'https://accounts.firefox.com/oauth/authorization'
+    query = parse_qs(url.query)
+    next_path = urlsafe_b64encode(path.encode('utf-8')).rstrip(b'=')
+    assert query == {
+        'acr_values': ['AAL2'],
+        'client_id': ['amodefault'],
+        'login_hint': ['test@example.com'],
+        'prompt': ['none'],
+        'scope': ['profile openid'],
+        'state': [f'myfxastate:{force_str(next_path)}'],
+        'access_type': ['offline'],
     }
 
 
 def test_unicode_next_path():
-    path = u'/en-US/føø/bãr'
+    path = '/en-US/føø/bãr'
     request = RequestFactory().get(path)
-    request.session = {}
-    url = utils.default_fxa_login_url(request)
+    request.session = {'fxa_state': 'fake-state'}
+    url = utils.fxa_login_url(
+        config=settings.FXA_CONFIG['default'],
+        state=request.session['fxa_state'],
+        next_path=utils.path_with_query(request),
+    )
     state = parse_qs(urlparse(url).query)['state'][0]
     next_path = urlsafe_b64decode(state.split(':')[1] + '===')
     assert next_path.decode('utf-8') == path
 
 
-@mock.patch('olympia.accounts.utils.default_fxa_login_url')
-def test_redirect_for_login(default_fxa_login_url):
-    login_url = 'https://example.com/login'
-    default_fxa_login_url.return_value = login_url
-    request = mock.MagicMock()
+def test_redirect_for_login():
+    request = RequestFactory().get('/somewhere')
+    request.session = {'fxa_state': 'fake-state'}
     response = utils.redirect_for_login(request)
-    default_fxa_login_url.assert_called_with(request)
-    assert response['location'] == login_url
+    assert response['location'] == utils.fxa_login_url(
+        config=settings.FXA_CONFIG['default'],
+        state=request.session['fxa_state'],
+        next_path='/somewhere',
+    )
+    assert request.session['enforce_2fa'] is False
 
 
-class TestProcessSqsQueue(TestCase):
-
-    @mock.patch('boto3._get_default_session')
-    @mock.patch('olympia.accounts.utils.process_fxa_event')
-    @mock.patch('boto3.client')
-    def test_process_sqs_queue(self, client, process_fxa_event, get_session):
-        messages = [
-            {'Body': 'foo', 'ReceiptHandle': '$$$'}, {'Body': 'bar'}, None,
-            {'Body': 'thisonetoo'}]
-        sqs = mock.MagicMock(
-            **{'receive_message.side_effect': [{'Messages': messages}]})
-        session_mock = mock.MagicMock(
-            **{'get_available_regions.side_effect': ['nowh-ere']})
-        get_session.return_value = session_mock
-        delete_mock = mock.MagicMock()
-        sqs.delete_message = delete_mock
-        client.return_value = sqs
-
-        with self.assertRaises(StopIteration):
-            utils.process_sqs_queue(
-                queue_url='https://sqs.nowh-ere.aws.com/123456789/')
-
-        client.assert_called()
-        client.assert_called_with(
-            'sqs', region_name='nowh-ere'
-        )
-        process_fxa_event.assert_called()
-        # The 'None' in messages would cause an exception, but it should be
-        # handled, and the remaining message(s) still processed.
-        process_fxa_event.assert_has_calls(
-            [mock.call('foo'), mock.call('bar'), mock.call('thisonetoo')])
-        delete_mock.assert_called_once()  # Receipt handle is present in foo.
-        delete_mock.assert_called_with(
-            QueueUrl='https://sqs.nowh-ere.aws.com/123456789/',
-            ReceiptHandle='$$$')
+def test_redirect_for_login_with_next_path():
+    request = RequestFactory().get('/somewhere')
+    request.session = {'fxa_state': 'fake-state'}
+    response = utils.redirect_for_login(request, next_path='/over/the/rainbow')
+    assert response['location'] == utils.fxa_login_url(
+        config=settings.FXA_CONFIG['default'],
+        state=request.session['fxa_state'],
+        next_path='/over/the/rainbow',
+    )
+    assert request.session['enforce_2fa'] is False
 
 
-def totimestamp(datetime_obj):
-    return time.mktime(datetime_obj.timetuple())
+def test_redirect_for_login_with_2fa_enforced():
+    request = RequestFactory().get('/somewhere')
+    request.session = {'fxa_state': 'fake-state'}
+    response = utils.redirect_for_login_with_2fa_enforced(request)
+    assert response['location'] == utils.fxa_login_url(
+        config=settings.FXA_CONFIG['default'],
+        state=request.session['fxa_state'],
+        next_path='/somewhere',
+        enforce_2fa=True,
+    )
+    assert request.session['enforce_2fa'] is True
 
 
-class TestProcessFxAEvent(TestCase):
+def test_redirect_for_login_with_2fa_enforced_id_token_hint():
+    request = RequestFactory().get('/somewhere')
+    request.session = {'fxa_state': 'fake-state'}
+    response = utils.redirect_for_login_with_2fa_enforced(
+        request, id_token_hint='some_token_hint'
+    )
+    assert response['location'] == utils.fxa_login_url(
+        config=settings.FXA_CONFIG['default'],
+        state=request.session['fxa_state'],
+        next_path='/somewhere',
+        enforce_2fa=True,
+        id_token_hint='some_token_hint',
+    )
+    assert request.session['enforce_2fa'] is True
+
+
+def test_redirect_for_login_with_2fa_enforced_and_next_path():
+    request = RequestFactory().get('/somewhere')
+    request.session = {'fxa_state': 'fake-state'}
+    response = utils.redirect_for_login_with_2fa_enforced(
+        request, next_path='/over/the/rainbow'
+    )
+    assert response['location'] == utils.fxa_login_url(
+        config=settings.FXA_CONFIG['default'],
+        state=request.session['fxa_state'],
+        next_path='/over/the/rainbow',
+        enforce_2fa=True,
+    )
+    assert request.session['enforce_2fa'] is True
+
+
+def test_redirect_for_login_with_2fa_enforced_and_config():
+    request = RequestFactory().get('/somewhere')
+    request.session = {'fxa_state': 'fake-state'}
+    response = utils.redirect_for_login_with_2fa_enforced(
+        request,
+        config={'client_id': 'foo_other', 'client_secret': 'bar_other'},
+    )
+    assert response['location'] == utils.fxa_login_url(
+        config={'client_id': 'foo_other', 'client_secret': 'bar_other'},
+        state=request.session['fxa_state'],
+        next_path='/somewhere',
+        enforce_2fa=True,
+    )
+    assert request.session['enforce_2fa'] is True
+
+
+@override_settings(FXA_CONFIG={'default': {'client_id': ''}})
+def test_fxa_login_url_when_faking_fxa_auth():
+    path = '/en-US/addons/abp/?source=ddg'
+    request = RequestFactory().get(path)
+    request.session = {'fxa_state': 'myfxastate'}
+    raw_url = utils.fxa_login_url(
+        config=settings.FXA_CONFIG['default'],
+        state=request.session['fxa_state'],
+        next_path=path,
+    )
+    url = urlparse(raw_url)
+    assert url.scheme == ''
+    assert url.netloc == ''
+    assert url.path == reverse('fake-fxa-authorization')
+    # client_id has a blank value, so we should inspect blank values
+    query = parse_qs(url.query, keep_blank_values=True)
+    next_path = urlsafe_b64encode(path.encode('utf-8')).rstrip(b'=')
+    assert query == {
+        'client_id': [''],
+        'scope': ['profile openid'],
+        'state': [f'myfxastate:{force_str(next_path)}'],
+        'access_type': ['offline'],
+    }
+
+
+@override_settings(
+    FXA_CONFIG={
+        'foo': {'FOO': 123},
+        'bar': {'BAR': 456},
+        'baz': {'BAZ': 789},
+    },
+    DEFAULT_FXA_CONFIG_NAME='baz',
+)
+class TestGetFxaConfigAndName(TestCase):
+    def test_no_config(self):
+        request = RequestFactory().get('/login')
+        assert utils.get_fxa_config_name(request) == 'baz'
+        config = utils.get_fxa_config(request)
+        assert config == {'BAZ': 789}
+
+    def test_config_alternate(self):
+        request = RequestFactory().get('/login?config=bar')
+        assert utils.get_fxa_config_name(request) == 'bar'
+        config = utils.get_fxa_config(request)
+        assert config == {'BAR': 456}
+
+    def test_config_is_default(self):
+        request = RequestFactory().get('/login?config=baz')
+        assert utils.get_fxa_config_name(request) == 'baz'
+        config = utils.get_fxa_config(request)
+        assert config == {'BAZ': 789}
+
+
+class TestCheckForSessionAnomaly(TestCase):
     def setUp(self):
-        self.email_changed_date = self.days_ago(42)
-        self.body = json.dumps({'Message': json.dumps(
-            {'email': 'new-email@example.com', 'event': 'primaryEmailChanged',
-             'uid': 'ABCDEF012345689',
-             'ts': totimestamp(self.email_changed_date)})})
+        self.create_switch('enable-session-anomaly-recording', active=True)
 
-    def test_success_integration(self):
-        user = user_factory(email='old-email@example.com',
-                            fxa_id='ABCDEF012345689')
-        process_fxa_event(self.body)
-        user.reload()
-        assert user.email == 'new-email@example.com'
-        assert user.email_changed == self.email_changed_date
+    def create_request_and_session(self, headers=None):
+        request = RequestFactory().get('/', headers=headers)
+        self.initialize_session({}, request=request)
+        return request
 
-    def test_success_integration_previously_changed_once(self):
-        user = user_factory(email='old-email@example.com',
-                            fxa_id='ABCDEF012345689',
-                            email_changed=datetime(2017, 10, 11))
-        process_fxa_event(self.body)
-        user.reload()
-        assert user.email == 'new-email@example.com'
-        assert user.email_changed == self.email_changed_date
+    def test_no_user(self):
+        self.request = self.create_request_and_session()
+        utils.check_for_session_anomaly(
+            session=self.request.session, headers=self.request.headers, user=None
+        )
+        assert ActivityLog.objects.count() == 0
 
-    @mock.patch('olympia.accounts.utils.primary_email_change_event.delay')
-    def test_success(self, primary_email_change_event):
-        process_fxa_event(self.body)
-        primary_email_change_event.assert_called()
-        primary_email_change_event.assert_called_with(
-            'new-email@example.com', 'ABCDEF012345689',
-            totimestamp(self.email_changed_date))
+    def test_not_authenticated(self):
+        self.request = self.create_request_and_session()
+        utils.check_for_session_anomaly(
+            session=self.request.session,
+            headers=self.request.headers,
+            user=AnonymousUser(),
+        )
+        assert ActivityLog.objects.count() == 0
 
-    @mock.patch('olympia.accounts.utils.primary_email_change_event.delay')
-    def test_malformed_body_doesnt_throw(self, primary_email_change_event):
-        process_fxa_event('')
-        process_fxa_event(json.dumps({'Message': ''}))
-        process_fxa_event(json.dumps({'Message': 'ddfdfd'}))
-        # No timestamp
-        process_fxa_event(json.dumps({'Message': json.dumps(
-            {'email': 'foo@baa', 'event': 'primaryEmailChanged',
-             'uid': '999'})}))
-        # Not a supported event type
-        process_fxa_event(json.dumps({'Message': json.dumps(
-            {'email': 'foo@baa', 'event': 'not-an-event', 'uid': '999',
-             'ts': totimestamp(datetime.now())})}))
-        primary_email_change_event.assert_not_called()
+    def test_no_initial_headers(self):
+        self.request = self.create_request_and_session({'Client-JA4': 'some-ja4'})
+        self.request.user = user_factory()
+        utils.check_for_session_anomaly(
+            session=self.request.session,
+            headers=self.request.headers,
+            user=self.request.user,
+        )
+        assert ActivityLog.objects.count() == 0
+        assert self.request.session['request_headers'] == {'client-ja4': 'some-ja4'}
+
+    def test_no_anomaly(self):
+        self.request = self.create_request_and_session({'Client-JA4': 'some-ja4'})
+        self.request.user = user_factory()
+        self.request.session['request_headers'] = {'client-ja4': 'some-ja4'}
+        utils.check_for_session_anomaly(
+            session=self.request.session,
+            headers=self.request.headers,
+            user=self.request.user,
+        )
+        assert ActivityLog.objects.count() == 0
+
+    def test_ignore_missing_header_in_session(self):
+        self.request = self.create_request_and_session({'Client-JA4': 'some-ja4'})
+        self.request.user = user_factory()
+        self.request.session['request_headers'] = {}
+        utils.check_for_session_anomaly(
+            session=self.request.session,
+            headers=self.request.headers,
+            user=self.request.user,
+        )
+        assert ActivityLog.objects.count() == 0
+        assert self.request.session['request_headers'] == {'client-ja4': 'some-ja4'}
+
+    def test_anomaly(self):
+        self.request = self.create_request_and_session({'Client-JA4': 'different-ja4'})
+        self.request.user = user_factory()
+        self.request.session['request_headers'] = {'client-ja4': 'some-ja4'}
+        utils.check_for_session_anomaly(
+            session=self.request.session,
+            headers=self.request.headers,
+            user=self.request.user,
+        )
+        expected_anomalies = [
+            {
+                'header': 'client-ja4',
+                'expected': 'some-ja4',
+                'received': 'different-ja4',
+            }
+        ]
+        assert 'session_anomalies' in self.request.session
+        assert self.request.session['session_anomalies'] == expected_anomalies
+        assert ActivityLog.objects.count() == 1
+        activity = ActivityLog.objects.get()
+        assert activity.action == amo.LOG.SESSION_ANOMALY.id
+        assert activity.user == self.request.user
+        assert activity.details == {'anomalies': expected_anomalies}
+
+    def test_anomalies(self):
+        self.request = self.create_request_and_session(
+            {
+                'Client-JA4': 'different-ja4',
+                'Cloudfront-Viewer-country': 'different-country',
+            }
+        )
+        self.request.user = user_factory()
+        self.request.session['request_headers'] = {
+            'client-ja4': 'some-ja4',
+            'cloudfront-viewer-country': 'some-country',
+        }
+        utils.check_for_session_anomaly(
+            session=self.request.session,
+            headers=self.request.headers,
+            user=self.request.user,
+        )
+        # Order follows REQUEST_HEADERS_TO_CHECK in the function.
+        expected_anomalies = [
+            {
+                'header': 'client-ja4',
+                'expected': 'some-ja4',
+                'received': 'different-ja4',
+            },
+            {
+                'header': 'cloudfront-viewer-country',
+                'expected': 'some-country',
+                'received': 'different-country',
+            },
+        ]
+        assert 'session_anomalies' in self.request.session
+        assert self.request.session['session_anomalies'] == expected_anomalies
+        assert ActivityLog.objects.count() == 1
+        activity = ActivityLog.objects.get()
+        assert activity.action == amo.LOG.SESSION_ANOMALY.id
+        assert activity.user == self.request.user
+        assert activity.details == {'anomalies': expected_anomalies}
+
+    def test_anomaly_only_recorded_once_per_session(self):
+        self.test_anomaly()
+        ActivityLog.objects.all().delete()
+        utils.check_for_session_anomaly(
+            session=self.request.session,
+            headers=self.request.headers,
+            user=self.request.user,
+        )
+        # New anomaly is not logged, one per session is enough.
+        assert ActivityLog.objects.count() == 0
+
+    @override_switch('enable-session-anomaly-recording', active=False)
+    def test_waffle_off(self):
+        self.request = self.create_request_and_session({'Client-JA4': 'different-ja4'})
+        self.request.user = user_factory()
+        self.request.session['request_headers'] = {'client-ja4': 'some-ja4'}
+        utils.check_for_session_anomaly(
+            session=self.request.session,
+            headers=self.request.headers,
+            user=self.request.user,
+        )
+        assert ActivityLog.objects.count() == 0

@@ -1,16 +1,17 @@
-{% extends "base_modal.html" if request.is_ajax() else "impala/base_shared.html" %}
+{% extends "base.html" %}
 
 {% block title %}{{ _('Not allowed') }}{% endblock %}
 
-{% block content %}
-  <section class="primary">
+{% block main_content %}
+<div role="main">
+  <section>
     <h1>{{ _('Oops! Not allowed.') }}</h1>
     <p>
       {{ _("You tried to do something that you weren't allowed to.") }}
     </p>
   </section>
 
-  <section class="primary">
+  <section>
     {# Taken primarily from Django's CSRF page #}
     {% if no_referer %}
       <p>
@@ -20,6 +21,7 @@
         sent. This header is required for security reasons, to ensure
         that your browser is not being hijacked by third parties.
         {% endtrans %}
+      </p>
       <p>
         {% trans %}
         If you have configured your browser to disable 'Referer' headers,
@@ -45,4 +47,5 @@
       </p>
     {% endif %}
   </section>
+</div>
 {% endblock %}

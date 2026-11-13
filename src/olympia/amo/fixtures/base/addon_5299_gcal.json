@@ -1,5 +1,4 @@
-[
-    {
+[{
         "pk": 90914,
         "model": "translations.translation",
         "fields": {
@@ -29,8 +28,6 @@
             "slug": "better-gcal-5299",
             "last_updated": "2008-07-07 12:08:01",
             "_current_version": 49515,
-            "view_source": false,
-            "total_downloads": 206990,
             "disabled_by_user": false,
             "guid": "bettergcal@ginatrapani.org",
             "description": 58812,
@@ -38,7 +35,6 @@
             "average_rating": "3.43",
             "average_daily_users": 19616,
             "bayesian_rating": 3.6313200000000001,
-            "public_stats": false,
             "status": 4,
             "default_locale": "en-US",
             "name": 58814,
@@ -90,10 +86,10 @@
             "hash": "sha256:114091778b4a4e3991e010ff07921eddd65139ff2f29e83b5a14140f2ca37d22",
             "created": "2008-07-06 13:53:30",
             "modified": "2010-03-12 07:45:52",
-            "filename": "better_gcal-0.3-fx.xpi",
-            "platform": 1,
+            "file": "99/5299/5299/better_gcal-0.3.xpi",
             "version": 49515,
             "size": 75776,
+            "manifest_version": 2,
             "datestatuschanged": "2008-07-07 12:08:01"
         }
     },
@@ -103,10 +99,10 @@
             "hash": "sha256:4395f9cf4934ecc8f22d367c2a301fd79613b68937c59e676e92e4f0a89a5b92",
             "created": "2009-09-18 12:33:25",
             "modified": "2010-02-09 19:50:16",
-            "filename": "better_gcal-0.4-fx.xpi",
-            "platform": 1,
+            "file": "99/5299/5299/better_gcal-0.4.xpi",
             "version": 50000,
             "size": 24576,
+            "manifest_version": 2,
             "datestatuschanged": "2009-09-18 12:32:59"
         },
         "model": "files.file",
@@ -173,16 +169,6 @@
             "version": 49515,
             "min": 1,
             "max": 307
-        }
-    },
-    {
-        "pk": 1237,
-        "model": "addons.appsupport",
-        "fields": {
-            "app": 1,
-            "addon": 5299,
-            "modified": "2010-10-25 18:09:30",
-            "created": "2010-10-25 18:09:30"
         }
     }
 ]

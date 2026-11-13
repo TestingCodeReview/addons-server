@@ -1,6 +1,6 @@
 from olympia import amo
 from olympia.addons.models import Addon
-from olympia.amo.tests import TestCase
+from olympia.amo.tests import TestCase, version_factory
 from olympia.devhub.models import BlogPost
 from olympia.files.models import File
 from olympia.versions.models import Version
@@ -10,7 +10,7 @@ class TestVersion(TestCase):
     fixtures = ['base/users', 'base/addon_3615']
 
     def setUp(self):
-        super(TestVersion, self).setUp()
+        super().setUp()
         self.addon = Addon.objects.get(pk=3615)
         self.version = Version.objects.get(pk=81551)
         self.file = File.objects.get(pk=67442)
@@ -23,14 +23,13 @@ class TestVersion(TestCase):
     def _extra_version_and_file(self, status):
         version = Version.objects.get(pk=81551)
 
-        version_two = Version(addon=self.addon,
-                              license=version.license,
-                              version='1.2.3')
-        version_two.save()
-
-        file_two = File(status=status, version=version_two)
-        file_two.save()
-        return version_two, file_two
+        version_two = version_factory(
+            addon=self.addon,
+            license=version.license,
+            version='1.2.3',
+            file_kw={'status': status},
+        )
+        return version_two, version_two.file
 
     def test_version_delete_status_unreviewed(self):
         self._extra_version_and_file(amo.STATUS_AWAITING_REVIEW)
@@ -46,17 +45,16 @@ class TestVersion(TestCase):
         assert Addon.objects.get(pk=3615).status == amo.STATUS_NULL
 
     def test_file_delete_status_null_multiple(self):
-        version_two, file_two = self._extra_version_and_file(amo.STATUS_NULL)
+        _version_two, file_two = self._extra_version_and_file(amo.STATUS_NULL)
         self.file.delete()
-        assert self.addon.status == amo.STATUS_PUBLIC
+        assert self.addon.status == amo.STATUS_APPROVED
         file_two.delete()
         assert self.addon.status == amo.STATUS_NULL
 
 
 class TestBlogPosts(TestCase):
-
     def test_blog_posts(self):
         BlogPost.objects.create(title='hi')
         bp = BlogPost.objects.all()
         assert bp.count() == 1
-        assert bp[0].title == "hi"
+        assert bp[0].title == 'hi'

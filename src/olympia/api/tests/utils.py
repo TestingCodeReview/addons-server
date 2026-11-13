@@ -1,15 +1,13 @@
 from datetime import datetime
 
 from rest_framework.test import APIClient
-from six import text_type
 
-from olympia.amo.tests import TestCase
 from olympia.api.authentication import JWTKeyAuthentication
 from olympia.api.tests.test_jwt_auth import JWTAuthKeyTester
 from olympia.users.models import UserProfile
 
 
-class APIKeyAuthTestMixin(TestCase, JWTAuthKeyTester):
+class APIKeyAuthTestMixin(JWTAuthKeyTester):
     client_class = APIClient
 
     def create_api_user(self):
@@ -18,25 +16,46 @@ class APIKeyAuthTestMixin(TestCase, JWTAuthKeyTester):
             email='a@m.o',
             read_dev_agreement=datetime.today(),
         )
-        self.api_key = self.create_api_key(
-            self.user, text_type(self.user.pk) + ':f')
+        self.api_key = self.create_api_key(self.user, str(self.user.pk) + ':f')
 
     def authorization(self):
         """
         Creates a suitable JWT auth token.
         """
-        token = self.create_auth_token(self.api_key.user, self.api_key.key,
-                                       self.api_key.secret)
-        return 'JWT {}'.format(token)
+        token = self.create_auth_token(
+            self.api_key.user, self.api_key.key, self.api_key.secret
+        )
+        return f'JWT {token}'
+
+    def head(self, url, **client_kwargs):
+        return self.client.head(
+            url, HTTP_AUTHORIZATION=self.authorization(), **client_kwargs
+        )
+
+    def delete(self, url, **client_kwargs):
+        return self.client.delete(
+            url, HTTP_AUTHORIZATION=self.authorization(), **client_kwargs
+        )
 
     def get(self, url, **client_kwargs):
-        return self.client.get(url, HTTP_AUTHORIZATION=self.authorization(),
-                               **client_kwargs)
+        return self.client.get(
+            url, HTTP_AUTHORIZATION=self.authorization(), **client_kwargs
+        )
 
-    def post(self, url, data, **client_kwargs):
+    def post(self, url, data=None, **client_kwargs):
         return self.client.post(
-            url, data, HTTP_AUTHORIZATION=self.authorization(),
-            **client_kwargs)
+            url, data, HTTP_AUTHORIZATION=self.authorization(), **client_kwargs
+        )
+
+    def put(self, url, data=None, **client_kwargs):
+        return self.client.put(
+            url, data, HTTP_AUTHORIZATION=self.authorization(), **client_kwargs
+        )
+
+    def patch(self, url, data=None, **client_kwargs):
+        return self.client.patch(
+            url, data, HTTP_AUTHORIZATION=self.authorization(), **client_kwargs
+        )
 
     def auth_required(self, cls):
         """
@@ -50,6 +69,6 @@ class APIKeyAuthTestMixin(TestCase, JWTAuthKeyTester):
         Tests that the verbs you expect on the class are present and no more.
         Options is added if you don't pass it.
         """
-        verbs = set(v.upper() for v in verbs)
+        verbs = {v.upper() for v in verbs}
         verbs.add('OPTIONS')
         assert not set(cls._allowed_methods(cls())).difference(verbs)

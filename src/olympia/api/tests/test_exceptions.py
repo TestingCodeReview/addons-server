@@ -1,28 +1,43 @@
-from django.urls import reverse
+from unittest import mock
+
 from django.http import Http404
 from django.test import TestCase, override_settings
+from django.urls import reverse
 
-import mock
-
-from rest_framework.exceptions import APIException, PermissionDenied
+from rest_framework.exceptions import APIException, PermissionDenied, Throttled
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.routers import SimpleRouter
 from rest_framework.settings import api_settings
 from rest_framework.viewsets import GenericViewSet
 
+from olympia import amo
+from olympia.applications.models import AppVersion
+
 
 class DummyViewSet(GenericViewSet):
     """Dummy test viewset that raises an exception when calling list()."""
+
     def list(self, *args, **kwargs):
-        raise Exception('something went wrong')
+        raise Exception('something went wrong')  # noqa: TRY002 (tests generic handler)
+
+
+class DummyWriteViewSet(GenericViewSet):
+    """Dummy test viewset that writes to the database before raising."""
+
+    def create(self, *args, **kwargs):
+        AppVersion.objects.create(application=amo.FIREFOX.id, version='99999.0')
+        raise Exception('something went wrong')  # noqa: TRY002 (tests generic handler)
 
 
 test_exception = SimpleRouter()
 test_exception.register('testexcept', DummyViewSet, basename='test-exception')
+test_exception.register(
+    'testexceptwrite', DummyWriteViewSet, basename='test-exception-write'
+)
 
 
-@override_settings(ROOT_URLCONF=test_exception.urls)
+@override_settings(ROOT_URLCONF=tuple(test_exception.urls))
 class TestExceptionHandlerWithViewSet(TestCase):
     # The test client connects to got_request_exception, so we need to mock it
     # otherwise it would immediately re-raise the exception.
@@ -37,7 +52,8 @@ class TestExceptionHandlerWithViewSet(TestCase):
         assert got_request_exception_mock.send.call_count == 1
         assert got_request_exception_mock.send.call_args[0][0] == DummyViewSet
         assert isinstance(
-            got_request_exception_mock.send.call_args[1]['request'], Request)
+            got_request_exception_mock.send.call_args[1]['request'], Request
+        )
 
     # The test client connects to got_request_exception, so we need to mock it
     # otherwise it would immediately re-raise the exception.
@@ -48,14 +64,37 @@ class TestExceptionHandlerWithViewSet(TestCase):
             response = self.client.get(url)
             assert response.status_code == 500
             data = response.data
-            assert set(data.keys()) == set(['detail', 'traceback'])
+            assert set(data.keys()) == {'detail', 'traceback'}
             assert data['detail'] == 'Internal Server Error'
             assert 'Traceback (most recent call last):' in data['traceback']
 
         assert got_request_exception_mock.send.call_count == 1
         assert got_request_exception_mock.send.call_args[0][0] == DummyViewSet
         assert isinstance(
-            got_request_exception_mock.send.call_args[1]['request'], Request)
+            got_request_exception_mock.send.call_args[1]['request'], Request
+        )
+
+
+@override_settings(ROOT_URLCONF=tuple(test_exception.urls))
+class TestExceptionHandlerRollback(TestCase):
+    # The test client connects to got_request_exception, so we need to mock it
+    # otherwise it would immediately re-raise the exception.
+    @mock.patch('olympia.api.exceptions.got_request_exception')
+    def test_non_api_exception_rolls_back_writes(self, got_request_exception_mock):
+        # Deliberately a POST: NonAtomicRequestsForSafeHttpMethodsMiddleware
+        # would make the view non-atomic for safe methods, and we want
+        # ATOMIC_REQUESTS to be in effect here.
+        url = reverse('test-exception-write-list')
+        with self.settings(DEBUG_PROPAGATE_EXCEPTIONS=False, DEBUG=False):
+            response = self.client.post(url)
+            assert response.status_code == 500
+
+        # Our handler turns the exception into a Response, so it never
+        # propagates out of the view. Without an explicit set_rollback() the
+        # write the view made before raising would have been committed.
+        assert not AppVersion.objects.filter(
+            application=amo.FIREFOX.id, version='99999.0'
+        ).exists()
 
 
 class TestExceptionHandler(TestCase):
@@ -65,7 +104,7 @@ class TestExceptionHandler(TestCase):
         with self.settings(DEBUG_PROPAGATE_EXCEPTIONS=False):
             try:
                 raise APIException()
-            except Exception as exc:
+            except APIException as exc:
                 response = exception_handler(exc, {})
                 assert isinstance(response, Response)
                 assert response.status_code == 500
@@ -76,7 +115,7 @@ class TestExceptionHandler(TestCase):
         with self.settings(DEBUG_PROPAGATE_EXCEPTIONS=False):
             try:
                 raise Http404()
-            except Exception as exc:
+            except Http404 as exc:
                 response = exception_handler(exc, {})
                 assert isinstance(response, Response)
                 assert response.status_code == 404
@@ -87,7 +126,7 @@ class TestExceptionHandler(TestCase):
         with self.settings(DEBUG_PROPAGATE_EXCEPTIONS=False):
             try:
                 raise PermissionDenied()
-            except Exception as exc:
+            except PermissionDenied as exc:
                 response = exception_handler(exc, {})
                 assert isinstance(response, Response)
                 assert response.status_code == 403
@@ -99,8 +138,10 @@ class TestExceptionHandler(TestCase):
 
         with self.settings(DEBUG_PROPAGATE_EXCEPTIONS=False):
             try:
-                raise Exception()
-            except Exception as exc:
+                # Any non-DRF exception (here KeyError) should still produce a
+                # Response rather than propagating.
+                raise KeyError()
+            except KeyError as exc:
                 response = exception_handler(exc, {})
                 assert isinstance(response, Response)
                 assert response.status_code == 500
@@ -108,41 +149,98 @@ class TestExceptionHandler(TestCase):
     def test_api_exception_handler_with_propagation(self):
         exception_handler = api_settings.EXCEPTION_HANDLER
 
-        with self.assertRaises(APIException):
-            with self.settings(DEBUG_PROPAGATE_EXCEPTIONS=True):
-                try:
-                    raise APIException()
-                except Exception as exc:
-                    exception_handler(exc, {})
+        with (
+            self.assertRaises(APIException),
+            self.settings(DEBUG_PROPAGATE_EXCEPTIONS=True),
+        ):
+            try:
+                raise APIException()
+            except APIException as exc:
+                exception_handler(exc, {})
 
     def test_exception_handler_404_with_propagation(self):
         exception_handler = api_settings.EXCEPTION_HANDLER
 
-        with self.assertRaises(Http404):
-            with self.settings(DEBUG_PROPAGATE_EXCEPTIONS=True):
-                try:
-                    raise Http404()
-                except Exception as exc:
-                    exception_handler(exc, {})
+        with (
+            self.assertRaises(Http404),
+            self.settings(DEBUG_PROPAGATE_EXCEPTIONS=True),
+        ):
+            try:
+                raise Http404()
+            except Http404 as exc:
+                exception_handler(exc, {})
 
     def test_exception_handler_403_with_propagation(self):
         exception_handler = api_settings.EXCEPTION_HANDLER
 
-        with self.assertRaises(PermissionDenied):
-            with self.settings(DEBUG_PROPAGATE_EXCEPTIONS=True):
-                try:
-                    raise PermissionDenied()
-                except Exception as exc:
-                    exception_handler(exc, {})
+        with (
+            self.assertRaises(PermissionDenied),
+            self.settings(DEBUG_PROPAGATE_EXCEPTIONS=True),
+        ):
+            try:
+                raise PermissionDenied()
+            except PermissionDenied as exc:
+                exception_handler(exc, {})
 
     def test_non_api_exception_handler_with_propagation(self):
         # Regular DRF exception handler does not return a Response for non-api
         # exceptions, but we do.
         exception_handler = api_settings.EXCEPTION_HANDLER
 
-        with self.assertRaises(KeyError):
-            with self.settings(DEBUG_PROPAGATE_EXCEPTIONS=True):
-                try:
-                    raise KeyError()
-                except Exception as exc:
-                    exception_handler(exc, {})
+        with (
+            self.assertRaises(KeyError),
+            self.settings(DEBUG_PROPAGATE_EXCEPTIONS=True),
+        ):
+            try:
+                raise KeyError()
+            except KeyError as exc:
+                exception_handler(exc, {})
+
+
+class TestThrottledExceptionHandler(TestCase):
+    def handle(self, exc):
+        with self.settings(DEBUG_PROPAGATE_EXCEPTIONS=False):
+            return api_settings.EXCEPTION_HANDLER(exc, {})
+
+    def test_throttled_with_wait(self):
+        response = self.handle(Throttled(wait=41.3))
+        assert response.status_code == 429
+        assert response['Retry-After'] == '42'
+        assert response.data['detail'] == (
+            'Request was throttled. Expected available in 42 seconds.'
+        )
+
+    def test_throttled_with_wait_singular(self):
+        response = self.handle(Throttled(wait=1))
+        assert response.status_code == 429
+        assert response['Retry-After'] == '1'
+        assert response.data['detail'] == (
+            'Request was throttled. Expected available in 1 second.'
+        )
+
+    def test_throttled_without_wait(self):
+        response = self.handle(Throttled())
+        assert response.status_code == 429
+        assert 'Retry-After' not in response
+        assert response.data['detail'] == 'Request was throttled.'
+
+    @mock.patch('olympia.api.exceptions.ngettext')
+    def test_throttled_translates_before_formatting(self, ngettext_mock):
+        ngettext_mock.return_value = 'Encore {wait} secondes.'
+        response = self.handle(Throttled(wait=5))
+        ngettext_mock.assert_called_once_with(
+            'Expected available in {wait} second.',
+            'Expected available in {wait} seconds.',
+            5,
+        )
+        assert response.data['detail'] == 'Request was throttled. Encore 5 secondes.'
+
+    def test_throttled_custom_detail_left_untouched(self):
+        response = self.handle(Throttled(wait=5, detail='Slow down.'))
+        assert response.status_code == 429
+        assert response['Retry-After'] == '5'
+        # DRF still appends its own sentence to custom details, we leave
+        # those alone.
+        assert response.data['detail'] == (
+            'Slow down. Expected available in 5 seconds.'
+        )

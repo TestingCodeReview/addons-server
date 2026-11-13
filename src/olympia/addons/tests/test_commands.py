@@ -1,208 +1,34 @@
+import random
 from contextlib import contextmanager
+from datetime import datetime, timedelta
+from unittest import mock
 
 from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.forms import ValidationError
-from django.utils import translation
 
-import mock
 import pytest
+import time_machine
 
 from olympia import amo
-from olympia.activity.models import AddonLog
+from olympia.abuse.models import AbuseReport
 from olympia.addons.management.commands import (
-    approve_addons, process_addons as pa)
-from olympia.addons.models import Addon
+    fix_langpacks_with_max_version_star,
+    process_addons,
+)
+from olympia.addons.models import Addon, DeniedGuid
 from olympia.amo.tests import (
-    AMOPaths, TestCase, addon_factory, version_factory)
+    TestCase,
+    addon_factory,
+    create_default_webext_appversion,
+    user_factory,
+    version_factory,
+)
 from olympia.applications.models import AppVersion
-from olympia.files.models import FileValidation, WebextPermission
-from olympia.reviewers.models import AutoApprovalSummary, ReviewerScore
-from olympia.versions.models import ApplicationsVersions, VersionPreview
-
-
-# Where to monkeypatch "lib.crypto.tasks.sign_addons" so it's correctly mocked.
-SIGN_ADDONS = 'olympia.addons.management.commands.sign_addons.sign_addons'
-
-
-def test_sign_addons_force_signing(monkeypatch):
-    """You can force signing an addon even if it's already signed."""
-    def not_forced(ids, force, reason):
-        assert not force
-    monkeypatch.setattr(SIGN_ADDONS, not_forced)
-    call_command('sign_addons', '123')
-
-    def is_forced(ids, force, reason):
-        assert force
-    monkeypatch.setattr(SIGN_ADDONS, is_forced)
-    call_command('sign_addons', '123', force=True)
-
-
-def test_sign_addons_reason(monkeypatch):
-    """You can pass a reason."""
-    def has_reason(ids, force, reason):
-        assert reason == 'expiry'
-    monkeypatch.setattr(SIGN_ADDONS, has_reason)
-    call_command('sign_addons', '123', reason='expiry')
-
-
-def test_sign_addons_overwrite_autograph_settings(monkeypatch):
-    def has_config_overwrite(ids, force, reason):
-        config = settings.AUTOGRAPH_CONFIG
-        assert config['server_url'] == 'dummy server url'
-        assert config['user_id'] == 'dummy user id'
-        assert config['key'] == 'dummy key'
-        assert config['signer'] == 'dummy signer'
-
-    monkeypatch.setattr(SIGN_ADDONS, has_config_overwrite)
-    call_command(
-        'sign_addons', '123',
-        autograph_server_url='dummy server url',
-        autograph_user_id='dummy user id',
-        autograph_key='dummy key',
-        autograph_signer='dummy signer')
-
-
-@pytest.mark.django_db
-def test_approve_addons_get_files_incomplete():
-    """An incomplete add-on can't be approved."""
-    addon = addon_factory(status=amo.STATUS_NULL)
-    assert approve_addons.get_files([addon.guid]) == []
-
-
-@pytest.mark.django_db
-def test_approve_addons_get_files_bad_guid():
-    """An add-on with another guid doesn't get approved."""
-    addon1 = addon_factory(status=amo.STATUS_NOMINATED, guid='foo')
-    addon1_file = addon1.find_latest_version(
-        amo.RELEASE_CHANNEL_LISTED).files.get()
-    addon1_file.update(status=amo.STATUS_AWAITING_REVIEW)
-    # Create another add-on that we won't get the files for.
-    addon2 = addon_factory(status=amo.STATUS_NOMINATED, guid='bar')
-    addon2_file = addon2.find_latest_version(
-        amo.RELEASE_CHANNEL_LISTED).files.get()
-    addon2_file.update(status=amo.STATUS_AWAITING_REVIEW)
-    # There's only the addon1's file returned, no other.
-    assert approve_addons.get_files(['foo']) == [addon1_file]
-
-
-def id_function(fixture_value):
-    """Convert a param from the use_case fixture to a nicer name.
-
-    By default, the name (used in the test generated from the parameterized
-    fixture) will use the fixture name and a number.
-    Eg: test_foo[use_case0]
-
-    Providing explicit 'ids' (either as strings, or as a function) will use
-    those names instead. Here the name will be something like
-    test_foo[public-unreviewed-full], for the status values, and if the file is
-    unreviewed.
-    """
-    addon_status, file_status, review_type = fixture_value
-    return '{0}-{1}-{2}'.format(amo.STATUS_CHOICES_API[addon_status],
-                                amo.STATUS_CHOICES_API[file_status],
-                                review_type)
-
-
-@pytest.fixture(
-    params=[(amo.STATUS_NOMINATED, amo.STATUS_AWAITING_REVIEW, 'full'),
-            (amo.STATUS_PUBLIC, amo.STATUS_AWAITING_REVIEW, 'full')],
-    # ids are used to build better names for the tests using this fixture.
-    ids=id_function)
-def use_case(request, db):
-    """This fixture will return quadruples for different use cases.
-
-    Addon                   | File1 and 2        | Review type
-    ==============================================================
-    awaiting review         | awaiting review    | approved
-    approved                | awaiting review    | approved
-    """
-    addon_status, file_status, review_type = request.param
-
-    addon = addon_factory(status=addon_status, guid='foo')
-    version = addon.find_latest_version(amo.RELEASE_CHANNEL_LISTED)
-    file1 = version.files.get()
-    file1.update(status=file_status)
-    # A second file for good measure.
-    file2 = amo.tests.file_factory(version=version, status=file_status)
-    # If the addon is public, and we change its only file to something else
-    # than public, it'll change to unreviewed.
-    addon.update(status=addon_status)
-    assert addon.reload().status == addon_status
-    assert file1.reload().status == file_status
-    assert file2.reload().status == file_status
-
-    return (addon, file1, file2, review_type)
-
-
-@pytest.fixture
-def mozilla_user(db):
-    """Create and return the "mozilla" user used to auto approve addons."""
-    return amo.tests.user_factory(id=settings.TASK_USER_ID)
-
-
-def test_approve_addons_get_files(use_case):
-    """Files that need to get approved are returned in the list.
-
-    Use cases are quadruples taken from the "use_case" fixture above.
-    """
-    addon, file1, file2, review_type = use_case
-    assert approve_addons.get_files([addon.guid]) == [file1, file2]
-
-
-@pytest.mark.django_db
-def test_approve_addons_approve_files_no_review_type():
-    """Files which don't need approval don't change status."""
-    # Create the "mozilla" user, needed for the log.
-    amo.tests.user_factory(id=settings.TASK_USER_ID)
-    addon = addon_factory(status=amo.STATUS_PUBLIC)
-    file_ = addon.versions.get().files.get()
-    file_.update(status=amo.STATUS_PUBLIC)
-    approve_addons.approve_files([(file_, None)])
-    # Nothing changed.
-    assert addon.reload().status == amo.STATUS_PUBLIC
-    assert file_.reload().status == amo.STATUS_PUBLIC
-
-
-def test_approve_addons_approve_files(use_case, mozilla_user):
-    """Files are approved using the correct review type.
-
-    Use cases are quadruples taken from the "use_case" fixture above.
-    """
-    addon, file1, file2, review_type = use_case
-    approve_addons.approve_files([(file1, review_type),
-                                  (file2, review_type)])
-    assert file1.reload().status == amo.STATUS_PUBLIC
-    assert file2.reload().status == amo.STATUS_PUBLIC
-    logs = AddonLog.objects.filter(addon=addon)
-    assert len(logs) == 2  # One per file.
-    file1_log, file2_log = logs
-    # An AddonLog has been created for each approval.
-    assert file1_log.activity_log.details['comments'] == u'bulk approval'
-    assert file1_log.activity_log.user == mozilla_user
-    assert file2_log.activity_log.details['comments'] == u'bulk approval'
-    assert file2_log.activity_log.user == mozilla_user
-    # No ReviewerScore was granted, it's an automatic approval.
-    assert not ReviewerScore.objects.all()
-
-
-@pytest.mark.django_db
-def test_approve_addons_get_review_type_already_approved():
-    """The review type for a file that doesn't need approval is None."""
-    addon = addon_factory(status=amo.STATUS_PUBLIC)
-    file_ = addon.versions.get().files.get()
-    file_.update(status=amo.STATUS_PUBLIC)
-    assert approve_addons.get_review_type(file_) is None
-
-
-def test_approve_addons_get_review_type(use_case):
-    """Review type depends on the file and addon status.
-
-    Use cases are quadruples taken from the "use_case" fixture above.
-    """
-    addon, file1, _, review_type = use_case
-    assert approve_addons.get_review_type(file1) == review_type
+from olympia.files.models import FileValidation
+from olympia.ratings.models import Rating, RatingAggregate
+from olympia.reviewers.models import AutoApprovalSummary, NeedsHumanReview
+from olympia.versions.models import ApplicationsVersions, Version, VersionPreview
 
 
 def test_process_addons_invalid_task():
@@ -235,104 +61,68 @@ def count_subtask_calls(original_function):
     original_function.subtask = original_function_subtask
 
 
+@time_machine.travel('2019-04-01', tick=False)
 @pytest.mark.django_db
 def test_process_addons_limit_addons():
-    addon_ids = [addon_factory().id for _ in range(5)]
+    user_factory(id=settings.TASK_USER_ID)
+    addon_ids = [addon_factory(status=amo.STATUS_APPROVED).id for _ in range(5)]
     assert Addon.objects.count() == 5
 
-    with count_subtask_calls(pa.sign_addons) as calls:
-        call_command('process_addons', task='sign_addons')
+    with count_subtask_calls(process_addons.bump_and_resign_addons) as calls:
+        call_command('process_addons', task='bump_and_resign_addons')
         assert len(calls) == 1
         assert calls[0]['kwargs']['args'] == [addon_ids]
 
-    with count_subtask_calls(pa.sign_addons) as calls:
-        call_command('process_addons', task='sign_addons', limit=2)
+    with count_subtask_calls(process_addons.bump_and_resign_addons) as calls:
+        call_command('process_addons', task='bump_and_resign_addons', limit=2)
         assert len(calls) == 1
         assert calls[0]['kwargs']['args'] == [addon_ids[:2]]
 
 
-class AddFirefox57TagTestCase(TestCase):
-    def test_affects_only_public_webextensions(self):
-        addon_factory()
-        addon_factory(file_kw={'is_webextension': True,
-                               'status': amo.STATUS_AWAITING_REVIEW},
-                      status=amo.STATUS_NOMINATED)
-        public_webextension = addon_factory(file_kw={'is_webextension': True})
-        public_mozilla_signed = addon_factory(file_kw={
-            'is_mozilla_signed_extension': True})
+@pytest.mark.django_db
+@mock.patch.object(process_addons.Command, 'get_pks')
+def test_process_addons_batch_size(mock_get_pks):
+    addon_ids = [random.randrange(1000) for _ in range(101)]
+    mock_get_pks.return_value = addon_ids
 
-        with count_subtask_calls(pa.add_firefox57_tag) as calls:
-            call_command(
-                'process_addons', task='add_firefox57_tag_to_webextensions')
+    with count_subtask_calls(process_addons.recreate_previews) as calls:
+        call_command('process_addons', task='recreate_previews')
+        assert len(calls) == 2
+        assert calls[0]['kwargs']['args'] == [addon_ids[:100]]
+        assert calls[1]['kwargs']['args'] == [addon_ids[100:]]
 
+    with count_subtask_calls(process_addons.recreate_previews) as calls:
+        call_command('process_addons', task='recreate_previews', batch_size=50)
+        assert len(calls) == 3
+        assert calls[0]['kwargs']['args'] == [addon_ids[:50]]
+        assert calls[1]['kwargs']['args'] == [addon_ids[50:100]]
+        assert calls[2]['kwargs']['args'] == [addon_ids[100:]]
+
+
+@pytest.mark.django_db
+def test_process_addons_channel_arg():
+    listed_addon = addon_factory()
+    unlisted_addon = addon_factory(version_kw={'channel': amo.CHANNEL_UNLISTED})
+    enterprise_addon = addon_factory(version_kw={'channel': amo.CHANNEL_ENTERPRISE})
+
+    with count_subtask_calls(process_addons.addon_rating_aggregates) as calls:
+        call_command(
+            'process_addons', task='update_rating_aggregates', channel='listed'
+        )
         assert len(calls) == 1
-        assert calls[0]['kwargs']['args'] == [
-            [public_webextension.pk, public_mozilla_signed.pk]
-        ]
-
-    def test_tag_added_for_is_webextension(self):
-        self.addon = addon_factory(file_kw={'is_webextension': True})
-        assert self.addon.tags.all().count() == 0
+        assert calls[0]['kwargs']['args'] == [[listed_addon.pk]]
 
         call_command(
-            'process_addons', task='add_firefox57_tag_to_webextensions')
-
-        assert (
-            set(self.addon.tags.all().values_list('tag_text', flat=True)) ==
-            set(['firefox57']))
-
-    def test_tag_added_for_is_mozilla_signed_extension(self):
-        self.addon = addon_factory(
-            file_kw={'is_mozilla_signed_extension': True})
-        assert self.addon.tags.all().count() == 0
+            'process_addons', task='update_rating_aggregates', channel='unlisted'
+        )
+        assert len(calls) == 2
+        assert calls[1]['kwargs']['args'] == [[unlisted_addon.pk]]
 
         call_command(
-            'process_addons', task='add_firefox57_tag_to_webextensions')
-
-        assert (
-            set(self.addon.tags.all().values_list('tag_text', flat=True)) ==
-            set(['firefox57']))
-
-
-class TestAddDynamicThemeTagForThemeApiCommand(TestCase):
-    def test_affects_only_public_webextensions(self):
-        addon_factory()
-        addon_factory(file_kw={'is_webextension': True,
-                               'status': amo.STATUS_AWAITING_REVIEW},
-                      status=amo.STATUS_NOMINATED)
-        public_webextension = addon_factory(file_kw={'is_webextension': True})
-
-        with count_subtask_calls(pa.add_dynamic_theme_tag) as calls:
-            call_command(
-                'process_addons', task='add_dynamic_theme_tag_for_theme_api')
-
-        assert len(calls) == 1
-        assert calls[0]['kwargs']['args'] == [
-            [public_webextension.pk]
-        ]
-
-    def test_tag_added_for_is_dynamic_theme(self):
-        addon = addon_factory(file_kw={'is_webextension': True})
-        WebextPermission.objects.create(
-            file=addon.current_version.all_files[0],
-            permissions=['theme'])
-        assert addon.tags.all().count() == 0
-        # Add some more that shouldn't be tagged
-        no_perms = addon_factory(file_kw={'is_webextension': True})
-        not_a_theme = addon_factory(file_kw={'is_webextension': True})
-        WebextPermission.objects.create(
-            file=not_a_theme.current_version.all_files[0],
-            permissions=['downloads'])
-
-        call_command(
-            'process_addons', task='add_dynamic_theme_tag_for_theme_api')
-
-        assert (
-            list(addon.tags.all().values_list('tag_text', flat=True)) ==
-            [u'dynamic theme'])
-
-        assert not no_perms.tags.all().exists()
-        assert not not_a_theme.tags.all().exists()
+            'process_addons', task='update_rating_aggregates', channel='enterprise'
+        )
+        assert len(calls) == 3
+        assert calls[2]['kwargs']['args'] == [[enterprise_addon.pk]]
 
 
 class RecalculateWeightTestCase(TestCase):
@@ -343,14 +133,15 @@ class RecalculateWeightTestCase(TestCase):
         # Non auto-approved add-on that has an AutoApprovalSummary entry,
         # should not be considered.
         AutoApprovalSummary.objects.create(
-            version=addon_factory().current_version,
-            verdict=amo.NOT_AUTO_APPROVED)
+            version=addon_factory().current_version, verdict=amo.NOT_AUTO_APPROVED
+        )
 
         # Add-on with the current version not auto-approved, should not be
         # considered.
         extra_addon = addon_factory()
         AutoApprovalSummary.objects.create(
-            version=extra_addon.current_version, verdict=amo.AUTO_APPROVED)
+            version=extra_addon.current_version, verdict=amo.AUTO_APPROVED
+        )
         extra_addon.current_version.update(created=self.days_ago(1))
         version_factory(addon=extra_addon)
 
@@ -359,393 +150,226 @@ class RecalculateWeightTestCase(TestCase):
         already_confirmed_addon = addon_factory()
         AutoApprovalSummary.objects.create(
             version=already_confirmed_addon.current_version,
-            verdict=amo.AUTO_APPROVED, confirmed=True)
+            verdict=amo.AUTO_APPROVED,
+            confirmed=True,
+        )
 
         # Add-on that should be considered because it's current version is
         # auto-approved.
         auto_approved_addon = addon_factory()
         AutoApprovalSummary.objects.create(
-            version=auto_approved_addon.current_version,
-            verdict=amo.AUTO_APPROVED)
+            version=auto_approved_addon.current_version, verdict=amo.AUTO_APPROVED
+        )
         # Add some extra versions that should not have an impact.
         version_factory(
-            addon=auto_approved_addon,
-            file_kw={'status': amo.STATUS_AWAITING_REVIEW})
-        version_factory(
-            addon=auto_approved_addon, channel=amo.RELEASE_CHANNEL_UNLISTED)
+            addon=auto_approved_addon, file_kw={'status': amo.STATUS_AWAITING_REVIEW}
+        )
+        version_factory(addon=auto_approved_addon, channel=amo.CHANNEL_UNLISTED)
 
-        with count_subtask_calls(pa.recalculate_post_review_weight) as calls:
-            call_command(
-                'process_addons', task='recalculate_post_review_weight')
+        with count_subtask_calls(
+            process_addons.recalculate_post_review_weight
+        ) as calls:
+            call_command('process_addons', task='recalculate_post_review_weight')
 
         assert len(calls) == 1
         assert calls[0]['kwargs']['args'] == [[auto_approved_addon.pk]]
 
     def test_task_works_correctly(self):
         addon = addon_factory(average_daily_users=100000)
-        FileValidation.objects.create(
-            file=addon.current_version.all_files[0], validation=u'{}')
+        FileValidation.objects.create(file=addon.current_version.file, validation='{}')
         addon = Addon.objects.get(pk=addon.pk)
         summary = AutoApprovalSummary.objects.create(
-            version=addon.current_version, verdict=amo.AUTO_APPROVED)
+            version=addon.current_version, verdict=amo.AUTO_APPROVED
+        )
         assert summary.weight == 0
 
-        call_command(
-            'process_addons', task='recalculate_post_review_weight')
+        call_command('process_addons', task='recalculate_post_review_weight')
 
         summary.reload()
         # Weight should be 10 because of average_daily_users / 10000.
         assert summary.weight == 10
 
 
-class BumpAppVerForLegacyAddonsTestCase(AMOPaths, TestCase):
-    def setUp(self):
-        self.firefox_56_star, _ = AppVersion.objects.get_or_create(
-            application=amo.FIREFOX.id, version='56.*')
-        self.firefox_for_android_56_star, _ = AppVersion.objects.get_or_create(
-            application=amo.ANDROID.id, version='56.*')
+class ConstantlyRecalculateWeightTestCase(TestCase):
+    def test_affects_correct_addons(self):
+        # *not considered* - Non auto-approved add-on
+        addon_factory()
 
-    def test_only_affects_legacy_addons_targeting_firefox_lower_than_56(self):
-        # Should be included:
-        addon = addon_factory(version_kw={'max_app_version': '55.*'})
-        addon2 = addon_factory(version_kw={'application': amo.ANDROID.id})
-        addon3 = addon_factory(type=amo.ADDON_THEME)
-        # Should not be included:
-        addon_factory(file_kw={'is_webextension': True})
-        addon_factory(version_kw={'max_app_version': '56.*'})
+        # *not considered* - Non auto-approved add-on that has an
+        # AutoApprovalSummary entry
+        AutoApprovalSummary.objects.create(
+            version=addon_factory().current_version, verdict=amo.NOT_AUTO_APPROVED
+        )
 
-        with count_subtask_calls(pa.bump_appver_for_legacy_addons) as calls:
+        # *not considered* -Add-on with the current version not auto-approved
+        extra_addon = addon_factory()
+        AutoApprovalSummary.objects.create(
+            version=extra_addon.current_version, verdict=amo.AUTO_APPROVED
+        )
+        extra_addon.current_version.update(created=self.days_ago(1))
+        version_factory(addon=extra_addon)
+
+        # *not considered* - current version is auto-approved but doesn't
+        # have recent abuse reports or low ratings
+        auto_approved_addon = addon_factory()
+        AutoApprovalSummary.objects.create(
+            version=auto_approved_addon.current_version, verdict=amo.AUTO_APPROVED
+        )
+
+        # *considered* - current version is auto-approved and
+        # has a recent rating with rating <= 3
+        auto_approved_addon1 = addon_factory()
+        summary = AutoApprovalSummary.objects.create(
+            version=auto_approved_addon1.current_version, verdict=amo.AUTO_APPROVED
+        )
+        Rating.objects.create(
+            created=summary.modified + timedelta(days=3),
+            addon=auto_approved_addon1,
+            version=auto_approved_addon1.current_version,
+            rating=2,
+            body='Apocalypse',
+            user=user_factory(),
+        )
+
+        # *not considered* - current version is auto-approved but
+        # has a recent rating with rating > 3
+        auto_approved_addon2 = addon_factory()
+        summary = AutoApprovalSummary.objects.create(
+            version=auto_approved_addon2.current_version, verdict=amo.AUTO_APPROVED
+        )
+        Rating.objects.create(
+            created=summary.modified + timedelta(days=3),
+            addon=auto_approved_addon2,
+            version=auto_approved_addon2.current_version,
+            rating=4,
+            body='Apocalypse',
+            user=user_factory(),
+        )
+
+        # *not considered* - current version is auto-approved but
+        # has a recent rating with rating > 3
+        auto_approved_addon3 = addon_factory()
+        summary = AutoApprovalSummary.objects.create(
+            version=auto_approved_addon3.current_version, verdict=amo.AUTO_APPROVED
+        )
+        Rating.objects.create(
+            created=summary.modified + timedelta(days=3),
+            addon=auto_approved_addon3,
+            version=auto_approved_addon3.current_version,
+            rating=4,
+            body='Apocalypse',
+            user=user_factory(),
+        )
+
+        # *not considered* - current version is auto-approved but
+        # has a low rating that isn't recent enough
+        auto_approved_addon4 = addon_factory()
+        summary = AutoApprovalSummary.objects.create(
+            version=auto_approved_addon4.current_version, verdict=amo.AUTO_APPROVED
+        )
+        Rating.objects.create(
+            created=summary.modified - timedelta(days=3),
+            addon=auto_approved_addon4,
+            version=auto_approved_addon4.current_version,
+            rating=1,
+            body='Apocalypse',
+            user=user_factory(),
+        )
+
+        # *considered* - current version is auto-approved and
+        # has a recent abuse report
+        auto_approved_addon5 = addon_factory()
+        summary = AutoApprovalSummary.objects.create(
+            version=auto_approved_addon5.current_version, verdict=amo.AUTO_APPROVED
+        )
+        AbuseReport.objects.create(
+            guid=auto_approved_addon5.guid, created=summary.modified + timedelta(days=3)
+        )
+
+        # *not considered* - current version is auto-approved but
+        # has an abuse report that isn't recent enough
+        auto_approved_addon6 = addon_factory()
+        summary = AutoApprovalSummary.objects.create(
+            version=auto_approved_addon6.current_version, verdict=amo.AUTO_APPROVED
+        )
+        AbuseReport.objects.create(
+            guid=auto_approved_addon6.guid, created=summary.modified - timedelta(days=3)
+        )
+
+        # *considered* - current version is auto-approved and
+        # has an abuse report through it's author that is recent enough
+        author = user_factory()
+        auto_approved_addon7 = addon_factory(users=[author])
+        summary = AutoApprovalSummary.objects.create(
+            version=auto_approved_addon7.current_version, verdict=amo.AUTO_APPROVED
+        )
+        AbuseReport.objects.create(
+            user=author, created=summary.modified + timedelta(days=3)
+        )
+
+        # *not considered* - current version is auto-approved and
+        # has a recent rating with rating <= 3
+        # but the rating is deleted.
+        auto_approved_addon9 = addon_factory()
+        summary = AutoApprovalSummary.objects.create(
+            version=auto_approved_addon9.current_version, verdict=amo.AUTO_APPROVED
+        )
+        Rating.objects.create(
+            created=summary.modified + timedelta(days=3),
+            addon=auto_approved_addon9,
+            version=auto_approved_addon9.current_version,
+            deleted=True,
+            rating=2,
+            body='Apocalypse',
+            user=user_factory(),
+        )
+
+        # *considered* - current version is auto-approved and
+        # has an abuse report through it's author that is recent enough
+        # Used to test that we only recalculate the weight for
+        # the most recent version
+        author = user_factory()
+        auto_approved_addon8 = addon_factory(
+            users=[author], version_kw={'version': '0.1'}
+        )
+
+        AutoApprovalSummary.objects.create(
+            version=auto_approved_addon8.current_version, verdict=amo.AUTO_APPROVED
+        )
+
+        # Let's create a new `current_version` and summary
+        current_version = version_factory(addon=auto_approved_addon8, version='0.2')
+
+        summary = AutoApprovalSummary.objects.create(
+            version=current_version, verdict=amo.AUTO_APPROVED
+        )
+
+        AbuseReport.objects.create(
+            user=author, created=summary.modified + timedelta(days=3)
+        )
+
+        mod = 'olympia.reviewers.tasks.AutoApprovalSummary.calculate_weight'
+        with (
+            mock.patch(mod) as calc_weight_mock,
+            count_subtask_calls(process_addons.recalculate_post_review_weight) as calls,
+        ):
             call_command(
-                'process_addons', task='bump_appver_for_legacy_addons')
+                'process_addons', task='constantly_recalculate_post_review_weight'
+            )
 
         assert len(calls) == 1
-        assert calls[0]['kwargs']['args'] == [[addon.pk, addon2.pk, addon3.pk]]
-
-    @mock.patch('olympia.addons.tasks.index_addons.delay')
-    @mock.patch('olympia.addons.tasks.bump_appver_for_addon_if_necessary')
-    def test_reindex_if_updated_for_firefox_and_android(
-            self, bump_appver_for_addon_if_necessary_mock, index_addons_mock):
-        bump_appver_for_addon_if_necessary_mock.return_value = False
-        # Note: technically this add-on is only compatible with Firefox, but
-        # we're mocking the function that does the check anyway... we only care
-        # about how the task behaves when bump_appver_for_legacy_addons()
-        # returns False for both applications.
-        addon = addon_factory()
-        index_addons_mock.reset_mock()
-        call_command('process_addons', task='bump_appver_for_legacy_addons')
-        assert bump_appver_for_addon_if_necessary_mock.call_count == 2
-
-        assert index_addons_mock.call_count == 1
-        assert index_addons_mock.call_args[0] == ([addon.pk],)
-
-    @mock.patch('olympia.addons.tasks.index_addons.delay')
-    @mock.patch('olympia.addons.tasks.bump_appver_for_addon_if_necessary')
-    def test_reindex_if_updated_for_firefox(
-            self, bump_appver_for_addon_if_necessary_mock, index_addons_mock):
-        bump_appver_for_addon_if_necessary_mock.side_effect = (False, None)
-        addon = addon_factory()
-        index_addons_mock.reset_mock()
-        call_command('process_addons', task='bump_appver_for_legacy_addons')
-        assert bump_appver_for_addon_if_necessary_mock.call_count == 2
-
-        assert index_addons_mock.call_count == 1
-        assert index_addons_mock.call_args[0] == ([addon.pk],)
-
-    @mock.patch('olympia.addons.tasks.index_addons.delay')
-    @mock.patch('olympia.addons.tasks.bump_appver_for_addon_if_necessary')
-    def test_reindex_if_updated_for_android(
-            self, bump_appver_for_addon_if_necessary_mock, index_addons_mock):
-        bump_appver_for_addon_if_necessary_mock.side_effect = (None, False)
-        addon = addon_factory()
-        index_addons_mock.reset_mock()
-        call_command('process_addons', task='bump_appver_for_legacy_addons')
-        assert bump_appver_for_addon_if_necessary_mock.call_count == 2
-
-        assert index_addons_mock.call_count == 1
-        assert index_addons_mock.call_args[0] == ([addon.pk],)
-
-    @mock.patch('olympia.addons.tasks.index_addons.delay')
-    @mock.patch('olympia.addons.tasks.bump_appver_for_addon_if_necessary')
-    def test_no_update_necessary(
-            self, bump_appver_for_addon_if_necessary_mock, index_addons_mock):
-        bump_appver_for_addon_if_necessary_mock.return_value = True
-        addon_factory()
-        index_addons_mock.reset_mock()
-        call_command('process_addons', task='bump_appver_for_legacy_addons')
-        assert bump_appver_for_addon_if_necessary_mock.call_count == 1
-        # 0 index_addons calls since bump_appver_for_addon_if_necessary
-        # returned True.
-        assert index_addons_mock.call_count == 0
-
-        index_addons_mock.reset_mock()
-        bump_appver_for_addon_if_necessary_mock.reset_mock()
-        bump_appver_for_addon_if_necessary_mock.return_value = None
-        call_command('process_addons', task='bump_appver_for_legacy_addons')
-        # This time, since bump_appver_for_addon_if_necessary_mock returned
-        # None the first time, we had to call a second time...
-        assert bump_appver_for_addon_if_necessary_mock.call_count == 2
-        # ... We still should have 0 add-ons to index.
-        assert index_addons_mock.call_count == 0
-
-    @mock.patch('olympia.addons.tasks.index_addons.delay')
-    @mock.patch('olympia.addons.tasks.storage.open')
-    def test_exception_when_reading_xpi(
-            self, open_mock, index_addons_mock):
-        open_mock.side_effect = Exception
-        # Add 2 add-ons for Firefox. We want to make sure both are considered
-        # even though the open() calls are raising an exception (i.e. the
-        # exception is caught and we go to the next add-on).
-        addon_factory()
-        addon_factory()
-        index_addons_mock.reset_mock()
-        call_command('process_addons', task='bump_appver_for_legacy_addons')
-        assert open_mock.call_count == 2
-
-        # No index_addons call, but eh, we didn't raise an exception in the
-        # middle of running the command/task.
-        assert index_addons_mock.call_count == 0
-
-    def test_correctly_updated(self):
-        # This is a full test without mocks, so the file needs to exist.
-        addon = addon_factory(version_kw={
-            # Might as well match the xpi contents.
-            'min_app_version': '3.0',
-            'max_app_version': '3.6.*'
-        })
-        apv = ApplicationsVersions.objects.get(version=addon.current_version)
-        assert apv.max != self.firefox_56_star
-        self.xpi_copy_over(addon.current_version.all_files[0], 'extension.xpi')
-        call_command('process_addons', task='bump_appver_for_legacy_addons')
-        apv = ApplicationsVersions.objects.get(version=addon.current_version)
-        assert apv.max == self.firefox_56_star
-
-    def test_correctly_ignored_because_strict_compatibility_is_enabled(self):
-        # This is a full test without mocks, so the file needs to exist.
-        addon = addon_factory(version_kw={
-            # Might as well match the xpi contents.
-            'min_app_version': '3.0',
-            'max_app_version': '3.6.*'
-        })
-        apv = ApplicationsVersions.objects.get(version=addon.current_version)
-        assert apv.max != self.firefox_56_star
-        self.xpi_copy_over(
-            addon.current_version.all_files[0], 'strict-compat.xpi')
-        call_command('process_addons', task='bump_appver_for_legacy_addons')
-        apv = ApplicationsVersions.objects.get(version=addon.current_version)
-        # Shouldn't have been updated to 56.* since strictCompatibilty is true.
-        assert apv.max != self.firefox_56_star
-
-
-class TestMigrateLegacyDictionariesToWebextension(TestCase):
-    @mock.patch('olympia.addons.tasks.index_addons.delay', autospec=True)
-    @mock.patch(
-        'olympia.addons.tasks.migrate_legacy_dictionary_to_webextension',
-        autospec=True)
-    def test_basic(self, migrate_legacy_dictionarymock, index_addons_mock):
-        self.counter = 0
-
-        def side_effect(*args, **kwargs):
-            self.counter += 1
-            if self.counter == 2:
-                raise ValidationError('Dummy validation error')
-
-        addon_factory()
-        addon_factory(type=amo.ADDON_LPAPP)
-        addon_factory(type=amo.ADDON_STATICTHEME)
-        addon_factory(type=amo.ADDON_DICT, file_kw={'is_webextension': True})
-        addon_factory(
-            type=amo.ADDON_DICT, target_locale='es',
-            status=amo.STATUS_DISABLED)
-        addon_factory(
-            type=amo.ADDON_DICT, target_locale='it',
-            disabled_by_user=True)
-        self.addon = addon_factory(type=amo.ADDON_DICT, target_locale='fr')
-        self.addon2 = addon_factory(type=amo.ADDON_DICT, target_locale=None)
-        self.addon3 = addon_factory(type=amo.ADDON_DICT, target_locale='')
-        migrate_legacy_dictionarymock.side_effect = side_effect
-        index_addons_mock.reset_mock()
-
-        call_command('process_addons',
-                     task='migrate_legacy_dictionaries_to_webextension')
-        assert migrate_legacy_dictionarymock.call_count == 3
-        actual_calls = (
-            migrate_legacy_dictionarymock.call_args_list[0][0][0],
-            migrate_legacy_dictionarymock.call_args_list[1][0][0],
-            migrate_legacy_dictionarymock.call_args_list[2][0][0]
-        )
-        expected_calls = (self.addon, self.addon2, self.addon3)
-        assert actual_calls == expected_calls
-        # self.addon2 will raise a ValidationError because of the side_effect
-        # above, so we should only reindex 1 and 3.
-        assert index_addons_mock.call_args[0][0] == [self.addon, self.addon3]
-
-
-class TestExtractWebextensionsToGitStorage(TestCase):
-    @mock.patch('olympia.addons.tasks.index_addons.delay', autospec=True)
-    @mock.patch(
-        'olympia.versions.tasks.extract_version_to_git', autospec=True)
-    def test_basic(self, extract_version_to_git_mock, index_addons_mock):
-        addon_factory(file_kw={'is_webextension': True})
-        addon_factory(file_kw={'is_webextension': True})
-        addon_factory(
-            type=amo.ADDON_STATICTHEME, file_kw={'is_webextension': True})
-        addon_factory(
-            file_kw={'is_webextension': True}, status=amo.STATUS_DISABLED)
-        addon_factory(type=amo.ADDON_LPAPP, file_kw={'is_webextension': True})
-        addon_factory(type=amo.ADDON_DICT, file_kw={'is_webextension': True})
-        addon_factory(
-            type=amo.ADDON_SEARCH, file_kw={'is_webextension': False})
-
-        # Not supported, we focus entirely on WebExtensions
-        # (except for search plugins)
-        addon_factory(type=amo.ADDON_THEME)
-        addon_factory()
-        addon_factory()
-        addon_factory(type=amo.ADDON_LPAPP, file_kw={'is_webextension': False})
-        addon_factory(type=amo.ADDON_DICT, file_kw={'is_webextension': False})
-
-        call_command('process_addons',
-                     task='extract_webextensions_to_git_storage')
-
-        assert extract_version_to_git_mock.call_count == 7
-
-
-class TestDisableLegacyAddons(TestCase):
-    def test_basic(self):
-        # These add-ons should be disabled completely since they only have a
-        # single legacy file.
-        should_be_fully_disabled = [
-            addon_factory(),
-            addon_factory(type=amo.ADDON_LPAPP),
-            addon_factory(type=amo.ADDON_THEME),
+        assert calls[0]['kwargs']['args'] == [
+            [
+                auto_approved_addon1.pk,
+                auto_approved_addon5.pk,
+                auto_approved_addon7.pk,
+                auto_approved_addon8.pk,
+            ]
         ]
 
-        # This one has a legacy and a non-legacy version, so only the legacy
-        # File & Version should be disabled.
-        should_have_old_version_disabled = [
-            addon_factory(created=self.days_ago(42),
-                          version_kw={'created': self.days_ago(42)}),
-        ]
-        version_factory(
-            addon=should_have_old_version_disabled[0],
-            file_kw={'is_webextension': True})
-
-        # These should *not* have any File instance disabled, they should be
-        # kept intact.
-        should_be_kept_intact = [
-            addon_factory(file_kw={'is_webextension': True}),
-            addon_factory(file_kw={'is_mozilla_signed_extension': True}),
-            addon_factory(file_kw={'is_mozilla_signed_extension': True,
-                                   'is_webextension': True}),
-            addon_factory(type=amo.ADDON_DICT),
-            addon_factory(type=amo.ADDON_SEARCH),
-        ]
-
-        call_command('process_addons', task='disable_legacy_files')
-
-        for addon in should_be_fully_disabled:
-            addon.reload()
-            assert addon.status == amo.STATUS_NULL  # No public version left.
-            assert addon.current_version is None
-            file_ = addon.versions.all()[0].files.all()[0]
-            assert file_.status == amo.STATUS_DISABLED
-
-        for addon in should_have_old_version_disabled:
-            addon.reload()
-            assert addon.status == amo.STATUS_PUBLIC
-            assert addon.current_version
-            file_ = addon.current_version.files.all()[0]
-            assert file_.status == amo.STATUS_PUBLIC
-            file_ = addon.versions.exclude(
-                pk=addon.current_version.pk)[0].files.all()[0]
-            assert file_.status == amo.STATUS_DISABLED
-
-        for addon in should_be_kept_intact:
-            addon.reload()
-            assert addon.status == amo.STATUS_PUBLIC
-            assert addon.current_version
-            file_ = addon.versions.all()[0].all_files[0]
-            assert file_.status == amo.STATUS_PUBLIC
-
-
-class TestRemoveAMOLinksInURLFields(TestCase):
-    domain = settings.DOMAIN
-    allowed_url = u'https://example.org'
-
-    def test_remove_links_in_homepages(self):
-        addons = [
-            addon_factory(homepage=u'%s' % self.domain),
-            addon_factory(homepage=u'https://%s/page.html' % self.domain),
-        ]
-
-        call_command('process_addons', task='remove_amo_links_in_url_fields')
-
-        for addon in addons:
-            addon.reload()
-            assert addon.homepage.localized_string == u''
-            assert addon.homepage.localized_string_clean == u''
-
-    def test_remove_links_in_support_urls(self):
-        addons = [
-            addon_factory(support_url=u'%s' % self.domain),
-            addon_factory(support_url=u'https://%s/page.html' % self.domain),
-        ]
-
-        call_command('process_addons', task='remove_amo_links_in_url_fields')
-
-        for addon in addons:
-            addon.reload()
-            assert addon.support_url.localized_string == u''
-            assert addon.support_url.localized_string_clean == u''
-
-    def test_remove_links_in_contributions(self):
-        addons = [
-            addon_factory(contributions=u'%s' % self.domain),
-            addon_factory(contributions=u'https://%s/page.html' % self.domain),
-        ]
-
-        call_command('process_addons', task='remove_amo_links_in_url_fields')
-
-        for addon in addons:
-            addon.reload()
-            assert addon.contributions == u''
-
-    def test_remove_links_in_support_url_and_homepage(self):
-        addons = [
-            addon_factory(
-                homepage=u'http://%s' % self.domain,
-                support_url=u'%s' % self.domain,
-            ),
-        ]
-        should_be_kept_intact = [
-            addon_factory(support_url=self.allowed_url),
-        ]
-
-        call_command('process_addons', task='remove_amo_links_in_url_fields')
-
-        for addon in addons:
-            addon.reload()
-            assert addon.homepage == u''
-            assert addon.support_url == u''
-        for addon in should_be_kept_intact:
-            addon.reload()
-            assert addon.support_url == self.allowed_url
-
-    def test_with_multiple_translations(self):
-        addon = addon_factory(support_url={
-            'en-US': self.allowed_url,
-            'fr': u'http://%s' % self.domain,
-        })
-
-        call_command('process_addons', task='remove_amo_links_in_url_fields')
-
-        translation.activate('en-US')
-        addon.reload()
-        assert addon.support_url == self.allowed_url
-
-        translation.activate('fr')
-        addon.reload()
-        assert addon.support_url == u''
+        # Only 4 calls for each add-on, doesn't consider the extra version
+        # that got created for addon 8
+        assert calc_weight_mock.call_count == 4
 
 
 class TestExtractColorsFromStaticThemes(TestCase):
@@ -754,11 +378,331 @@ class TestExtractColorsFromStaticThemes(TestCase):
         addon = addon_factory(type=amo.ADDON_STATICTHEME)
         preview = VersionPreview.objects.create(version=addon.current_version)
         extract_colors_from_image_mock.return_value = [
-            {'h': 4, 's': 8, 'l': 15, 'ratio': .16}
+            {'h': 4, 's': 8, 'l': 15, 'ratio': 0.16}
         ]
-        call_command(
-            'process_addons', task='extract_colors_from_static_themes')
+        call_command('process_addons', task='extract_colors_from_static_themes')
         preview.reload()
-        assert preview.colors == [
-            {'h': 4, 's': 8, 'l': 15, 'ratio': .16}
-        ]
+        assert preview.colors == [{'h': 4, 's': 8, 'l': 15, 'ratio': 0.16}]
+
+
+class TestBumpAndResignAddons(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        create_default_webext_appversion()
+
+    @mock.patch('olympia.lib.crypto.tasks.bump_addon_version')
+    def test_basic(self, bump_addon_version_mock):
+        file_kw = {'filename': 'webextension.xpi', 'is_signed': True}
+        user_factory(id=settings.TASK_USER_ID)
+
+        with time_machine.travel('2019-04-01', tick=False):
+            addon_with_history = addon_factory(file_kw=file_kw)
+            # Create a few more versions for this add-on to test that we only
+            # re-sign current versions
+            version_factory(addon=addon_with_history, file_kw=file_kw)
+            version_factory(addon=addon_with_history, file_kw=file_kw)
+            version_factory(addon=addon_with_history, file_kw=file_kw)
+
+            another_extension = addon_factory(file_kw=file_kw)
+            a_theme = addon_factory(type=amo.ADDON_STATICTHEME, file_kw=file_kw)
+            a_dict = addon_factory(type=amo.ADDON_DICT, file_kw=file_kw)
+
+            # Langpacks and non-public add-ons won't be bumped.
+            addon_factory(type=amo.ADDON_LPAPP, file_kw=file_kw)
+            addon_factory(status=amo.STATUS_DISABLED, file_kw=file_kw)
+            addon_factory(status=amo.STATUS_AWAITING_REVIEW, file_kw=file_kw)
+            addon_factory(status=amo.STATUS_NULL, file_kw=file_kw)
+            addon_factory(disabled_by_user=True, file_kw=file_kw)
+
+        # Don't resign add-ons created after April 4th 2019
+        with time_machine.travel('2019-05-01', tick=False):
+            addon_factory(file_kw=file_kw)
+            addon_factory(type=amo.ADDON_STATICTHEME, file_kw=file_kw)
+
+        call_command('process_addons', task='bump_and_resign_addons')
+
+        assert bump_addon_version_mock.call_count == 4
+        assert {call[0][0] for call in bump_addon_version_mock.call_args_list} == {
+            addon_with_history.current_version,
+            another_extension.current_version,
+            a_theme.current_version,
+            a_dict.current_version,
+        }
+
+
+class TestDeleteObsoleteAddons(TestCase):
+    def setUp(self):
+        # Some add-ons that shouldn't be deleted
+        self.extension = addon_factory()
+        self.static_theme = addon_factory(type=amo.ADDON_STATICTHEME)
+        self.dictionary = addon_factory(type=amo.ADDON_DICT)
+        # And some obsolete ones
+        self.xul_theme = addon_factory(type=2)  # _ADDON_THEME
+        self.lpaddon = addon_factory()
+        self.lpaddon.update(type=6)  # _ADDON_LPADDON
+        self.plugin = addon_factory()
+        self.plugin.update(type=7)  # _ADDON_PLUGIN
+        self.lwt = addon_factory(type=9, guid=None)  # _ADDON_PERSONA
+        self.webapp = addon_factory()
+        self.webapp.update(type=11)  # webapp
+        self.no_versions = addon_factory(type=6)  # _ADDON_LPADDON
+        self.no_versions.current_version.delete(hard=True)
+
+        assert Addon.unfiltered.count() == 9
+
+    def test_hard(self):
+        # add it already to check that the conflict is ignored
+        DeniedGuid.objects.create(guid=self.xul_theme.guid)
+        assert DeniedGuid.objects.all().count() == 1
+
+        call_command('process_addons', task='delete_obsolete_addons', with_deleted=True)
+
+        assert Addon.unfiltered.count() == 3
+        assert Addon.unfiltered.get(id=self.extension.id)
+        assert Addon.unfiltered.get(id=self.static_theme.id)
+        assert Addon.unfiltered.get(id=self.dictionary.id)
+
+        # check the guids have been added to DeniedGuid
+        assert DeniedGuid.objects.all().count() == 5
+        assert DeniedGuid.objects.get(guid=self.xul_theme.guid)
+        assert DeniedGuid.objects.get(guid=self.lpaddon.guid)
+        assert DeniedGuid.objects.get(guid=self.plugin.guid)
+        # no self.lwt as it didn't have a guid
+        assert DeniedGuid.objects.get(guid=self.webapp.guid)
+        assert DeniedGuid.objects.filter(guid=self.no_versions.guid)
+
+    def test_hard_with_already_deleted(self):
+        Addon.unfiltered.update(status=amo.STATUS_DELETED)
+        self.test_hard()
+
+    def test_normal(self):
+        call_command('process_addons', task='delete_obsolete_addons')
+
+        assert Addon.unfiltered.count() == 8
+        assert Addon.objects.count() == 3
+        assert Addon.objects.get(id=self.extension.id)
+        assert Addon.objects.get(id=self.static_theme.id)
+        assert Addon.objects.get(id=self.dictionary.id)
+        # Addon.delete will hard delete this add-on because it's got no versions.
+        assert not Addon.unfiltered.filter(guid=self.no_versions.guid).exists()
+
+
+class TestFixLangpacksWithMaxVersionStar(TestCase):
+    def setUp(self):
+        addon = addon_factory(  # Should autocreate the AppVersions for Firefox
+            type=amo.ADDON_LPAPP,
+            version_kw={
+                'min_app_version': '77.0',
+                'max_app_version': '*',
+            },
+        )
+        # Add the missing AppVersions for Android, and assign them to the addon
+        min_android = AppVersion.objects.get_or_create(
+            application=amo.ANDROID.id, version='77.0'
+        )[0]
+        max_android_star = AppVersion.objects.get_or_create(
+            application=amo.ANDROID.id, version='*'
+        )[0]
+        ApplicationsVersions.objects.create(
+            application=amo.ANDROID.id,
+            version=addon.current_version,
+            min=min_android,
+            max=max_android_star,
+        )
+
+        addon_factory(  # Same kind of langpack, but without android compat.
+            type=amo.ADDON_LPAPP,
+            version_kw={
+                'min_app_version': '77.0',
+                'max_app_version': '*',
+            },
+        )
+        addon = addon_factory(  # Shouldn't be touched, its max is not '*'.
+            type=amo.ADDON_LPAPP,
+            version_kw={
+                'min_app_version': '77.0',
+                'max_app_version': '77.*',
+            },
+        )
+        max_android = AppVersion.objects.get_or_create(
+            application=amo.ANDROID.id, version='77.*'
+        )[0]
+        ApplicationsVersions.objects.create(
+            application=amo.ANDROID.id,
+            version=addon.current_version,
+            min=min_android,
+            max=max_android,
+        )
+
+    def test_find_affected_langpacks(self):
+        command = fix_langpacks_with_max_version_star.Command()
+        qs = command.find_affected_langpacks()
+        assert qs.count() == 2
+
+    def test_basic(self):
+        call_command('fix_langpacks_with_max_version_star')
+        # Each versions should still have valid ApplicationsVersions, and they
+        # should all point to 77.* - all '*' have been converted.
+        for version in Version.objects.all():
+            for app in version.compatible_apps:
+                assert version.compatible_apps[app].max.version == '77.*'
+
+
+@pytest.mark.django_db
+def test_update_rating_aggregates():
+    addon = addon_factory()
+    Rating.objects.create(addon=addon, user=user_factory(), rating=4)
+    assert RatingAggregate.objects.filter(addon=addon).delete()
+    call_command('process_addons', task='update_rating_aggregates')
+    assert RatingAggregate.objects.filter(addon=addon).exists()
+    addon = Addon.objects.get(id=addon.id)
+    assert addon.ratingaggregate
+    assert addon.ratingaggregate.count_4 == 1
+
+
+@pytest.mark.django_db
+def test_delete_list_theme_previews():
+    old_list_preview_size = {
+        'thumbnail': [529, 64],
+        'image': [760, 92],
+    }
+    addon = addon_factory(type=amo.ADDON_STATICTHEME)
+    other_version = version_factory(
+        addon=addon, file_kw={'status': amo.STATUS_AWAITING_REVIEW}
+    )
+
+    firefox_preview = VersionPreview.objects.create(
+        version=addon.current_version, sizes=amo.THEME_PREVIEW_RENDERINGS['firefox']
+    )
+    amo_preview = VersionPreview.objects.create(
+        version=addon.current_version, sizes=amo.THEME_PREVIEW_RENDERINGS['amo']
+    )
+    old_list_preview = VersionPreview.objects.create(
+        version=addon.current_version, sizes=old_list_preview_size
+    )
+    other_firefox_preview = VersionPreview.objects.create(
+        version=other_version, sizes=amo.THEME_PREVIEW_RENDERINGS['firefox']
+    )
+    other_amo_preview = VersionPreview.objects.create(
+        version=other_version, sizes=amo.THEME_PREVIEW_RENDERINGS['amo']
+    )
+    other_old_list_preview = VersionPreview.objects.create(
+        version=other_version, sizes=old_list_preview_size
+    )
+
+    call_command('process_addons', task='delete_list_theme_previews')
+
+    assert VersionPreview.objects.count() == 4
+    assert VersionPreview.objects.filter(id=firefox_preview.id).exists()
+    assert VersionPreview.objects.filter(id=amo_preview.id).exists()
+    assert not VersionPreview.objects.filter(id=old_list_preview.id).exists()
+    assert VersionPreview.objects.filter(id=other_firefox_preview.id).exists()
+    assert VersionPreview.objects.filter(id=other_amo_preview.id).exists()
+    assert not VersionPreview.objects.filter(id=other_old_list_preview.id).exists()
+
+
+@pytest.mark.django_db
+def test_delete_erroneously_added_overgrowth_needshumanreview():
+    user_factory(pk=settings.TASK_USER_ID, display_name='Mozilla')
+    should_no_longer_have_nhr_or_due_date = [
+        # Basic case
+        addon_factory()
+        .current_version.needshumanreview_set.create(
+            reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+            created=datetime(2024, 11, 7),
+        )
+        .version.addon,
+        # Somehow has 2 bogus NHR, one active one not
+        NeedsHumanReview.objects.create(
+            reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+            created=datetime(2024, 11, 7),
+            is_active=False,
+            version=addon_factory()
+            .current_version.needshumanreview_set.create(
+                reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+                created=datetime(2024, 11, 7),
+            )
+            .version,
+        ).version.addon,
+        # Has 2 versions both with the bogus NHR
+        NeedsHumanReview.objects.create(
+            version=version_factory(
+                addon=addon_factory()
+                .current_version.needshumanreview_set.create(
+                    reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+                    created=datetime(2024, 11, 7),
+                )
+                .version.addon,
+                channel=amo.CHANNEL_UNLISTED,
+            ),
+            reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+            created=datetime(2024, 11, 7),
+        ).version.addon,
+    ]
+    should_still_have_nhr_and_due_date = [
+        # Outside the range
+        addon_factory()
+        .current_version.needshumanreview_set.create(
+            reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+            created=datetime(2024, 11, 3),
+        )
+        .version.addon,
+        # In the range but wrong reason
+        addon_factory()
+        .current_version.needshumanreview_set.create(
+            reason=NeedsHumanReview.REASONS.UNKNOWN,
+            created=datetime(2024, 11, 6),
+        )
+        .version.addon,
+    ]
+    should_no_longer_have_hotness_nhr_but_still_other_nhr_and_due_date = [
+        # Has both a bogus NHR (inside the range, reason we care about) and
+        # another valid one.
+        NeedsHumanReview.objects.create(
+            reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+            created=datetime(2024, 1, 1),
+            version=addon_factory()
+            .current_version.needshumanreview_set.create(
+                reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+                created=datetime(2024, 11, 7),
+            )
+            .version,
+        ).version.addon,
+        # Has 2 versions, one with bogus NHR but other version has a different,
+        # valid (because date outside the range) NHR for that same reason.
+        NeedsHumanReview.objects.create(
+            version=version_factory(
+                addon=addon_factory()
+                .current_version.needshumanreview_set.create(
+                    reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+                    created=datetime(2024, 11, 7),
+                )
+                .version.addon,
+                channel=amo.CHANNEL_UNLISTED,
+            ),
+            reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+        ).version.addon,
+    ]
+    call_command(
+        'process_addons', task='delete_erroneously_added_overgrowth_needshumanreview'
+    )
+    for addon in should_no_longer_have_nhr_or_due_date:
+        assert not addon.versions.filter(due_date__isnull=False).exists()
+        assert not NeedsHumanReview.objects.filter(
+            version__addon=addon, is_active=True
+        ).exists()
+    for addon in should_still_have_nhr_and_due_date:
+        assert addon.versions.filter(due_date__isnull=False).exists()
+        assert NeedsHumanReview.objects.filter(
+            version__addon=addon, is_active=True
+        ).exists()
+    for addon in should_no_longer_have_hotness_nhr_but_still_other_nhr_and_due_date:
+        assert addon.versions.filter(due_date__isnull=False).exists()
+        assert NeedsHumanReview.objects.filter(
+            version__addon=addon, is_active=True
+        ).exists()
+        assert NeedsHumanReview.objects.filter(
+            version__addon=addon,
+            is_active=True,
+            reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+        ).exists()

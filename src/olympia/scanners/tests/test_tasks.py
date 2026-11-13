@@ -1,0 +1,3868 @@
+import json
+import os
+from datetime import datetime
+from unittest import mock
+
+from django.conf import settings
+from django.core.files import File as DjangoFile
+from django.test.utils import override_settings
+from django.urls import reverse
+
+import pytest
+import requests
+from celery.exceptions import Retry
+
+from olympia import amo
+from olympia.amo.templatetags.jinja_helpers import absolutify
+from olympia.amo.tests import (
+    TestCase,
+    addon_factory,
+    block_factory,
+    user_factory,
+    version_factory,
+)
+from olympia.constants.promoted import NOTABLE_API_NAME
+from olympia.constants.scanners import (
+    ABORTED,
+    ABORTING,
+    COMPLETED,
+    NARC,
+    NEW,
+    RUNNING,
+    SCANNER_RESULTS_MISSING_RULE_NAME,
+    SCHEDULED,
+    WEBHOOK,
+    WEBHOOK_DURING_VALIDATION,
+    WEBHOOK_EVENTS_AGGREGATED_BY_ON_VERSION_SCANNED,
+    WEBHOOK_EVENTS_SHOULD_RUN_ACTIONS_ON_RESULTS,
+    WEBHOOK_MAX_RETRIES,
+    WEBHOOK_ON_LISTING_CHANGED,
+    WEBHOOK_ON_SOURCE_CODE_UPLOADED,
+    WEBHOOK_ON_VERSION_CREATED,
+    WEBHOOK_ON_VERSION_SCANNED,
+    WEBHOOK_PUSH,
+    YARA,
+)
+from olympia.files.models import File
+from olympia.files.tests.test_models import UploadMixin
+from olympia.files.utils import parse_addon
+from olympia.scanners.models import (
+    ScannerQueryResult,
+    ScannerQueryRule,
+    ScannerResult,
+    ScannerRule,
+    ScannerWebhook,
+    ScannerWebhookEvent,
+)
+from olympia.scanners.serializers import (
+    WebhookAddonSerializer,
+    WebhookVersionSerializer,
+)
+from olympia.scanners.tasks import (
+    _call_webhook,
+    _run_yara,
+    call_webhooks,
+    call_webhooks_during_validation,
+    call_webhooks_on_listing_changed,
+    call_webhooks_on_version_scanned,
+    mark_scanner_query_rule_as_completed_or_aborted,
+    maybe_call_webhooks_on_version_scanned,
+    maybe_run_actions_for_webhook_result,
+    run_actions_for_scanner_result,
+    run_narc_on_version,
+    run_scanner_query_rule,
+    run_scanner_query_rule_on_versions_chunk,
+    run_yara,
+    wait_for_scanner_results,
+)
+from olympia.versions.models import Version
+
+
+class TestRunActionsForScannerResult(TestCase):
+    def setUp(self):
+        super().setUp()
+
+        self.version = version_factory(addon=addon_factory())
+        self.webhook = ScannerWebhook.objects.create(
+            name='test-webhook',
+            url='https://example.com/webhook',
+            api_key='secret',
+        )
+        self.event = ScannerWebhookEvent.objects.create(
+            webhook=self.webhook, event=WEBHOOK_PUSH
+        )
+        self.rule_a = ScannerRule.objects.create(name='rule-a', scanner=WEBHOOK)
+        self.rule_b = ScannerRule.objects.create(name='rule-b', scanner=WEBHOOK)
+
+    def create_result(self, matched_rules):
+        return ScannerResult.objects.create(
+            scanner=WEBHOOK,
+            version=self.version,
+            webhook_event=self.event,
+            results={'version': '1.0.0', 'matchedRules': matched_rules},
+        )
+
+    @mock.patch.object(ScannerResult, 'run_actions')
+    def test_run_actions(self, run_actions_mock):
+        scanner_result = self.create_result(['rule-a'])
+
+        run_actions_for_scanner_result(scanner_result.pk)
+
+        assert run_actions_mock.call_count == 1
+        assert run_actions_mock.call_args[0] == (self.version,)
+        assert run_actions_mock.call_args[1]['rules'] == [self.rule_a.pk]
+
+    @mock.patch.object(ScannerResult, 'run_actions')
+    def test_no_run_actions_without_matched_rules(self, run_actions_mock):
+        scanner_result = self.create_result([])
+
+        run_actions_for_scanner_result(scanner_result.pk)
+
+        assert run_actions_mock.call_count == 0
+
+    @mock.patch.object(ScannerResult, 'run_actions')
+    def test_run_actions_for_unknown_rule(self, run_actions_mock):
+        scanner_result = self.create_result(['unknown-rule'])
+        new_rule = ScannerRule.objects.get(name='unknown-rule', scanner=WEBHOOK)
+
+        run_actions_for_scanner_result(scanner_result.pk)
+
+        assert run_actions_mock.call_count == 1
+        assert run_actions_mock.call_args[1]['rules'] == [new_rule.pk]
+
+    @mock.patch.object(ScannerResult, 'run_actions')
+    def test_no_run_actions_when_rules_were_already_matched(self, run_actions_mock):
+        self.create_result(['rule-a', 'rule-b'])
+        scanner_result = self.create_result(['rule-a'])
+
+        run_actions_for_scanner_result(scanner_result.pk)
+
+        assert run_actions_mock.call_count == 0
+
+    @mock.patch.object(ScannerResult, 'run_actions')
+    def test_run_actions_for_new_rules_only(self, run_actions_mock):
+        self.create_result(['rule-a'])
+        scanner_result = self.create_result(['rule-a', 'rule-b'])
+
+        run_actions_for_scanner_result(scanner_result.pk)
+
+        run_actions_mock.assert_called_once_with(self.version, rules=[self.rule_b.pk])
+
+    @mock.patch.object(ScannerResult, 'run_actions')
+    def test_run_actions_when_rule_was_only_matched_by_a_newer_result(
+        self, run_actions_mock
+    ):
+        scanner_result = self.create_result(['rule-a'])
+        self.create_result(['rule-a'])
+
+        run_actions_for_scanner_result(scanner_result.pk)
+
+        run_actions_mock.assert_called_once_with(self.version, rules=[self.rule_a.pk])
+
+    @mock.patch.object(ScannerResult, 'run_actions')
+    def test_run_actions_when_rule_was_only_matched_for_another_event(
+        self, run_actions_mock
+    ):
+        other_event = ScannerWebhookEvent.objects.create(
+            webhook=self.webhook, event=WEBHOOK_ON_LISTING_CHANGED
+        )
+        ScannerResult.objects.create(
+            scanner=WEBHOOK,
+            version=self.version,
+            webhook_event=other_event,
+            results={'version': '1.0.0', 'matchedRules': ['rule-a']},
+        )
+        scanner_result = self.create_result(['rule-a'])
+
+        run_actions_for_scanner_result(scanner_result.pk)
+
+        run_actions_mock.assert_called_once_with(self.version, rules=[self.rule_a.pk])
+
+    @mock.patch.object(ScannerResult, 'run_actions')
+    def test_run_actions_when_rule_was_only_matched_for_another_version(
+        self, run_actions_mock
+    ):
+        ScannerResult.objects.create(
+            scanner=WEBHOOK,
+            version=version_factory(addon=self.version.addon),
+            webhook_event=self.event,
+            results={'version': '1.0.0', 'matchedRules': ['rule-a']},
+        )
+        scanner_result = self.create_result(['rule-a'])
+
+        run_actions_for_scanner_result(scanner_result.pk)
+
+        run_actions_mock.assert_called_once_with(self.version, rules=[self.rule_a.pk])
+
+
+@mock.patch('olympia.scanners.tasks.run_actions_for_scanner_result.delay')
+class TestMaybeRunActionsForWebhookResult(TestCase):
+    def setUp(self):
+        super().setUp()
+
+        self.version = version_factory(addon=addon_factory())
+        webhook = ScannerWebhook.objects.create(
+            name='some-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        self.event = ScannerWebhookEvent.objects.create(
+            event=WEBHOOK_ON_LISTING_CHANGED,
+            webhook=webhook,
+        )
+
+    def _create_result(self, **kwargs):
+        return ScannerResult.objects.create(
+            scanner=WEBHOOK,
+            version=self.version,
+            webhook_event=self.event,
+            **kwargs,
+        )
+
+    def test_call_run_actions_for_scanner_result(self, delay_mock):
+        for event in WEBHOOK_EVENTS_SHOULD_RUN_ACTIONS_ON_RESULTS:
+            with self.subTest(event=event):
+                delay_mock.reset_mock()
+                self.event.update(event=event)
+                scanner_result = self._create_result(
+                    results={'matchedRules': ['some-rule']}
+                )
+
+                maybe_run_actions_for_webhook_result(scanner_result)
+
+                delay_mock.assert_called_once_with(scanner_result.pk)
+
+    def test_does_nothing_without_matches(self, delay_mock):
+        maybe_run_actions_for_webhook_result(
+            self._create_result(results={'matchedRules': []})
+        )
+
+        delay_mock.assert_not_called()
+
+    def test_does_nothing_when_the_result_is_incomplete(self, delay_mock):
+        maybe_run_actions_for_webhook_result(
+            self._create_result(results={'message': 'Task queued'})
+        )
+
+        delay_mock.assert_not_called()
+
+    def test_does_nothing_when_the_event_was_skipped(self, delay_mock):
+        maybe_run_actions_for_webhook_result(self._create_result(results=None))
+
+        delay_mock.assert_not_called()
+
+    def test_does_nothing_for_other_events(self, delay_mock):
+        self.event.update(event=WEBHOOK_ON_VERSION_CREATED)
+
+        maybe_run_actions_for_webhook_result(
+            self._create_result(results={'matchedRules': ['some-rule']})
+        )
+
+        delay_mock.assert_not_called()
+
+
+class TestCallWebhooksOnListingChanged(TestCase):
+    def setUp(self):
+        super().setUp()
+
+        self.addon = addon_factory()
+        self.version = self.addon.current_version
+        self.webhook = ScannerWebhook.objects.create(
+            name='some-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+        )
+
+    def create_event(self, event=WEBHOOK_ON_LISTING_CHANGED):
+        return ScannerWebhookEvent.objects.create(event=event, webhook=self.webhook)
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_call_webhooks(self, _call_webhook_mock):
+        event = self.create_event()
+        _call_webhook_mock.return_value = {'version': '1.0', 'matchedRules': []}
+
+        call_webhooks_on_listing_changed(self.version.pk, reason='metadata')
+
+        scanner_result = ScannerResult.objects.get()
+        assert scanner_result.version == self.version
+        assert scanner_result.webhook_event == event
+        _call_webhook_mock.assert_called_once_with(
+            webhook=self.webhook,
+            payload={
+                'addon': WebhookAddonSerializer(self.addon).data,
+                'version': WebhookVersionSerializer(self.version).data,
+                'reason': 'metadata',
+                'event': 'on_listing_changed',
+                'scanner_result_url': absolutify(
+                    reverse('v5:scanner-result-patch', args=[scanner_result.pk])
+                ),
+            },
+            request_id=mock.ANY,
+        )
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_no_subscribed_scanner(self, _call_webhook_mock):
+        self.create_event(event=WEBHOOK_ON_VERSION_CREATED)
+        ScannerWebhookEvent.objects.create(
+            event=WEBHOOK_ON_LISTING_CHANGED,
+            webhook=self.webhook,
+            is_active=False,
+        )
+
+        call_webhooks_on_listing_changed(self.version.pk, reason='metadata')
+
+        assert _call_webhook_mock.call_count == 0
+        assert not ScannerResult.objects.exists()
+
+    @mock.patch('olympia.scanners.tasks.log')
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_logs_errors(self, _call_webhook_mock, log_mock):
+        self.create_event()
+        _call_webhook_mock.side_effect = RuntimeError()
+
+        call_webhooks_on_listing_changed(self.version.pk, reason='metadata')
+
+        log_mock.exception.assert_any_call(
+            'Error while calling webhooks for Version %s',
+            self.version.pk,
+        )
+
+    @mock.patch('olympia.scanners.tasks.run_actions_for_scanner_result')
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_runs_actions_on_matches(self, _call_webhook_mock, run_actions_task_mock):
+        self.create_event()
+        _call_webhook_mock.return_value = {'matchedRules': ['some-rule']}
+
+        call_webhooks_on_listing_changed(self.version.pk, reason='metadata')
+
+        scanner_result = ScannerResult.objects.get()
+        run_actions_task_mock.delay.assert_called_once_with(scanner_result.pk)
+
+    @mock.patch('olympia.scanners.tasks.run_actions_for_scanner_result')
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_no_run_actions_when_results_were_patched_during_the_call(
+        self, _call_webhook_mock, run_actions_task_mock
+    ):
+        self.create_event()
+
+        # The scanner PATCHed the result before answering, so the PATCH endpoint
+        # has already scheduled the actions.
+        def patch_results_then_answer(*args, **kwargs):
+            ScannerResult.objects.update(results={'matchedRules': ['some-rule']})
+            return {'message': 'Task queued'}
+
+        _call_webhook_mock.side_effect = patch_results_then_answer
+
+        call_webhooks_on_listing_changed(self.version.pk, reason='metadata')
+
+        assert run_actions_task_mock.delay.call_count == 0
+
+
+class TestRunNarc(UploadMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.user = user_factory(display_name='Fôo')
+        self.addon = addon_factory(
+            guid='@webextension-guid',
+            slug='my-webextension',
+            name='My Fancy WebExtension Addon',
+            summary='My Fancy WebExtension Summary',
+            users=[self.user],
+        )
+        upload = self.get_upload('webextension.xpi', user=self.user)
+        parsed_data = parse_addon(upload, addon=self.addon, user=self.user)
+        self.version = Version.from_upload(
+            upload,
+            self.addon,
+            amo.CHANNEL_LISTED,
+            selected_apps=[amo.FIREFOX.id],
+            parsed_data=parsed_data,
+        )
+        assert len(ScannerResult.objects.all()) == 0
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run(self, incr_mock):
+        # This rule will match all strings, we have a user, an xpi and strings
+        # in db matching so there should be 3 matches.
+        rule = ScannerRule.objects.create(
+            name='always_match_rule',
+            scanner=NARC,
+            definition='.*',
+        )
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == 6
+        assert narc_result.results == [
+            {
+                'meta': {
+                    'variant': 'normalized',
+                    'locale': 'en-us',
+                    'source': 'db_addon',
+                    'string': 'MyFancyWebExtensionAddon',
+                    'original_string': 'My Fancy WebExtension Addon',
+                },
+                'rule': 'always_match_rule',
+            },
+            {
+                'meta': {
+                    'locale': 'en-us',
+                    'source': 'db_addon',
+                    'string': 'My Fancy WebExtension Addon',
+                },
+                'rule': 'always_match_rule',
+            },
+            {
+                'meta': {
+                    'variant': 'normalized',
+                    'locale': None,
+                    'source': 'author',
+                    'string': 'Foo',
+                    'original_string': 'Fôo',
+                },
+                'rule': 'always_match_rule',
+            },
+            {
+                'meta': {
+                    'variant': 'normalized',
+                    'locale': None,
+                    'source': 'xpi',
+                    'string': 'MyWebExtensionAddon',
+                    'original_string': 'My WebExtension Addon',
+                },
+                'rule': 'always_match_rule',
+            },
+            {
+                'meta': {
+                    'locale': None,
+                    'source': 'author',
+                    'string': 'Fôo',
+                },
+                'rule': 'always_match_rule',
+            },
+            {
+                'meta': {
+                    'locale': None,
+                    'source': 'xpi',
+                    'string': 'My WebExtension Addon',
+                },
+                'rule': 'always_match_rule',
+            },
+        ]
+        assert incr_mock.called
+        assert incr_mock.call_count == 3
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.narc.has_matches'),
+                mock.call(f'devhub.narc.rule.{rule.id}.match'),
+                mock.call('devhub.narc.success'),
+            ]
+        )
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_normalized_match(self, incr_mock):
+        self.addon.name = 'My\u2800 Fäncy WebExtension 𝕒ddon'
+        self.addon.save()
+
+        rule = ScannerRule.objects.create(
+            name='always_match_rule',
+            scanner=NARC,
+            definition='MyFancyWebExtensionAddon',
+        )
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == 1
+        assert narc_result.results == [
+            {
+                'meta': {
+                    'locale': 'en-us',
+                    'original_string': 'My⠀ Fäncy WebExtension 𝕒ddon',
+                    'source': 'db_addon',
+                    'string': 'MyFancyWebExtensionaddon',
+                    'variant': 'normalized',
+                },
+                'rule': 'always_match_rule',
+            },
+        ]
+        assert incr_mock.called
+        assert incr_mock.call_count == 3
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.narc.has_matches'),
+                mock.call(f'devhub.narc.rule.{rule.id}.match'),
+                mock.call('devhub.narc.success'),
+            ]
+        )
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_homoglyph_match(self, incr_mock):
+        self.addon.name = 'My\u2800 Fäncy W\u0435bEx\u0442ѐnsion addon'
+        self.addon.save()
+
+        rule = ScannerRule.objects.create(
+            name='always_match_rule',
+            scanner=NARC,
+            definition='MyFancyWebExtensionAddon',
+        )
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == 1
+        assert narc_result.results == [
+            {
+                'meta': {
+                    'locale': 'en-us',
+                    'original_string': 'My⠀ Fäncy WеbExтѐnsion addon',
+                    'source': 'db_addon',
+                    'string': 'myfancywebextensionaddon',
+                    'variant': 'homoglyph',
+                },
+                'rule': 'always_match_rule',
+            },
+        ]
+        assert incr_mock.called
+        assert incr_mock.call_count == 3
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.narc.has_matches'),
+                mock.call(f'devhub.narc.rule.{rule.id}.match'),
+                mock.call('devhub.narc.success'),
+            ]
+        )
+
+    @mock.patch('olympia.scanners.tasks.statsd.timer')
+    def test_calls_statsd_timer(self, timer_mock):
+        run_narc_on_version(self.version.pk)
+
+        assert timer_mock.call_count == 1
+        assert timer_mock.call_args[0] == ('devhub.narc',)
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_db_translation_match_only(self, incr_mock):
+        self.addon.name = {
+            'fr': 'Päin au chocolat',
+            'de': 'German päin',
+            'en-US': 'Chocolatine',
+        }
+        self.addon.save()
+        rule = ScannerRule.objects.create(
+            name='match_the_pain',
+            scanner=NARC,
+            definition=r'Päin.*',  # Case is ignored.
+        )
+        incr_mock.reset_mock()
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == 2
+        assert narc_result.results == [
+            {
+                'meta': {
+                    'locale': 'de',
+                    'source': 'db_addon',
+                    'string': 'German päin',
+                },
+                'rule': 'match_the_pain',
+            },
+            {
+                'meta': {
+                    'locale': 'fr',
+                    'source': 'db_addon',
+                    'string': 'Päin au chocolat',
+                },
+                'rule': 'match_the_pain',
+            },
+        ]
+        assert incr_mock.called
+        assert incr_mock.call_count == 3
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.narc.has_matches'),
+                mock.call(f'devhub.narc.rule.{rule.id}.match'),
+                mock.call('devhub.narc.success'),
+            ]
+        )
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_xpi_match_only(self, incr_mock):
+        rule = ScannerRule.objects.create(
+            name='always_match_rule',
+            scanner=NARC,
+            definition='^My WebExtension.*$',
+        )
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == 1
+        assert narc_result.results == [
+            {
+                'meta': {
+                    'locale': None,
+                    'source': 'xpi',
+                    'string': 'My WebExtension Addon',
+                },
+                'rule': 'always_match_rule',
+            },
+        ]
+        assert incr_mock.called
+        assert incr_mock.call_count == 3
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.narc.has_matches'),
+                mock.call(f'devhub.narc.rule.{rule.id}.match'),
+                mock.call('devhub.narc.success'),
+            ]
+        )
+        return narc_result
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_xpi_multiple_translations(self, incr_mock):
+        addon = addon_factory(file_kw={'filename': 'notify-link-clicks-i18n.xpi'})
+        rule = ScannerRule.objects.create(
+            name='match_in_japanese', scanner=NARC, definition='を通知'
+        )
+        incr_mock.reset_mock()
+
+        run_narc_on_version(addon.current_version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == addon.current_version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == 1
+        assert narc_result.results == [
+            {
+                'meta': {
+                    'locale': 'ja',
+                    'source': 'xpi',
+                    'string': 'リンクを通知する',
+                },
+                'rule': 'match_in_japanese',
+            },
+        ]
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_xpi_no_name(self, incr_mock):
+        # If somehow an XPI without a name gets scanned we shouldn't fail.
+        # Validation could have been bypassed by an admin.
+        addon = addon_factory(
+            file_kw={'filename': 'webextension_with_no_name_in_manifest.xpi'}
+        )
+        ScannerRule.objects.create(
+            name='match_everything', scanner=NARC, definition='.*'
+        )
+        incr_mock.reset_mock()
+
+        run_narc_on_version(addon.current_version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_invalid_manifest_somehow(self, incr_mock):
+        # If somehow an XPI with a entirely invalid manifest gets scanned we
+        # shouldn't fail. Validation could have been bypassed by an admin.
+        addon = addon_factory()
+        file_ = addon.current_version.file
+        filepath = os.path.join(
+            settings.ROOT,
+            'src/olympia/files/fixtures/files/invalid_manifest_webextension.xpi',
+        )
+        with open(filepath, 'rb') as f:
+            file_.file = DjangoFile(f)
+            file_.save()
+        ScannerRule.objects.create(
+            name='match_everything', scanner=NARC, definition='.*'
+        )
+        incr_mock.reset_mock()
+
+        run_narc_on_version(addon.current_version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_duplicate_values(self, incr_mock):
+        locales = sorted(('de', 'es-ES', 'fr', 'it', 'ja'))
+        # Make the addon name 'foo' in a bunch of locales except for one.
+        self.addon.name = {locale: 'foo' for locale in locales} | {'pl': 'extra'}
+        self.addon.save()
+        rule = ScannerRule.objects.create(
+            name='match_the_fool',
+            scanner=NARC,
+            definition=r'^foo$',
+        )
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == len(locales) + 1  # author matches.
+        assert narc_result.results[5] == {
+            'meta': {
+                'variant': 'normalized',
+                'locale': None,
+                'source': 'author',
+                'string': 'Foo',
+                'original_string': 'Fôo',
+            },
+            'rule': 'match_the_fool',
+        }
+
+        for result, locale in zip(narc_result.results[:-1], locales, strict=True):
+            assert result == {
+                'meta': {
+                    'locale': locale.lower(),
+                    'source': 'db_addon',
+                    'string': 'foo',
+                },
+                'rule': 'match_the_fool',
+            }
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_multiple_authors_match(self, incr_mock):
+        user1 = user_factory(display_name='Foo')
+        user2 = user_factory(display_name='FooBar')
+        user3 = user_factory(display_name='Alice Foo')
+        user4 = user_factory(display_name=None)  # Shouldn't matter.
+        self.addon.authors.add(user1)
+        self.addon.authors.add(user2)
+        self.addon.authors.add(user3)
+        self.addon.authors.add(user4)
+        rule = ScannerRule.objects.create(
+            name='match_the_fool',
+            scanner=NARC,
+            definition=r'^foo',  # Case is ignored.
+        )
+        incr_mock.reset_mock()
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == 3
+        assert narc_result.results == [
+            {
+                'meta': {
+                    'variant': 'normalized',
+                    'locale': None,
+                    'source': 'author',
+                    'string': 'Foo',
+                    'original_string': 'Fôo',
+                },
+                'rule': 'match_the_fool',
+            },
+            {
+                'meta': {
+                    'locale': None,
+                    'source': 'author',
+                    'string': 'Foo',
+                },
+                'rule': 'match_the_fool',
+            },
+            {
+                'meta': {
+                    'locale': None,
+                    'source': 'author',
+                    'string': 'FooBar',
+                },
+                'rule': 'match_the_fool',
+            },
+        ]
+        assert incr_mock.called
+        assert incr_mock.call_count == 3
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.narc.has_matches'),
+                mock.call(f'devhub.narc.rule.{rule.id}.match'),
+                mock.call('devhub.narc.success'),
+            ]
+        )
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_multiple_matching_rules(self, incr_mock):
+        # Note that those rules contain whitespace so they won't create
+        # additional results for normalized variants.
+        rule1 = ScannerRule.objects.create(
+            name='match_the_beginning',
+            scanner=NARC,
+            definition=r'^My\s.*',
+        )
+        rule2 = ScannerRule.objects.create(
+            name='match_the_end',
+            scanner=NARC,
+            definition=r'WebExtension Addon$',
+        )
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule1, rule2]
+        assert len(narc_result.results) == 4
+        assert narc_result.results == [
+            {
+                'meta': {
+                    'locale': 'en-us',
+                    'source': 'db_addon',
+                    'string': 'My Fancy WebExtension Addon',
+                },
+                'rule': 'match_the_beginning',
+            },
+            {
+                'meta': {
+                    'locale': 'en-us',
+                    'source': 'db_addon',
+                    'string': 'My Fancy WebExtension Addon',
+                },
+                'rule': 'match_the_end',
+            },
+            {
+                'meta': {
+                    'locale': None,
+                    'source': 'xpi',
+                    'string': 'My WebExtension Addon',
+                },
+                'rule': 'match_the_beginning',
+            },
+            {
+                'meta': {
+                    'locale': None,
+                    'source': 'xpi',
+                    'string': 'My WebExtension Addon',
+                },
+                'rule': 'match_the_end',
+            },
+        ]
+        assert incr_mock.called
+        assert incr_mock.call_count == 4
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.narc.has_matches'),
+                mock.call(f'devhub.narc.rule.{rule1.id}.match'),
+                mock.call(f'devhub.narc.rule.{rule2.id}.match'),
+                mock.call('devhub.narc.success'),
+            ]
+        )
+        return narc_result
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_no_rule(self, incr_mock):
+        run_narc_on_version(self.version.pk)
+        scanner_results = ScannerResult.objects.all()
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert len(narc_result.results) == 0
+        assert not narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == []
+        assert incr_mock.called
+        assert incr_mock.call_count == 1
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.narc.success'),
+            ]
+        )
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_inactive_rule_ignored(self, incr_mock):
+        ScannerRule.objects.create(
+            name='match_the_beginning_inactive',
+            scanner=NARC,
+            definition=r'^My.*',
+            is_active=False,
+        )
+        rule2 = ScannerRule.objects.create(
+            name='match_the_end',
+            scanner=NARC,
+            definition=r'(?<!fancy) WebExtension Addon$',
+        )
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule2]
+        assert len(narc_result.results) == 1
+        assert narc_result.results == [
+            {
+                'meta': {
+                    'locale': None,
+                    'source': 'xpi',
+                    'string': 'My WebExtension Addon',
+                },
+                'rule': 'match_the_end',
+            },
+        ]
+        assert incr_mock.called
+        assert incr_mock.call_count == 3
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.narc.has_matches'),
+                mock.call(f'devhub.narc.rule.{rule2.id}.match'),
+                mock.call('devhub.narc.success'),
+            ]
+        )
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_no_match(self, incr_mock):
+        ScannerRule.objects.create(
+            name='does_not_match',
+            scanner=NARC,
+            definition=r'^something*',
+        )
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert len(narc_result.results) == 0
+        assert not narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == []
+        assert incr_mock.called
+        assert incr_mock.call_count == 1
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.narc.success'),
+            ]
+        )
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    @mock.patch.object(ScannerResult, 'run_actions')
+    def test_re_run_on_version(self, run_actions_mock, incr_mock):
+        # Scan a version first, make it match multiple rules.
+        narc_result = self.test_run_multiple_matching_rules()
+        assert len(narc_result.results) == 4
+        rules = list(narc_result.matched_rules.all())
+
+        # Add more matches through the add-on name.
+        self.addon.name = {
+            'fr': 'My Foolish Addon',
+            'en-US': 'Another WebExtension Addon',
+        }
+        self.addon.save()
+
+        incr_mock.reset_mock()
+        run_actions_mock.reset_mock()
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        # New matches are added, they don't overwrite the existing ones, so we
+        # should have 2 new matches.
+        assert len(narc_result.results) == 6
+        assert narc_result.results == [
+            {
+                'meta': {
+                    'locale': 'en-us',
+                    'source': 'db_addon',
+                    'string': 'Another WebExtension Addon',
+                },
+                'rule': 'match_the_end',
+            },
+            # This second hit is from the initial run, that string is no longer
+            # present, but we are preserving the old results.
+            {
+                'meta': {
+                    'locale': 'en-us',
+                    'source': 'db_addon',
+                    'string': 'My Fancy WebExtension Addon',
+                },
+                'rule': 'match_the_beginning',
+            },
+            # Same as above.
+            {
+                'meta': {
+                    'locale': 'en-us',
+                    'source': 'db_addon',
+                    'string': 'My Fancy WebExtension Addon',
+                },
+                'rule': 'match_the_end',
+            },
+            {
+                'meta': {
+                    'locale': 'fr',
+                    'source': 'db_addon',
+                    'string': 'My Foolish Addon',
+                },
+                'rule': 'match_the_beginning',
+            },
+            {
+                'meta': {
+                    'locale': None,
+                    'source': 'xpi',
+                    'string': 'My WebExtension Addon',
+                },
+                'rule': 'match_the_beginning',
+            },
+            {
+                'meta': {
+                    'locale': None,
+                    'source': 'xpi',
+                    'string': 'My WebExtension Addon',
+                },
+                'rule': 'match_the_end',
+            },
+        ]
+        assert narc_result.has_matches
+        assert set(narc_result.matched_rules.all()) == set(rules)
+        assert incr_mock.called
+        assert incr_mock.call_count == 5
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.narc.rerun.has_matches'),
+                mock.call(f'devhub.narc.rerun.rule.{rules[0].id}.match'),
+                mock.call(f'devhub.narc.rerun.rule.{rules[1].id}.match'),
+                mock.call('devhub.narc.rerun.results_differ'),
+                mock.call('devhub.narc.success'),
+            ]
+        )
+
+        # We re-triggered the run action.
+        assert run_actions_mock.call_count == 1
+        assert run_actions_mock.call_args[0] == (self.version,)
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    @mock.patch.object(ScannerResult, 'run_actions')
+    def test_run_on_version_no_new_result(self, run_actions_mock, incr_mock):
+        # Scan a version first, make it one rule.
+        narc_result = self.test_run_xpi_match_only()
+        assert len(narc_result.results) == 1
+        rules = list(narc_result.matched_rules.all())
+
+        incr_mock.reset_mock()
+        run_actions_mock.reset_mock()
+
+        # Re-run on the version.
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        # Extra run shouldn't have caused duplicates.
+        assert len(narc_result.results) == 1
+        assert narc_result.has_matches
+        assert rules == list(narc_result.matched_rules.all())
+        rule = narc_result.matched_rules.all()[0]
+        assert incr_mock.called
+        assert incr_mock.call_count == 3
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.narc.rerun.has_matches'),
+                mock.call(f'devhub.narc.rerun.rule.{rule.id}.match'),
+                mock.call('devhub.narc.success'),
+            ]
+        )
+
+        # We didn't retrigger the action since the first run (no new matches).
+        assert run_actions_mock.call_count == 0
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    @mock.patch.object(ScannerResult, 'run_actions')
+    def test_run_actions_initial_run(self, run_actions_mock, incr_mock):
+        rule = ScannerRule.objects.create(
+            name='always_match_rule',
+            scanner=NARC,
+            definition='^My WebExtension.*$',
+        )
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == 1
+        assert narc_result.results == [
+            {
+                'meta': {
+                    'locale': None,
+                    'source': 'xpi',
+                    'string': 'My WebExtension Addon',
+                },
+                'rule': 'always_match_rule',
+            },
+        ]
+        assert incr_mock.called
+        assert incr_mock.call_count == 3
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.narc.has_matches'),
+                mock.call(f'devhub.narc.rule.{rule.id}.match'),
+                mock.call('devhub.narc.success'),
+            ]
+        )
+
+        assert run_actions_mock.call_count == 1
+        assert run_actions_mock.call_args[0] == (self.version,)
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    @mock.patch.object(ScannerResult, 'run_actions')
+    def test_no_run_actions_if_no_results(self, run_actions_mock, incr_mock):
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert not narc_result.has_matches
+        assert not narc_result.matched_rules.all().exists()
+        assert narc_result.results == []
+        assert incr_mock.call_count == 1
+        assert incr_mock.call_args[0] == ('devhub.narc.success',)
+
+        assert run_actions_mock.call_count == 0
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    @mock.patch.object(ScannerResult, 'run_actions')
+    def test_no_run_actions_if_parameter_is_passed(self, run_actions_mock, incr_mock):
+        rule = ScannerRule.objects.create(
+            name='always_match_rule',
+            scanner=NARC,
+            definition='^My WebExtension.*$',
+        )
+
+        run_narc_on_version(self.version.pk, run_actions_on_match=False)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == 1
+        assert narc_result.results == [
+            {
+                'meta': {
+                    'locale': None,
+                    'source': 'xpi',
+                    'string': 'My WebExtension Addon',
+                },
+                'rule': 'always_match_rule',
+            },
+        ]
+        assert incr_mock.called
+        assert incr_mock.call_count == 3
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.narc.has_matches'),
+                mock.call(f'devhub.narc.rule.{rule.id}.match'),
+                mock.call('devhub.narc.success'),
+            ]
+        )
+
+        assert run_actions_mock.call_count == 0
+
+    def test_run_do_examine_slug(self):
+        rule = ScannerRule.objects.create(
+            name='always_match_rule',
+            scanner=NARC,
+            definition='.*',
+        )
+        # examine_slug defaults to False, enable it.
+        rule.configuration['examine_slug'] = True
+        rule.save()
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == 8  # Would be 6 without slug
+        assert narc_result.results
+        assert narc_result.results[4]['meta'] == {
+            'locale': None,
+            'source': 'slug',
+            'string': 'mywebextension',
+            'variant': 'normalized',
+            'original_string': 'my-webextension',
+        }
+        assert narc_result.results[6]['meta'] == {
+            'locale': None,
+            'source': 'slug',
+            'string': 'my-webextension',
+        }
+
+    def test_run_do_examine_listing_summaries(self):
+        rule = ScannerRule.objects.create(
+            name='always_match_rule',
+            scanner=NARC,
+            definition='.*',
+        )
+        # examine_listing_summaries defaults to False, enable it.
+        # Disable everything else that is enabled by default.
+        rule.configuration.update(
+            {
+                'examine_listing_names': False,
+                'examine_listing_summaries': True,
+                'examine_xpi_names': False,
+                'examine_authors_names': False,
+            }
+        )
+        rule.save()
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == 2
+        assert narc_result.results == [
+            {
+                'meta': {
+                    'locale': 'en-us',
+                    'original_string': 'My Fancy WebExtension Summary',
+                    'source': 'db_addon_summary',
+                    'string': 'MyFancyWebExtensionSummary',
+                    'variant': 'normalized',
+                },
+                'rule': 'always_match_rule',
+            },
+            {
+                'meta': {
+                    'locale': 'en-us',
+                    'source': 'db_addon_summary',
+                    'string': 'My Fancy WebExtension Summary',
+                },
+                'rule': 'always_match_rule',
+            },
+        ]
+
+    def test_run_do_examine_listing_summaries_localized(self):
+        rule = ScannerRule.objects.create(
+            name='match_fromage_rule',
+            scanner=NARC,
+            definition='fromage',
+        )
+        self.addon.summary = {
+            'fr': 'Mon Petit Frômage',
+            'en-US': str(self.addon.summary),
+            'de': None,
+        }
+        self.addon.save()
+        # examine_listing_summaries defaults to False, enable it.
+        # Disable everything else that is enabled by default.
+        rule.configuration.update(
+            {
+                'examine_listing_names': False,
+                'examine_listing_summaries': True,
+                'examine_xpi_names': False,
+                'examine_authors_names': False,
+            }
+        )
+        rule.save()
+
+        run_narc_on_version(self.version.pk)
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == 1
+        assert narc_result.results == [
+            {
+                'meta': {
+                    'locale': 'fr',
+                    'source': 'db_addon_summary',
+                    'string': 'MonPetitFromage',
+                    'variant': 'normalized',
+                    'original_string': 'Mon Petit Frômage',
+                },
+                'rule': 'match_fromage_rule',
+            }
+        ]
+
+    def test_run_do_examine_xpi_descriptions(self):
+        rule = ScannerRule.objects.create(
+            name='always_match_rule',
+            scanner=NARC,
+            definition='.*',
+        )
+        # examine_xpi_descriptions defaults to False, enable it.
+        # Disable everything else that is enabled by default.
+        rule.configuration.update(
+            {
+                'examine_listing_names': False,
+                'examine_xpi_descriptions': True,
+                'examine_xpi_names': False,
+                'examine_authors_names': False,
+            }
+        )
+        rule.save()
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == 2
+        assert narc_result.results == [
+            {
+                'meta': {
+                    'locale': None,
+                    'original_string': (
+                        'just a test addon with the manifest.json format'
+                    ),
+                    'source': 'xpi_description',
+                    'string': 'justatestaddonwiththemanifestjsonformat',
+                    'variant': 'normalized',
+                },
+                'rule': 'always_match_rule',
+            },
+            {
+                'meta': {
+                    'locale': None,
+                    'source': 'xpi_description',
+                    'string': 'just a test addon with the manifest.json format',
+                },
+                'rule': 'always_match_rule',
+            },
+        ]
+
+    def test_run_dont_examine_xpi_names(self):
+        rule = ScannerRule.objects.create(
+            name='always_match_rule',
+            scanner=NARC,
+            definition='.*',
+        )
+        rule.configuration['examine_xpi_names'] = False
+        rule.save()
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == 4  # Would be 6 with xpi
+        assert 'xpi' not in {result['meta']['source'] for result in narc_result.results}
+
+    def test_run_dont_examine_author_names(self):
+        rule = ScannerRule.objects.create(
+            name='always_match_rule',
+            scanner=NARC,
+            definition='.*',
+        )
+        rule.configuration['examine_authors_names'] = False
+        rule.save()
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == 4  # Would be 6 with author
+        assert 'author' not in {
+            result['meta']['source'] for result in narc_result.results
+        }
+
+    def test_run_dont_examine_listing_names(self):
+        rule = ScannerRule.objects.create(
+            name='always_match_rule',
+            scanner=NARC,
+            definition='.*',
+        )
+        rule.configuration['examine_listing_names'] = False
+        rule.save()
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == 4  # Would be 6 with listing names
+        assert 'db_addon' not in {
+            result['meta']['source'] for result in narc_result.results
+        }
+
+    def test_run_dont_examine_normalized_variants(self):
+        rule = ScannerRule.objects.create(
+            name='always_match_rule',
+            scanner=NARC,
+            definition='.*',
+        )
+        rule.configuration['examine_normalized_variants'] = False
+        rule.save()
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == 3  # Would be 6 with normalized
+        assert 'normalized' not in {
+            result['meta'].get('variant') for result in narc_result.results
+        }
+
+    def test_run_dont_examine_homoglyphs_variants(self):
+        rule = ScannerRule.objects.create(
+            name='always_match_rule',
+            scanner=NARC,
+            definition='.*',
+        )
+        rule.configuration['examine_homoglyphs_variants'] = False
+        rule.save()
+        self.addon.name = 'Little addon'  # l/I homoglyph
+        self.addon.save()
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == 6  # Would be 7 with homoglyphs
+        assert 'homoglyph' not in {
+            result['meta'].get('variant') for result in narc_result.results
+        }
+
+    def test_run_dont_examine_anything(self):
+        rule = ScannerRule.objects.create(
+            name='always_match_rule',
+            scanner=NARC,
+            definition='.*',
+        )
+        # examine_slugs default to False already.
+        rule.configuration['examine_listing_names'] = False
+        rule.configuration['examine_xpi_names'] = False
+        rule.configuration['examine_authors_names'] = False
+        rule.save()
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert not narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == []
+
+    def test_run_dont_examine_source_with_same_string_elsewhere(self):
+        # Have the listing name and author name share the same string...
+        self.addon.name = self.addon.listed_authors[0].display_name
+        self.addon.save()
+
+        # ...Then configure the rule not to search in the author name.
+        rule = ScannerRule.objects.create(
+            name='always_match_rule',
+            scanner=NARC,
+            definition='.*',
+        )
+        rule.configuration['examine_authors_names'] = False
+        rule.save()
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert len(narc_result.results) == 4  # Removed author & normalized author match
+        # We didn't examine the author name
+        assert 'author' not in {
+            result['meta']['source'] for result in narc_result.results
+        }
+        # We should still have matches for the listing name (& normalized listing name)
+        assert 'db_addon' in {
+            result['meta']['source'] for result in narc_result.results
+        }
+
+    def test_run_multiple_rules_with_different_configuration(self):
+        ScannerRule.objects.create(
+            name='always_match_rule_with_config_not_matching_anything',
+            scanner=NARC,
+            definition='.*',
+            configuration={
+                'examine_xpi_names': False,
+                'examine_slug': False,
+                'examine_listing_names': False,
+                'examine_authors_names': False,
+            },
+        )
+
+        rule = ScannerRule.objects.create(
+            name='always_match_rule',
+            scanner=NARC,
+            definition='.*',
+        )
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert len(narc_result.results) == 6
+        assert list(narc_result.matched_rules.all()) == [rule]
+
+    def test_run_truncate_xpi_manifest_values(self):
+        rule = ScannerRule.objects.create(
+            name='always_match_rule',
+            scanner=NARC,
+            definition='.*',
+            configuration={
+                'examine_xpi_names': True,
+                'examine_xpi_descriptions': True,
+            },
+        )
+        # NARC will bypass the actual XPI contents to use the FileManifest
+        # data, so we add values that are over the limit to verify that it
+        # truncates them properly.
+        expected_name = 'a' * 50
+        expected_description = 'b' * 250
+        self.version.file.file_manifest.manifest_data.update(
+            {
+                'name': expected_name + 'z',
+                'description': expected_description + 'z',
+            }
+        )
+        self.version.file.file_manifest.save()
+
+        run_narc_on_version(self.version.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        narc_result = scanner_results[0]
+        assert narc_result.scanner == NARC
+        assert narc_result.upload is None
+        assert narc_result.version == self.version
+        assert narc_result.has_matches
+        assert list(narc_result.matched_rules.all()) == [rule]
+        assert len(narc_result.results) == 2
+        assert narc_result.results[0]['meta']['string'] == expected_name
+        assert narc_result.results[1]['meta']['string'] == expected_description
+
+
+class TestRunYara(UploadMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+
+        self.upload = self.get_upload('webextension.xpi')
+        self.results = {
+            **amo.VALIDATOR_SKELETON_RESULTS,
+        }
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_with_meta_and_tags(self, incr_mock):
+        assert len(ScannerResult.objects.all()) == 0
+        # This rule will match for all files in the xpi.
+        rule = ScannerRule.objects.create(
+            name='always_true',
+            scanner=YARA,
+            definition="""
+                rule always_true : Tag1 Tag2 Tag3 {
+                    meta:
+                        meta_1 = "some metadata"
+                    condition:
+                        true
+                }
+            """,
+        )
+
+        received_results = run_yara(self.results, self.upload.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        scanner_result = scanner_results[0]
+        assert scanner_result.upload == self.upload
+        assert len(scanner_result.results) == 2
+        assert scanner_result.results[0] == {
+            'rule': rule.name,
+            'tags': ['Tag1', 'Tag2', 'Tag3'],
+            'meta': {'filename': 'index.js', 'meta_1': 'some metadata'},
+        }
+        assert scanner_result.results[1] == {
+            'rule': rule.name,
+            'tags': ['Tag1', 'Tag2', 'Tag3'],
+            'meta': {'filename': 'manifest.json', 'meta_1': 'some metadata'},
+        }
+        assert incr_mock.called
+        assert incr_mock.call_count == 3
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.yara.has_matches'),
+                mock.call(f'devhub.yara.rule.{rule.id}.match'),
+                mock.call('devhub.yara.success'),
+            ]
+        )
+        # The task should always return the results.
+        assert received_results == self.results
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run(self, incr_mock):
+        assert len(ScannerResult.objects.all()) == 0
+        # This rule will match for all files in the xpi.
+        rule = ScannerRule.objects.create(
+            name='always_true',
+            scanner=YARA,
+            definition='rule always_true { condition: true }',
+        )
+
+        received_results = run_yara(self.results, self.upload.pk)
+
+        scanner_results = ScannerResult.objects.all()
+        assert len(scanner_results) == 1
+        scanner_result = scanner_results[0]
+        assert scanner_result.upload == self.upload
+        assert len(scanner_result.results) == 2
+        assert scanner_result.results[0] == {
+            'rule': rule.name,
+            'tags': [],
+            'meta': {'filename': 'index.js'},
+        }
+        assert scanner_result.results[1] == {
+            'rule': rule.name,
+            'tags': [],
+            'meta': {'filename': 'manifest.json'},
+        }
+        assert incr_mock.called
+        assert incr_mock.call_count == 3
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.yara.has_matches'),
+                mock.call(f'devhub.yara.rule.{rule.id}.match'),
+                mock.call('devhub.yara.success'),
+            ]
+        )
+        # The task should always return the results.
+        assert received_results == self.results
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_with_invalid_filename(self, incr_mock):
+        assert len(ScannerResult.objects.all()) == 0
+        # This rule will match for all files in the xpi.
+        rule = ScannerRule.objects.create(
+            name='always_true',
+            scanner=YARA,
+            definition='rule always_true { condition: true }',
+        )
+        self.upload = self.get_upload('archive-with-invalid-chars-in-filenames.zip')
+
+        received_results = run_yara(self.results, self.upload.pk)
+
+        yara_results = ScannerResult.objects.all()
+        assert len(yara_results) == 1
+        yara_result = yara_results[0]
+        assert yara_result.upload == self.upload
+        assert len(yara_result.results) == 1
+        assert yara_result.results[0] == {
+            'rule': rule.name,
+            'tags': [],
+            'meta': {'filename': 'path\\to\\file.txt'},
+        }
+        # The task should always return the results.
+        assert received_results == self.results
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_is_json(self, incr_mock):
+        assert len(ScannerResult.objects.all()) == 0
+        # This rule will match for just all *.json files
+        rule = ScannerRule.objects.create(
+            name='json_true',
+            scanner=YARA,
+            # 'is_json_file' is an external variable we automatically provide.
+            definition='rule json_true { condition: is_json_file and true }',
+        )
+
+        received_results = run_yara(self.results, self.upload.pk)
+
+        yara_results = ScannerResult.objects.all()
+        assert len(yara_results) == 1
+        yara_result = yara_results[0]
+        assert yara_result.upload == self.upload
+        assert len(yara_result.results) == 1
+        assert yara_result.results[0] == {
+            'rule': rule.name,
+            'tags': [],
+            'meta': {'filename': 'manifest.json'},
+        }
+        assert incr_mock.called
+        assert incr_mock.call_count == 3
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.yara.has_matches'),
+                mock.call(f'devhub.yara.rule.{rule.id}.match'),
+                mock.call('devhub.yara.success'),
+            ]
+        )
+        # The task should always return the results.
+        assert received_results == self.results
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_is_manifest(self, incr_mock):
+        assert len(ScannerResult.objects.all()) == 0
+        # This rule will match for just the manifest.json
+        rule = ScannerRule.objects.create(
+            name='is_manifest_true',
+            scanner=YARA,
+            # 'is_manifest_file' is an external variable we automatically
+            # provide.
+            definition='rule is_manifest_true { condition: is_manifest_file }',
+        )
+
+        received_results = run_yara(self.results, self.upload.pk)
+
+        yara_results = ScannerResult.objects.all()
+        assert len(yara_results) == 1
+        yara_result = yara_results[0]
+        assert yara_result.upload == self.upload
+        assert len(yara_result.results) == 1
+        assert yara_result.results[0] == {
+            'rule': rule.name,
+            'tags': [],
+            'meta': {'filename': 'manifest.json'},
+        }
+        assert incr_mock.called
+        assert incr_mock.call_count == 3
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.yara.has_matches'),
+                mock.call(f'devhub.yara.rule.{rule.id}.match'),
+                mock.call('devhub.yara.success'),
+            ]
+        )
+        # The task should always return the results.
+        assert received_results == self.results
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_is_locale_file(self, incr_mock):
+        self.upload = self.get_upload('notify-link-clicks-i18n.xpi')
+        assert len(ScannerResult.objects.all()) == 0
+        # This rule will match for all _locales/*/messages.json files
+        rule = ScannerRule.objects.create(
+            name='is_locale_true',
+            scanner=YARA,
+            # 'is_locale_file' is an external variable we automatically
+            # provide.
+            definition='rule is_locale_true { condition: is_locale_file }',
+        )
+
+        received_results = run_yara(self.results, self.upload.pk)
+
+        yara_results = ScannerResult.objects.all()
+        assert len(yara_results) == 1
+        yara_result = yara_results[0]
+        assert yara_result.upload == self.upload
+        assert len(yara_result.results) == 7
+        assert yara_result.results[0] == {
+            'rule': rule.name,
+            'tags': [],
+            'meta': {'filename': '_locales/de/messages.json'},
+        }
+        assert yara_result.results[1] == {
+            'rule': rule.name,
+            'tags': [],
+            'meta': {'filename': '_locales/en/messages.json'},
+        }
+        assert yara_result.results[2] == {
+            'rule': rule.name,
+            'tags': [],
+            'meta': {'filename': '_locales/ja/messages.json'},
+        }
+        assert yara_result.results[3] == {
+            'rule': rule.name,
+            'tags': [],
+            'meta': {'filename': '_locales/nb_NO/messages.json'},
+        }
+        assert yara_result.results[4] == {
+            'rule': rule.name,
+            'tags': [],
+            'meta': {'filename': '_locales/nl/messages.json'},
+        }
+        assert yara_result.results[5] == {
+            'rule': rule.name,
+            'tags': [],
+            'meta': {'filename': '_locales/ru/messages.json'},
+        }
+        assert yara_result.results[6] == {
+            'rule': rule.name,
+            'tags': [],
+            'meta': {'filename': '_locales/sv/messages.json'},
+        }
+        assert incr_mock.called
+        assert incr_mock.call_count == 3
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.yara.has_matches'),
+                mock.call(f'devhub.yara.rule.{rule.id}.match'),
+                mock.call('devhub.yara.success'),
+            ]
+        )
+        # The task should always return the results.
+        assert received_results == self.results
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_filename(self, incr_mock):
+        assert len(ScannerResult.objects.all()) == 0
+        # This rule will match for just the index.js file
+        rule = ScannerRule.objects.create(
+            name='is_index_js',
+            scanner=YARA,
+            definition='rule is_index_js { condition: filename == "index.js" }',
+        )
+
+        received_results = run_yara(self.results, self.upload.pk)
+
+        yara_results = ScannerResult.objects.all()
+        assert len(yara_results) == 1
+        yara_result = yara_results[0]
+        assert yara_result.upload == self.upload
+        assert len(yara_result.results) == 1
+        assert yara_result.results[0] == {
+            'rule': rule.name,
+            'tags': [],
+            'meta': {'filename': 'index.js'},
+        }
+        assert incr_mock.called
+        assert incr_mock.call_count == 3
+        incr_mock.assert_has_calls(
+            [
+                mock.call('devhub.yara.has_matches'),
+                mock.call(f'devhub.yara.rule.{rule.id}.match'),
+                mock.call('devhub.yara.success'),
+            ]
+        )
+        # The task should always return the results.
+        assert received_results == self.results
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_no_matches(self, incr_mock):
+        assert len(ScannerResult.objects.all()) == 0
+        # This compiled rule will never match.
+        ScannerRule.objects.create(
+            name='always_false',
+            scanner=YARA,
+            definition='rule always_false { condition: false }',
+        )
+
+        received_results = run_yara(self.results, self.upload.pk)
+
+        yara_result = ScannerResult.objects.all()[0]
+        assert yara_result.results == []
+        # The task should always return the results.
+        assert received_results == self.results
+        assert incr_mock.called
+        assert incr_mock.call_count == 1
+        incr_mock.assert_called_with('devhub.yara.success')
+
+    def test_run_ignores_directories(self):
+        upload = self.get_upload('webextension_signed_already.xpi')
+        results = {
+            **amo.VALIDATOR_SKELETON_RESULTS,
+        }
+        # This rule will match for all files in the xpi.
+        ScannerRule.objects.create(
+            name='always_true',
+            scanner=YARA,
+            definition='rule always_true { condition: true }',
+        )
+
+        received_results = run_yara(results, upload.pk)
+
+        yara_result = ScannerResult.objects.all()[0]
+        assert yara_result.upload == upload
+        # The `webextension_signed_already.xpi` fixture file has 1 directory
+        # and 3 files.
+        assert len(yara_result.results) == 3
+        # The task should always return the results.
+        assert received_results == results
+
+    def test_run_skips_disabled_yara_rules(self):
+        assert len(ScannerResult.objects.all()) == 0
+        # This rule should match for all files in the xpi but it is disabled.
+        ScannerRule.objects.create(
+            name='always_true',
+            scanner=YARA,
+            definition='rule always_true { condition: true }',
+            is_active=False,
+        )
+
+        run_yara(self.results, self.upload.pk)
+
+        yara_result = ScannerResult.objects.all()[0]
+        assert yara_result.upload == self.upload
+        assert len(yara_result.results) == 0
+
+    @mock.patch('yara_x.Compiler.build')
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_run_does_not_raise(self, incr_mock, yara_x_compile_mock):
+        self.create_switch('ignore-exceptions-in-scanner-tasks', active=True)
+        yara_x_compile_mock.side_effect = Exception()
+
+        # We use `_run_yara()` because `run_yara()` is decorated with
+        # `@validation_task`, which gracefully handles exceptions.
+        received_results = _run_yara(self.results, self.upload.pk)
+
+        assert incr_mock.called
+        incr_mock.assert_called_with('devhub.yara.failure')
+        # The task should always return the results.
+        assert received_results == self.results
+
+    @mock.patch('yara_x.Compiler.build')
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    def test_throws_errors(self, incr_mock, yara_x_compile_mock):
+        yara_x_compile_mock.side_effect = RuntimeError()
+
+        # We use `_run_yara()` because `run_yara()` is decorated with
+        # `@validation_task`, which gracefully handles exceptions.
+        with self.assertRaises(RuntimeError):
+            _run_yara(self.results, self.upload.pk)
+
+        assert incr_mock.called
+        incr_mock.assert_called_with('devhub.yara.failure')
+
+    @mock.patch('olympia.scanners.tasks.statsd.timer')
+    def test_calls_statsd_timer(self, timer_mock):
+        run_yara(self.results, self.upload.pk)
+
+        assert timer_mock.called
+        timer_mock.assert_called_with('devhub.yara')
+
+    @mock.patch('yara_x.Compiler')
+    def test_does_not_run_when_results_contain_errors(self, yara_x_compiler_mock):
+        self.results.update({'errors': 1})
+        received_results = run_yara(self.results, self.upload.pk)
+
+        assert not yara_x_compiler_mock.called
+        # The task should always return the results.
+        assert received_results == self.results
+
+    def test_run_in_binary_mode(self):
+        self.upload = self.get_upload('webextension_with_image.zip')
+
+        assert len(ScannerResult.objects.all()) == 0
+        # This rule will match for all PNG files in the xpi.
+        rule = ScannerRule.objects.create(
+            name='match_png',
+            scanner=YARA,
+            definition='rule match_png { '
+            'strings: $png = { 89 50 4E 47 0D 0A 1A 0A } '
+            'condition: $png at 0 }',
+        )
+
+        received_results = run_yara(self.results, self.upload.pk)
+
+        yara_results = ScannerResult.objects.all()
+        assert len(yara_results) == 1
+        yara_result = yara_results[0]
+        assert yara_result.upload == self.upload
+        assert len(yara_result.results) == 1
+        assert yara_result.results[0] == {
+            'rule': rule.name,
+            'tags': [],
+            'meta': {'filename': 'img.png'},
+        }
+        # The task should always return the results.
+        assert received_results == self.results
+
+    def test_amo_module(self):
+        self.upload = self.get_upload('webextension.xpi')
+        rule = ScannerRule.objects.create(
+            name='match_id',
+            scanner=YARA,
+            definition="""
+import "amo"
+
+rule match_id {
+    condition:
+        amo.manifest.get_value("$.applications.gecko.id") == "@webextension-guid"
+        and not is_manifest_file
+}
+            """,
+        )
+
+        run_yara(self.results, self.upload.pk)
+
+        yara_results = ScannerResult.objects.all()
+        yara_result = yara_results[0]
+        assert yara_result.upload == self.upload
+        assert len(yara_result.results) == 1
+        assert yara_result.results[0] == {
+            'rule': rule.name,
+            'tags': [],
+            'meta': {'filename': 'index.js'},
+        }
+
+
+class TestRunQueryRuleMixin:
+    __test__ = False
+
+    def create_basic_rule(self):
+        # Implement in actual test classes
+        raise NotImplementedError
+
+    def setUp(self):
+        self.version = addon_factory(
+            name='WebExtension', file_kw={'filename': 'webextension.xpi'}
+        ).current_version
+
+        self.rule = self.create_basic_rule()
+
+        # Just to be sure we're always starting fresh.
+        assert len(ScannerQueryResult.objects.all()) == 0
+
+    def test_run(self):
+        # Pretend we went through the admin.
+        self.rule.update(state=SCHEDULED)
+
+        # Similar to test_run_on_chunk() except it needs to find the versions
+        # by itself.
+        other_addon = addon_factory(
+            version_kw={'created': self.days_ago(1)},
+            file_kw={'filename': 'webextension.xpi'},
+        )
+        other_addon_previous_current_version = other_addon.current_version
+        included_versions = [
+            # Only listed webextension version on this add-on.
+            self.version,
+            # Unlisted webextension version of this add-on.
+            addon_factory(
+                disabled_by_user=True,  # Doesn't matter.
+                version_kw={'channel': amo.CHANNEL_UNLISTED},
+                file_kw={'filename': 'webextension.xpi'},
+            ).versions.get(),
+            # Unlisted webextension version of an add-on that has multiple
+            # versions.
+            version_factory(
+                addon=other_addon,
+                created=self.days_ago(42),
+                channel=amo.CHANNEL_UNLISTED,
+                file_kw={'filename': 'webextension.xpi'},
+            ),
+            # Listed webextension versions of an add-on that has multiple
+            # versions.
+            other_addon_previous_current_version,
+            version_factory(
+                addon=other_addon, file_kw={'filename': 'webextension.xpi'}
+            ),
+        ]
+        # Ignored versions:
+        # Listed Webextension version belonging to mozilla disabled add-on.
+        addon_factory(
+            status=amo.STATUS_DISABLED, file_kw={'filename': 'webextension.xpi'}
+        )
+        # Unlisted extension without a File instance
+        Version.objects.create(
+            addon=other_addon, channel=amo.CHANNEL_UNLISTED, version='42.42.42.42'
+        )
+        # Unlisted extension with a File... but no File.file
+        File.objects.create(
+            manifest_version=2,
+            version=Version.objects.create(
+                addon=other_addon, channel=amo.CHANNEL_UNLISTED, version='43.43.43.43'
+            ),
+        )
+
+        # Run the task.
+        run_scanner_query_rule.delay(self.rule.pk)
+
+        assert ScannerQueryResult.objects.count() == len(included_versions)
+        assert sorted(
+            ScannerQueryResult.objects.values_list('version_id', flat=True)
+        ) == sorted(v.pk for v in included_versions)
+        self.rule.reload()
+        assert self.rule.state == COMPLETED
+        assert self.rule.task_count == 1
+        # We run tests in eager mode, so we can't retrieve the result for real,
+        # just make sure the id was set to something.
+        assert self.rule.celery_group_result_id is not None
+
+    def test_run_on_disabled_addons(self):
+        self.version.addon.update(status=amo.STATUS_DISABLED)
+        self.rule.update(run_on_disabled_addons=True, state=SCHEDULED)
+        run_scanner_query_rule.delay(self.rule.pk)
+
+        assert ScannerQueryResult.objects.count() == 1
+        assert ScannerQueryResult.objects.get().version == self.version
+        self.rule.reload()
+        assert self.rule.state == COMPLETED
+
+    def test_exclude_promoted_addons(self):
+        self.make_addon_promoted(
+            self.version.addon, api_name=NOTABLE_API_NAME, listed_pre_review=True
+        )
+        self.rule.update(exclude_promoted_addons=True, state=SCHEDULED)
+        run_scanner_query_rule.delay(self.rule.pk)
+
+        assert ScannerQueryResult.objects.count() == 0
+        self.rule.reload()
+        assert self.rule.state == COMPLETED
+
+    def test_run_on_current_version_only(self):
+        # Pretend we went through the admin, run on current version only.
+        self.rule.update(state=SCHEDULED, run_on_current_version_only=True)
+
+        # Similar to test_run_on_chunk() except it needs to find the versions
+        # by itself.
+        other_addon = addon_factory(
+            version_kw={'created': self.days_ago(1)},
+            file_kw={'filename': 'webextension.xpi'},
+        )
+        included_versions = [
+            self.version,
+            other_addon.current_version,
+        ]
+        # Ignored versions:
+        version_factory(
+            addon=other_addon,
+            channel=amo.CHANNEL_UNLISTED,
+            file_kw={'filename': 'webextension.xpi'},
+        )
+        (
+            version_factory(
+                addon=other_addon,
+                created=self.days_ago(42),
+                file_kw={'filename': 'webextension.xpi'},
+            ),
+        )
+        # Listed Webextension version belonging to mozilla disabled add-on.
+        addon_factory(
+            status=amo.STATUS_DISABLED, file_kw={'filename': 'webextension.xpi'}
+        )
+        # Listed extension without a File instance
+        addon_factory(
+            version_kw={'channel': amo.CHANNEL_LISTED, 'version': '42.42.42.42'}
+        )
+
+        # Run the task.
+        run_scanner_query_rule.delay(self.rule.pk)
+
+        assert ScannerQueryResult.objects.count() == len(included_versions)
+        assert sorted(
+            ScannerQueryResult.objects.values_list('version_id', flat=True)
+        ) == sorted(v.pk for v in included_versions)
+        self.rule.reload()
+        assert self.rule.state == COMPLETED
+        assert self.rule.task_count == 1
+        # We run tests in eager mode, so we can't retrieve the result for real,
+        # just make sure the id was set to something.
+        assert self.rule.celery_group_result_id is not None
+
+    def test_run_on_specific_channels(self):
+
+        # Similar to test_run_on_chunk() except it needs to find the versions
+        # by itself.
+        unlisted_addon = addon_factory(
+            disabled_by_user=True,  # Doesn't matter.
+            version_kw={'channel': amo.CHANNEL_UNLISTED},
+            file_kw={'filename': 'webextension.xpi'},
+        )
+        other_addon = addon_factory(
+            version_kw={'created': self.days_ago(1)},
+            file_kw={'filename': 'webextension.xpi'},
+        )
+        other_addon_unlisted_version = version_factory(
+            addon=other_addon,
+            created=self.days_ago(42),
+            channel=amo.CHANNEL_UNLISTED,
+            file_kw={'filename': 'webextension.xpi'},
+        )
+        other_addon_enterprise_version = version_factory(
+            addon=other_addon,
+            channel=amo.CHANNEL_ENTERPRISE,
+            file_kw={'filename': 'webextension.xpi'},
+        )
+
+        # Ignored versions:
+        # Listed Webextension version belonging to mozilla disabled add-on.
+        addon_factory(file_kw={'filename': 'webextension.xpi'})
+        # Unlisted extension without a File instance
+        Version.objects.create(
+            addon=other_addon, channel=amo.CHANNEL_UNLISTED, version='42.42.42.42'
+        )
+        # Unlisted extension with a File... but no File.file
+        File.objects.create(
+            manifest_version=2,
+            version=Version.objects.create(
+                addon=other_addon, channel=amo.CHANNEL_UNLISTED, version='43.43.43.43'
+            ),
+        )
+
+        def run_on_channels(channels):
+            ScannerQueryResult.objects.all().delete()
+            self.rule.update(state=SCHEDULED, run_on_specific_channels=channels)
+            run_scanner_query_rule.delay(self.rule.pk)
+
+            self.rule.reload()
+            assert self.rule.state == COMPLETED
+            assert self.rule.task_count == 1
+            # We run tests in eager mode, so we can't retrieve the result for
+            # real, just make sure the id was set to something.
+            assert self.rule.celery_group_result_id is not None
+            return sorted(
+                ScannerQueryResult.objects.values_list('version_id', flat=True)
+            )
+
+        assert run_on_channels([amo.CHANNEL_UNLISTED]) == sorted(
+            version.pk
+            for version in (
+                unlisted_addon.versions.get(),
+                other_addon_unlisted_version,
+            )
+        )
+
+        assert run_on_channels(
+            [amo.CHANNEL_UNLISTED, amo.CHANNEL_ENTERPRISE]
+        ) == sorted(
+            version.pk
+            for version in (
+                unlisted_addon.versions.get(),
+                other_addon_unlisted_version,
+                other_addon_enterprise_version,
+            )
+        )
+
+    def test_run_created_after(self):
+        # Pretend we went through the admin, run after a specific date
+        some_time_ago = self.days_ago(42)
+        self.rule.update(state=SCHEDULED, created_after=some_time_ago)
+
+        # Make existing version old: it shouldn't be found.
+        self.version.update(created=self.days_ago(1200))
+
+        # Add a couple versions that should be found.
+        expected_versions = [
+            version_factory(
+                file_kw={'filename': 'webextension.xpi'},
+                addon=self.version.addon,
+            ),
+            addon_factory(
+                version_kw={'created': some_time_ago},
+                file_kw={'filename': 'webextension.xpi'},
+            ).current_version,
+        ]
+
+        # Run the task.
+        run_scanner_query_rule.delay(self.rule.pk)
+
+        # Only the newer versions should have been found.
+        assert ScannerQueryResult.objects.count() == 2
+
+        assert sorted(
+            ScannerQueryResult.objects.values_list('version_id', flat=True)
+        ) == sorted(v.pk for v in expected_versions)
+        self.rule.reload()
+        assert self.rule.state == COMPLETED
+        assert self.rule.task_count == 1
+
+    def test_run_not_new(self):
+        self.rule.update(state=RUNNING)  # Not SCHEDULED.
+        run_scanner_query_rule.delay(self.rule.pk)
+
+        # Nothing should have changed.
+        assert ScannerQueryResult.objects.count() == 0
+        self.rule.reload()
+        assert self.rule.state == RUNNING
+
+    def test_mark_scanner_query_rule_as_completed(self):
+        self.rule.update(state=RUNNING)
+        mark_scanner_query_rule_as_completed_or_aborted(self.rule.pk)
+        self.rule.reload()
+        assert self.rule.state == COMPLETED
+
+    def test_mark_scanner_query_rule_as_aborted(self):
+        self.rule.update(state=ABORTING)
+        mark_scanner_query_rule_as_completed_or_aborted(self.rule.pk)
+        self.rule.reload()
+        assert self.rule.state == ABORTED
+
+    def test_run_on_chunk_aborting(self):
+        self.rule.update(state=ABORTING)
+        run_scanner_query_rule_on_versions_chunk([self.version.pk], self.rule.pk)
+
+        assert ScannerQueryResult.objects.count() == 0
+
+        self.rule.reload()
+        assert self.rule.state == ABORTING  # Not touched by this.
+
+    def test_run_on_chunk_aborted(self):
+        # This shouldn't happen - if there are any tasks left, state should be
+        # RUNNING or ABORTING, but let's make sure we handle it.
+        self.rule.update(state=ABORTED)
+        run_scanner_query_rule_on_versions_chunk([self.version.pk], self.rule.pk)
+
+        assert ScannerQueryResult.objects.count() == 0
+        self.rule.reload()
+        assert self.rule.state == ABORTED  # Not touched by this.
+
+    def test_run_on_chunk_was_blocked(self):
+        self.rule.update(state=RUNNING)  # Pretend we started running the rule.
+        block_factory(addon=self.version.addon, updated_by=user_factory())
+        run_scanner_query_rule_on_versions_chunk([self.version.pk], self.rule.pk)
+
+        scanner_results = ScannerQueryResult.objects.all()
+        assert len(scanner_results) == 1
+        scanner_result = scanner_results[0]
+        assert scanner_result.version == self.version
+        assert scanner_result.was_blocked
+
+    def test_run_on_chunk_not_blocked(self):
+        self.rule.update(state=RUNNING)  # Pretend we started running the rule.
+        self.version.update(version='2.0')
+        another_version = version_factory(
+            addon=self.version.addon, channel=amo.CHANNEL_UNLISTED
+        )
+        block_factory(
+            addon=self.version.addon,
+            updated_by=user_factory(),
+            version_ids=[another_version.id],
+        )
+        block_factory(
+            addon=addon_factory(guid='@differentguid'),
+            updated_by=user_factory(),
+        )
+        run_scanner_query_rule_on_versions_chunk([self.version.pk], self.rule.pk)
+
+        scanner_results = ScannerQueryResult.objects.all()
+        assert len(scanner_results) == 1
+        scanner_result = scanner_results[0]
+        assert scanner_result.version == self.version
+        assert not scanner_result.was_blocked
+
+    def test_run_on_chunk_was_promoted(self):
+        self.rule.update(state=RUNNING)  # Pretend we started running the rule.
+        self.make_addon_promoted(
+            self.version.addon, api_name='pre_review', listed_pre_review=True
+        )
+        run_scanner_query_rule_on_versions_chunk([self.version.pk], self.rule.pk)
+
+        scanner_results = ScannerQueryResult.objects.all()
+        assert len(scanner_results) == 1
+        scanner_result = scanner_results[0]
+        assert scanner_result.version == self.version
+        assert scanner_result.was_promoted
+
+    def test_run_on_chunk_disabled(self):
+        # Make sure it still works when a file has been disabled
+        File.objects.filter(pk=self.version.file.pk).update(status=amo.STATUS_DISABLED)
+        self.test_run_on_chunk()
+
+    def test_dont_generate_results_if_not_matching_rule(self):
+        # Unlike "regular" ScannerRule/ScannerResult, for query stuff we don't
+        # store a result instance if the version doesn't match the rule.
+        self.rule.update(definition='rule always_false { condition: false }')
+        run_scanner_query_rule_on_versions_chunk([self.version.pk], self.rule.pk)
+        assert ScannerQueryResult.objects.count() == 0
+        self.rule.reload()
+        assert self.rule.state == NEW  # Not touched by this task.
+
+
+class TestRunYaraQueryRule(TestRunQueryRuleMixin, TestCase):
+    __test__ = True
+
+    def create_basic_rule(self):
+        # This rule will match for all files in the xpi.
+        return ScannerQueryRule.objects.create(
+            name='always_true',
+            scanner=YARA,
+            definition='rule always_true { condition: true }',
+            state=NEW,
+        )
+
+    def test_run_on_chunk(self):
+        self.rule.update(state=RUNNING)  # Pretend we started running the rule.
+        run_scanner_query_rule_on_versions_chunk([self.version.pk], self.rule.pk)
+
+        yara_results = ScannerQueryResult.objects.all()
+        assert len(yara_results) == 1
+        yara_result = yara_results[0]
+        assert yara_result.version == self.version
+        assert not yara_result.was_blocked
+        assert not yara_result.was_promoted
+        assert len(yara_result.results) == 2
+        assert yara_result.results[0] == {
+            'rule': self.rule.name,
+            'tags': [],
+            'meta': {'filename': 'index.js'},
+        }
+        assert yara_result.results[1] == {
+            'rule': self.rule.name,
+            'tags': [],
+            'meta': {'filename': 'manifest.json'},
+        }
+        self.rule.reload()
+        assert self.rule.state == RUNNING  # Not touched by this task.
+
+    def test_run_on_chunk_num_queries(self):
+        # Extra addons shouldn't affect number of queries.
+        extra_addon1_version1 = addon_factory(
+            file_kw={'filename': 'webextension.xpi'}
+        ).current_version
+        extra_addon2_version1 = addon_factory(
+            file_kw={'filename': 'webextension.xpi'}
+        ).current_version
+        extra_addon2_version2 = version_factory(
+            addon=extra_addon2_version1.addon, file_kw={'filename': 'webextension.xpi'}
+        )
+        # Make the rule not match to avoid queries when saving results, we
+        # don't care about those at this time.
+        self.rule.update(
+            definition='rule always_false { condition: false }',
+            name='always_false',
+            state=RUNNING,
+        )
+        with self.assertNumQueries(3):
+            # - 1 for the rule
+            # - 1 for all promoted addon info (prefetched even if no match)
+            # - 1 for all versions + file
+            run_scanner_query_rule_on_versions_chunk(
+                [
+                    self.version.pk,
+                    extra_addon1_version1.pk,
+                    extra_addon2_version1.pk,
+                    extra_addon2_version2.pk,
+                ],
+                self.rule.pk,
+            )
+        assert ScannerQueryResult.objects.count() == 0
+
+    def test_run_on_chunk_num_queries_matching(self):
+        # Extra addons shouldn't affect number of queries.
+        extra_addon1_version1 = addon_factory(
+            file_kw={'filename': 'webextension.xpi'}
+        ).current_version
+        extra_addon2_version1 = addon_factory(
+            file_kw={'filename': 'webextension.xpi'}
+        ).current_version
+        extra_addon2_version2 = version_factory(
+            addon=extra_addon2_version1.addon, file_kw={'filename': 'webextension.xpi'}
+        )
+        self.rule.update(state=RUNNING)
+        with self.assertNumQueries(4):
+            # - 1 for the rule
+            # - 1 for all versions + file
+            # - 1 for all promoted addon info
+            # - 1 for bulk-saving all results
+            run_scanner_query_rule_on_versions_chunk(
+                [
+                    self.version.pk,
+                    extra_addon1_version1.pk,
+                    extra_addon2_version1.pk,
+                    extra_addon2_version2.pk,
+                ],
+                self.rule.pk,
+            )
+        assert ScannerQueryResult.objects.count() == 4
+
+
+class TestRunNarcQueryRule(TestRunQueryRuleMixin, TestCase):
+    __test__ = True
+
+    def create_basic_rule(self):
+        # This rule will match every name, with the default config.
+        return ScannerQueryRule.objects.create(
+            name='match_everything',
+            scanner=NARC,
+            definition='.*',
+            state=NEW,
+        )
+
+    def test_run_on_chunk(self):
+        self.rule.update(state=RUNNING)  # Pretend we started running the rule.
+        run_scanner_query_rule_on_versions_chunk([self.version.pk], self.rule.pk)
+
+        scanner_results = ScannerQueryResult.objects.all()
+        assert len(scanner_results) == 1
+        scanner_result = scanner_results.get()
+        assert scanner_result.version == self.version
+        assert not scanner_result.was_blocked
+        assert len(scanner_result.results) == 3
+        assert scanner_result.results == [
+            {
+                'meta': {
+                    'locale': 'en-us',
+                    'source': 'db_addon',
+                    'string': 'WebExtension',
+                },
+                'rule': 'match_everything',
+            },
+            {
+                'meta': {
+                    'locale': None,
+                    'original_string': 'My WebExtension Addon',
+                    'source': 'xpi',
+                    'string': 'MyWebExtensionAddon',
+                    'variant': 'normalized',
+                },
+                'rule': 'match_everything',
+            },
+            {
+                'meta': {
+                    'locale': None,
+                    'source': 'xpi',
+                    'string': 'My WebExtension Addon',
+                },
+                'rule': 'match_everything',
+            },
+        ]
+        self.rule.reload()
+        assert self.rule.state == RUNNING  # Not touched by this task.
+
+    def test_run_on_chunk_num_queries(self):
+        # Extra addons shouldn't affect number of queries.
+        extra_addon1_version1 = addon_factory(
+            file_kw={'filename': 'webextension.xpi'}
+        ).current_version
+        extra_addon2_version1 = addon_factory(
+            file_kw={'filename': 'webextension.xpi'}
+        ).current_version
+        extra_addon2_version2 = version_factory(
+            addon=extra_addon2_version1.addon, file_kw={'filename': 'webextension.xpi'}
+        )
+        # Make the rule not match to avoid queries when saving results, we
+        # don't care about those at this time.
+        self.rule.update(
+            definition='willnotmatchanything',
+            name='willnotmatchanything',
+            state=RUNNING,
+        )
+        with self.assertNumQueries(5):
+            # - 1 for the rule
+            # - 1 for all promoted addon info (prefetched even if no match)
+            # - 1 for all authors
+            # - 1 for all translations
+            # - 1 for all versions + file
+            run_scanner_query_rule_on_versions_chunk(
+                [
+                    self.version.pk,
+                    extra_addon1_version1.pk,
+                    extra_addon2_version1.pk,
+                    extra_addon2_version2.pk,
+                ],
+                self.rule.pk,
+            )
+        assert ScannerQueryResult.objects.count() == 0
+
+    def test_run_on_chunk_num_queries_matching(self):
+        # Extra addons shouldn't affect number of queries.
+        extra_addon1_version1 = addon_factory(
+            file_kw={'filename': 'webextension.xpi'}
+        ).current_version
+        extra_addon2_version1 = addon_factory(
+            file_kw={'filename': 'webextension.xpi'}
+        ).current_version
+        extra_addon2_version2 = version_factory(
+            addon=extra_addon2_version1.addon, file_kw={'filename': 'webextension.xpi'}
+        )
+        self.rule.update(state=RUNNING)
+        with self.assertNumQueries(6):
+            # - 1 for the rule
+            # - 1 for all versions + file
+            # - 1 for all authors
+            # - 1 for all translations
+            # - 1 for all promoted addon info
+            # - 1 for bulk-saving all results
+            run_scanner_query_rule_on_versions_chunk(
+                [
+                    self.version.pk,
+                    extra_addon1_version1.pk,
+                    extra_addon2_version1.pk,
+                    extra_addon2_version2.pk,
+                ],
+                self.rule.pk,
+            )
+        assert ScannerQueryResult.objects.count() == 4
+
+
+class TestCallWebhooks(UploadMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+
+        self.upload = self.get_upload('webextension.xpi')
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_call_webhooks(self, _call_webhook_mock):
+        assert len(ScannerResult.objects.all()) == 0
+
+        webhook_1 = ScannerWebhook.objects.create(
+            name='some-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        # This one is disabled.
+        webhook_2 = ScannerWebhook.objects.create(
+            name='some-disabled-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=False,
+        )
+        webhook_3 = ScannerWebhook.objects.create(
+            name='some-other-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        # Register the webhook scanners for the same event.
+        event_1 = ScannerWebhookEvent.objects.create(
+            event=WEBHOOK_DURING_VALIDATION, webhook=webhook_1
+        )
+        _event_2 = ScannerWebhookEvent.objects.create(
+            event=WEBHOOK_DURING_VALIDATION, webhook=webhook_2
+        )
+        event_3 = ScannerWebhookEvent.objects.create(
+            event=WEBHOOK_DURING_VALIDATION, webhook=webhook_3
+        )
+
+        returned_data = {'data': 'some data returned by the scanner'}
+        _call_webhook_mock.return_value = returned_data
+
+        payload = {'some': 'payload to send to the scanners for that event'}
+
+        # Call the webhooks.
+        call_webhooks(WEBHOOK_DURING_VALIDATION, payload)
+
+        results = ScannerResult.objects.all()
+        assert len(results) == 2
+        for result in results:
+            assert result.scanner == WEBHOOK
+            assert result.results == returned_data
+        assert results[0].webhook_event == event_1
+        assert results[1].webhook_event == event_3
+
+        assert _call_webhook_mock.called
+        assert _call_webhook_mock.call_count == 2
+        _call_webhook_mock.assert_has_calls(
+            [
+                mock.call(
+                    webhook=webhook_1,
+                    payload={
+                        **payload,
+                        'event': 'during_validation',
+                        'scanner_result_url': f'http://testserver/api/v5/scanner/results/{results[0].pk}/',
+                    },
+                    request_id=mock.ANY,
+                ),
+                mock.call(
+                    webhook=webhook_3,
+                    payload={
+                        **payload,
+                        'event': 'during_validation',
+                        'scanner_result_url': f'http://testserver/api/v5/scanner/results/{results[1].pk}/',
+                    },
+                    request_id=mock.ANY,
+                ),
+            ]
+        )
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_call_webhooks_extracts_matched_rules(self, _call_webhook_mock):
+        rule = ScannerRule.objects.create(
+            name='some-rule',
+            scanner=WEBHOOK,
+            is_active=True,
+        )
+        webhook = ScannerWebhook.objects.create(
+            name='some-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        ScannerWebhookEvent.objects.create(
+            event=WEBHOOK_DURING_VALIDATION, webhook=webhook
+        )
+        _call_webhook_mock.return_value = {'matchedRules': [rule.name]}
+
+        call_webhooks(WEBHOOK_DURING_VALIDATION, payload={})
+
+        result = ScannerResult.objects.get(scanner=WEBHOOK)
+        assert result.has_matches is True
+        assert list(result.matched_rules.all()) == [rule]
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_call_webhooks_with_activity_log(self, _call_webhook_mock):
+        from olympia.activity.models import ActivityLog
+
+        webhook = ScannerWebhook.objects.create(
+            name='some-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        ScannerWebhookEvent.objects.create(
+            event=WEBHOOK_DURING_VALIDATION, webhook=webhook
+        )
+        _call_webhook_mock.return_value = {}
+        activity_log = ActivityLog.objects.create(
+            amo.LOG.SOURCE_CODE_UPLOADED, addon_factory(), user=user_factory()
+        )
+
+        call_webhooks(WEBHOOK_DURING_VALIDATION, payload={}, activity_log=activity_log)
+
+        result = ScannerResult.objects.get(scanner=WEBHOOK)
+        assert result.activity_log == activity_log
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_call_webhooks_raises(self, _call_webhook_mock):
+        assert len(ScannerResult.objects.all()) == 0
+
+        webhook = ScannerWebhook.objects.create(
+            name='some-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        ScannerWebhookEvent.objects.create(
+            event=WEBHOOK_DURING_VALIDATION, webhook=webhook
+        )
+
+        _call_webhook_mock.side_effect = RuntimeError()
+
+        payload = {'some': 'payload to send to the scanners for that event'}
+
+        with self.assertRaises(ExceptionGroup) as context:
+            call_webhooks(WEBHOOK_DURING_VALIDATION, payload)
+
+        assert isinstance(context.exception.exceptions[0], RuntimeError)
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_call_webhooks_calls_every_webhook_when_one_fails(self, _call_webhook_mock):
+        webhook_1 = ScannerWebhook.objects.create(
+            name='some-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        webhook_2 = ScannerWebhook.objects.create(
+            name='some-other-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        event_1 = ScannerWebhookEvent.objects.create(
+            event=WEBHOOK_DURING_VALIDATION, webhook=webhook_1
+        )
+        event_2 = ScannerWebhookEvent.objects.create(
+            event=WEBHOOK_DURING_VALIDATION, webhook=webhook_2
+        )
+        returned_data = {'matchedRules': []}
+        _call_webhook_mock.side_effect = [RuntimeError(), returned_data]
+
+        with self.assertRaises(ExceptionGroup):
+            call_webhooks(WEBHOOK_DURING_VALIDATION, payload={})
+
+        assert _call_webhook_mock.call_count == 2
+        # The webhook that failed still has a result, just not a complete one.
+        assert ScannerResult.objects.get(webhook_event=event_1).results == []
+        assert ScannerResult.objects.get(webhook_event=event_2).results == returned_data
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_call_webhooks_raises_every_error(self, _call_webhook_mock):
+        for name in ('some-scanner', 'some-other-scanner'):
+            ScannerWebhookEvent.objects.create(
+                event=WEBHOOK_DURING_VALIDATION,
+                webhook=ScannerWebhook.objects.create(
+                    name=name,
+                    url='https://example.org/webhook',
+                    api_key='some-api-key',
+                    is_active=True,
+                ),
+            )
+        _call_webhook_mock.side_effect = [RuntimeError('first'), ValueError('second')]
+
+        with self.assertRaises(ExceptionGroup) as context:
+            call_webhooks(WEBHOOK_DURING_VALIDATION, payload={})
+
+        assert str(context.exception) == (
+            'Error while calling "during_validation" webhooks (2 sub-exceptions)'
+        )
+        assert [str(exc) for exc in context.exception.exceptions] == ['first', 'second']
+        assert _call_webhook_mock.call_count == 2
+        assert ScannerResult.objects.count() == 2
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    @mock.patch('olympia.scanners.tasks.statsd.timer')
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_statsd_success(self, _call_webhook_mock, timer_mock, incr_mock):
+        ScannerWebhookEvent.objects.create(
+            event=WEBHOOK_DURING_VALIDATION,
+            webhook=ScannerWebhook.objects.create(
+                name='some (fancy) scanner',
+                url='https://example.org/webhook',
+                api_key='some-api-key',
+                is_active=True,
+            ),
+        )
+        _call_webhook_mock.return_value = {}
+
+        call_webhooks(WEBHOOK_DURING_VALIDATION, payload={})
+
+        expected_name = 'devhub.webhook.some-fancy-scanner.during_validation'
+        timer_mock.assert_called_once_with(expected_name)
+        incr_mock.assert_called_once_with(f'{expected_name}.success')
+
+    @mock.patch('olympia.scanners.tasks.statsd.incr')
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_statsd_failure(self, _call_webhook_mock, incr_mock):
+        ScannerWebhookEvent.objects.create(
+            event=WEBHOOK_DURING_VALIDATION,
+            webhook=ScannerWebhook.objects.create(
+                name='some (fancy) scanner',
+                url='https://example.org/webhook',
+                api_key='some-api-key',
+                is_active=True,
+            ),
+        )
+        _call_webhook_mock.side_effect = RuntimeError()
+
+        with self.assertRaises(ExceptionGroup):
+            call_webhooks(WEBHOOK_DURING_VALIDATION, payload={})
+
+        expected_name = 'devhub.webhook.some-fancy-scanner.during_validation'
+        incr_mock.assert_called_once_with(f'{expected_name}.failure')
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_call_webhooks_with_none_result(self, _call_webhook_mock):
+        webhook = ScannerWebhook.objects.create(
+            name='some-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        ScannerWebhookEvent.objects.create(
+            event=WEBHOOK_DURING_VALIDATION, webhook=webhook
+        )
+        _call_webhook_mock.return_value = None
+
+        call_webhooks(WEBHOOK_DURING_VALIDATION, payload={})
+
+        result = ScannerResult.objects.get(scanner=WEBHOOK)
+        assert result.results is None
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_call_webhooks_skips_inactive_event(self, _call_webhook_mock):
+        webhook = ScannerWebhook.objects.create(
+            name='some-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        ScannerWebhookEvent.objects.create(
+            event=WEBHOOK_DURING_VALIDATION, webhook=webhook, is_active=False
+        )
+
+        call_webhooks(WEBHOOK_DURING_VALIDATION, payload={})
+
+        assert not _call_webhook_mock.called
+        assert ScannerResult.objects.count() == 0
+
+
+class TestCallWebhook(TestCase):
+    def create_response(self, status_code=200, data=None):
+        response = mock.Mock(status_code=status_code)
+        response.json.return_value = data if data else {}
+        return response
+
+    @override_settings(SCANNER_TIMEOUT=123)
+    @mock.patch.object(requests.Session, 'post')
+    def test_call_webhook(self, requests_mock):
+        webhook = ScannerWebhook.objects.create(
+            name='some-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        payload = {'some': 'payload to send to the scanners for that event'}
+
+        response_data = {'version': '1.0.0', 'matchedRules': []}
+        requests_mock.return_value = self.create_response(data=response_data)
+
+        returned_value = _call_webhook(
+            webhook=webhook,
+            payload=payload,
+            request_id='some-request-id',
+        )
+
+        assert requests_mock.called
+        expected_digest = (
+            '1987be0ea649633a3eaca7c504b9995fe20aa054d7423e490df927b1ede917a1'
+        )
+        assert requests_mock.call_count == 1
+        call_kwargs = requests_mock.call_args.kwargs
+        assert call_kwargs['url'] == webhook.url
+        assert call_kwargs['data'] == json.dumps(payload)
+        assert call_kwargs['timeout'] == 123
+        assert call_kwargs['headers']['Content-Type'] == 'application/json'
+        assert (
+            call_kwargs['headers']['Authorization'] == f'HMAC-SHA256 {expected_digest}'
+        )
+        assert call_kwargs['headers']['X-AMO-Request-ID'] == 'some-request-id'
+        assert returned_value == response_data
+
+    @override_settings(SCANNER_TIMEOUT=123)
+    @mock.patch.object(requests.Session, 'post')
+    def test_call_webhook_http_201(self, requests_mock):
+        webhook = ScannerWebhook.objects.create(
+            name='some-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        response_data = {'version': '1.0.0', 'matchedRules': []}
+        requests_mock.return_value = self.create_response(
+            status_code=201, data=response_data
+        )
+
+        returned_value = _call_webhook(
+            webhook=webhook,
+            payload={},
+            request_id='some-request-id',
+        )
+
+        assert requests_mock.called
+        assert returned_value == response_data
+
+    @override_settings(SCANNER_TIMEOUT=123)
+    @mock.patch.object(requests.Session, 'post')
+    def test_call_webhook_http_202(self, requests_mock):
+        webhook = ScannerWebhook.objects.create(
+            name='some-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        response_data = {'some': 'data'}
+        requests_mock.return_value = self.create_response(
+            status_code=202, data=response_data
+        )
+
+        returned_value = _call_webhook(
+            webhook=webhook,
+            payload={},
+            request_id='some-request-id',
+        )
+
+        assert requests_mock.called
+        assert returned_value == response_data
+
+    @override_settings(SCANNER_TIMEOUT=123)
+    @mock.patch.object(requests.Session, 'post')
+    def test_call_webhook_http_204(self, requests_mock):
+        webhook = ScannerWebhook.objects.create(
+            name='some-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        requests_mock.return_value = self.create_response(status_code=204)
+
+        returned_value = _call_webhook(
+            webhook=webhook,
+            payload={},
+            request_id='some-request-id',
+        )
+
+        assert requests_mock.called
+        assert returned_value is None
+
+    @override_settings(SCANNER_TIMEOUT=123)
+    @mock.patch.object(requests.Session, 'post')
+    def test_call_webhook_with_error_returned_by_the_scanner(self, requests_mock):
+        webhook = ScannerWebhook.objects.create(
+            name='some-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        payload = {'some': 'payload to send to the scanners for that event'}
+
+        response_data = {'error': 'ooops'}
+        requests_mock.return_value = self.create_response(data=response_data)
+
+        with self.assertRaises(ValueError) as exc:
+            _call_webhook(
+                webhook=webhook,
+                payload=payload,
+                request_id='some-request-id',
+            )
+
+        assert requests_mock.called
+        assert exc.exception.args[0] == response_data
+
+    @override_settings(SCANNER_TIMEOUT=123)
+    @mock.patch.object(requests.Session, 'post')
+    def test_call_webhook_with_http_error(self, requests_mock):
+        webhook = ScannerWebhook.objects.create(
+            name='some-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        payload = {'some': 'payload to send to the scanners for that event'}
+
+        response_data = {'message': 'http timeout'}
+        requests_mock.return_value = self.create_response(
+            status_code=504, data=response_data
+        )
+
+        with self.assertRaises(ValueError) as exc:
+            _call_webhook(
+                webhook=webhook,
+                payload=payload,
+                request_id='some-request-id',
+            )
+
+        assert requests_mock.called
+        assert exc.exception.args[0] == response_data
+
+    @mock.patch.object(requests.Session, 'post')
+    def test_call_webhook_with_no_results_in_http_200(self, requests_mock):
+        webhook = ScannerWebhook.objects.create(
+            name='some-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        requests_mock.return_value = self.create_response(data={'ok': True})
+
+        with self.assertRaises(ValueError) as exc:
+            _call_webhook(
+                webhook=webhook,
+                payload={},
+                request_id='some-request-id',
+            )
+
+        assert exc.exception.args[0] == "$: 'version' is a required property"
+
+    @mock.patch.object(requests.Session, 'post')
+    def test_call_webhook_with_results_in_http_202(self, requests_mock):
+        webhook = ScannerWebhook.objects.create(
+            name='some-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        requests_mock.return_value = self.create_response(
+            status_code=202, data={'version': '1.0.0', 'matchedRules': []}
+        )
+
+        with self.assertRaises(ValueError) as exc:
+            _call_webhook(
+                webhook=webhook,
+                payload={},
+                request_id='some-request-id',
+            )
+
+        assert exc.exception.args[0] == (
+            "'matchedRules' is not allowed in a 202 response"
+        )
+
+
+class TestCallWebhooksDuringValidation(UploadMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+
+        self.upload = self.get_upload('webextension.xpi')
+        self.results = {
+            **amo.VALIDATOR_SKELETON_RESULTS,
+        }
+
+    @mock.patch('olympia.scanners.tasks.call_webhooks')
+    def test_call_webhooks_during_validation(self, call_webhooks_mock):
+        results = call_webhooks_during_validation(self.results, self.upload.pk)
+
+        assert call_webhooks_mock.called
+        call_webhooks_mock.assert_called_with(
+            event_id=WEBHOOK_DURING_VALIDATION,
+            payload={'download_url': self.upload.get_authenticated_download_url()},
+            upload=self.upload,
+        )
+        assert self.results == results
+
+    def test_call_webhooks_during_validation_without_file_path(self):
+        self.create_switch('ignore-exceptions-in-scanner-tasks', active=False)
+        self.upload.update(path='/not-a-file')
+
+        results = call_webhooks_during_validation(self.results, self.upload.pk)
+
+        assert self.results != results
+        # This is coming from `VALIDATOR_SKELETON_EXCEPTION_WEBEXT` because
+        # `call_webhooks_during_validation` is decorated with
+        # `@validation_task`, which handles all uncaught exceptions gracefully.
+        #
+        # This is the case here since the task raises when the file upload path
+        # doesn't exist.
+        assert results['messages'][0]['uid'] == '35432f419340461897aa8362398339c4'
+
+    def test_call_webhooks_during_validation_without_file_path_ignore_exceptions(self):
+        self.create_switch('ignore-exceptions-in-scanner-tasks', active=True)
+        self.upload.update(path='/not-a-file')
+
+        results = call_webhooks_during_validation(self.results, self.upload.pk)
+
+        assert self.results == results
+
+
+class TestWaitForScannerResults(UploadMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+
+        self.version = version_factory(addon=addon_factory())
+        self.webhook = ScannerWebhook.objects.create(
+            name='some-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        # The webhook has to predate the version, otherwise we don't wait on it.
+        self.webhook.update(modified=self.version.created)
+        self.event = ScannerWebhookEvent.objects.create(
+            event=WEBHOOK_ON_VERSION_CREATED, webhook=self.webhook
+        )
+
+    def _create_result(self, **kwargs):
+        # Without any results by default, i.e. the scanner still owes us some.
+        kwargs.setdefault('webhook_event', self.event)
+        kwargs.setdefault('version', self.version)
+        return ScannerResult.objects.create(scanner=WEBHOOK, **kwargs)
+
+    def _run_task(self, retries=0, event_ids=None):
+        return wait_for_scanner_results.apply(
+            args=(
+                self.version.pk,
+                event_ids or WEBHOOK_EVENTS_AGGREGATED_BY_ON_VERSION_SCANNED,
+            ),
+            retries=retries,
+        )
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_nothing_to_do_when_results_are_complete(self, _call_webhook_mock):
+        self._create_result(results={'matchedRules': []})
+
+        self._run_task()
+
+        _call_webhook_mock.assert_not_called()
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_nothing_to_do_when_event_was_skipped(self, _call_webhook_mock):
+        # A scanner that returned a 204 has `results` set to None.
+        self._create_result(results=None)
+
+        self._run_task()
+
+        _call_webhook_mock.assert_not_called()
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_nothing_to_do_when_no_event_blocks_auto_approval(self, _call_webhook_mock):
+        self.event.update(is_active=False)
+
+        self._run_task()
+
+        _call_webhook_mock.assert_not_called()
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_nothing_to_do_when_webhook_was_enabled_after_the_version(
+        self, _call_webhook_mock
+    ):
+        self.webhook.update(modified=datetime.now())
+
+        self._run_task()
+
+        _call_webhook_mock.assert_not_called()
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_nothing_to_do_when_disabled_with_waffle_switch(self, _call_webhook_mock):
+        self.create_switch('disable-wait-for-scanner-results', active=True)
+        self._create_result()
+
+        self._run_task()
+
+        _call_webhook_mock.assert_not_called()
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_calls_webhook_again_and_retries(self, _call_webhook_mock):
+        # The webhook accepts the call but does not return any results.
+        _call_webhook_mock.return_value = {}
+        scanner_result = self._create_result()
+
+        with pytest.raises(Retry) as exc_info:
+            self._run_task()
+
+        assert exc_info.value.when == settings.SCANNER_WEBHOOK_RETRY_DELAY
+        assert _call_webhook_mock.call_count == 1
+        assert _call_webhook_mock.call_args[1]['webhook'] == self.webhook
+        assert _call_webhook_mock.call_args[1]['request_id'] is not None
+        payload = _call_webhook_mock.call_args[1]['payload']
+        assert payload.keys() == {'addon', 'version', 'event', 'scanner_result_url'}
+        assert payload['addon']['id'] == self.version.addon.pk
+        assert payload['version']['id'] == self.version.pk
+        assert payload['event'] == 'on_version_created'
+        assert payload['scanner_result_url'] == (
+            f'http://testserver/api/v5/scanner/results/{scanner_result.pk}/'
+        )
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_handles_missing_event_ids_param(self, _call_webhook_mock):
+        _call_webhook_mock.return_value = {}
+        self._create_result()
+
+        with pytest.raises(Retry):
+            wait_for_scanner_results.apply(args=(self.version.pk,))
+
+        assert _call_webhook_mock.call_count == 1
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_retry_delay_is_fixed(self, _call_webhook_mock):
+        _call_webhook_mock.return_value = {}
+        self._create_result()
+
+        for retries in range(WEBHOOK_MAX_RETRIES):
+            with pytest.raises(Retry) as exc_info:
+                self._run_task(retries=retries)
+            assert exc_info.value.when == settings.SCANNER_WEBHOOK_RETRY_DELAY
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_does_not_retry_when_the_scanner_answers(self, _call_webhook_mock):
+        _call_webhook_mock.return_value = {'matchedRules': []}
+        scanner_result = self._create_result()
+
+        self._run_task()
+
+        assert _call_webhook_mock.call_count == 1
+        assert scanner_result.reload().results == {'matchedRules': []}
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_only_calls_the_webhooks_that_owe_us_results(self, _call_webhook_mock):
+        _call_webhook_mock.return_value = {}
+        other_webhook = ScannerWebhook.objects.create(
+            name='some-other-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        other_webhook.update(modified=self.version.created)
+        other_event = ScannerWebhookEvent.objects.create(
+            event=WEBHOOK_DURING_VALIDATION, webhook=other_webhook
+        )
+        self._create_result(results={'matchedRules': []})
+        self._create_result(
+            webhook_event=other_event, upload=self.get_upload('webextension.xpi')
+        )
+
+        with pytest.raises(Retry):
+            self._run_task()
+
+        assert _call_webhook_mock.call_count == 1
+        assert _call_webhook_mock.call_args[1]['webhook'] == other_webhook
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_keeps_the_results_sent_while_calling_the_webhook(self, _call_webhook_mock):
+        scanner_result = self._create_result()
+        sent_while_calling = {'matchedRules': ['some-rule']}
+
+        def patch_results_then_answer(*args, **kwargs):
+            ScannerResult.objects.filter(pk=scanner_result.pk).update(
+                results=sent_while_calling
+            )
+            return {}
+
+        _call_webhook_mock.side_effect = patch_results_then_answer
+
+        self._run_task()
+
+        assert scanner_result.reload().results == sent_while_calling
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_does_not_stop_on_a_webhook_error(self, _call_webhook_mock):
+        _call_webhook_mock.side_effect = ValueError('scanner is down')
+        scanner_result = self._create_result()
+
+        with pytest.raises(Retry):
+            self._run_task()
+
+        assert _call_webhook_mock.call_count == 1
+        assert scanner_result.reload().results == []
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_records_missing_results_when_out_of_retries(self, _call_webhook_mock):
+        rule = ScannerRule.objects.get(
+            name=SCANNER_RESULTS_MISSING_RULE_NAME, scanner=WEBHOOK
+        )
+        scanner_result = self._create_result()
+
+        self._run_task(retries=WEBHOOK_MAX_RETRIES)
+
+        _call_webhook_mock.assert_not_called()
+        scanner_result.reload()
+        assert scanner_result.results == {
+            'matchedRules': [SCANNER_RESULTS_MISSING_RULE_NAME]
+        }
+        assert scanner_result.is_complete
+        assert scanner_result.has_matches is True
+        assert list(scanner_result.matched_rules.all()) == [rule]
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_records_missing_results_when_the_upload_is_gone(self, _call_webhook_mock):
+        self.event.update(event=WEBHOOK_DURING_VALIDATION)
+        upload = self.get_upload('webextension.xpi')
+        upload.update(path='/not-a-file')
+        scanner_result = self._create_result(upload=upload)
+
+        self._run_task()
+
+        # There is nothing we could send again, so we don't even try.
+        _call_webhook_mock.assert_not_called()
+        assert scanner_result.reload().results == {
+            'matchedRules': [SCANNER_RESULTS_MISSING_RULE_NAME]
+        }
+
+    @mock.patch('olympia.scanners.tasks._build_payload_for_result')
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_retries_when_the_payload_cannot_be_built(
+        self, _call_webhook_mock, _build_payload_mock
+    ):
+        _build_payload_mock.side_effect = ValueError('nope')
+        scanner_result = self._create_result()
+
+        with pytest.raises(Retry):
+            self._run_task()
+
+        _call_webhook_mock.assert_not_called()
+        # We don't know whether this is transient, so we don't record missing
+        # results until we are out of retries.
+        assert scanner_result.reload().results == []
+
+    @mock.patch('olympia.scanners.tasks._build_payload_for_result')
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_records_missing_results_when_out_of_retries_and_no_payload(
+        self, _call_webhook_mock, _build_payload_mock
+    ):
+        _build_payload_mock.side_effect = ValueError('nope')
+        scanner_result = self._create_result()
+
+        self._run_task(retries=WEBHOOK_MAX_RETRIES)
+
+        _build_payload_mock.assert_not_called()
+        assert scanner_result.reload().results == {
+            'matchedRules': [SCANNER_RESULTS_MISSING_RULE_NAME]
+        }
+
+
+@mock.patch('olympia.scanners.tasks.wait_for_scanner_results.apply_async')
+@mock.patch('olympia.scanners.tasks._call_webhook')
+class TestCallWebhooksOnVersionScanned(UploadMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+
+        self.version = version_factory(addon=addon_factory())
+        self.event = self._create_event(
+            WEBHOOK_ON_VERSION_SCANNED, name='aggregating-scanner'
+        )
+
+    def _create_event(self, event, *, name, created=None):
+        webhook = ScannerWebhook.objects.create(
+            name=name,
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        # The webhook has to predate the version, otherwise we don't wait on it.
+        webhook.update(modified=created or self.days_ago(1))
+        return ScannerWebhookEvent.objects.create(event=event, webhook=webhook)
+
+    def _create_result(self, event, **kwargs):
+        kwargs.setdefault('version', self.version)
+        return ScannerResult.objects.create(
+            scanner=WEBHOOK, webhook_event=event, **kwargs
+        )
+
+    def _run_task(self):
+        return call_webhooks_on_version_scanned(version_pk=self.version.pk)
+
+    def _results_for(self, event):
+        return ScannerResult.objects.filter(version=self.version, webhook_event=event)
+
+    def test_nothing_to_do_when_no_scanner_is_listening(
+        self, _call_webhook_mock, apply_async_mock
+    ):
+        self.event.update(is_active=False)
+
+        self._run_task()
+
+        _call_webhook_mock.assert_not_called()
+        assert not ScannerResult.objects.exists()
+
+    def test_nothing_to_do_when_the_webhook_postdates_the_version(
+        self, _call_webhook_mock, apply_async_mock
+    ):
+        self.event.webhook.update(modified=datetime.now())
+
+        self._run_task()
+
+        _call_webhook_mock.assert_not_called()
+        assert not ScannerResult.objects.exists()
+
+    def test_nothing_to_do_while_an_aggregated_scanner_owes_us_results(
+        self, _call_webhook_mock, apply_async_mock
+    ):
+        self._create_result(
+            self._create_event(WEBHOOK_ON_VERSION_CREATED, name='some-scanner')
+        )
+
+        self._run_task()
+
+        _call_webhook_mock.assert_not_called()
+        assert not self._results_for(self.event).exists()
+
+    def test_calls_the_webhook_when_the_aggregated_scanners_are_done(
+        self, _call_webhook_mock, apply_async_mock
+    ):
+        _call_webhook_mock.return_value = {'matchedRules': []}
+        event = self._create_event(WEBHOOK_ON_VERSION_CREATED, name='some-scanner')
+        self._create_result(event, results={'matchedRules': ['SOME_RULE']})
+
+        self._run_task()
+
+        scanner_result = self._results_for(self.event).get()
+        assert scanner_result.results == {'matchedRules': []}
+        assert _call_webhook_mock.call_count == 1
+        assert _call_webhook_mock.call_args[1]['webhook'] == self.event.webhook
+        assert _call_webhook_mock.call_args[1]['request_id'] is not None
+        payload = _call_webhook_mock.call_args[1]['payload']
+        assert payload.keys() == {
+            'addon',
+            'version',
+            'scanner_results',
+            'event',
+            'scanner_result_url',
+        }
+        assert payload['addon']['id'] == self.version.addon.pk
+        assert payload['version']['id'] == self.version.pk
+        assert payload['scanner_results'] == {
+            'during_validation': {},
+            'on_version_created': {'some-scanner': {'matchedRules': ['SOME_RULE']}},
+        }
+        assert payload['event'] == 'on_version_scanned'
+        assert payload['scanner_result_url'] == (
+            f'http://testserver/api/v5/scanner/results/{scanner_result.pk}/'
+        )
+
+    def test_calls_the_webhook_when_no_scanner_is_aggregated(
+        self, _call_webhook_mock, apply_async_mock
+    ):
+        _call_webhook_mock.return_value = {'matchedRules': []}
+
+        self._run_task()
+
+        assert self._results_for(self.event).exists()
+        assert _call_webhook_mock.call_args[1]['payload']['scanner_results'] == {
+            'during_validation': {},
+            'on_version_created': {},
+        }
+
+    def test_aggregates_every_event_and_scanner(
+        self, _call_webhook_mock, apply_async_mock
+    ):
+        _call_webhook_mock.return_value = {}
+        during_validation = self._create_event(
+            WEBHOOK_DURING_VALIDATION, name='some-scanner'
+        )
+        # The same scanner listening to both aggregated events.
+        on_version_created = ScannerWebhookEvent.objects.create(
+            event=WEBHOOK_ON_VERSION_CREATED, webhook=during_validation.webhook
+        )
+        other = self._create_event(WEBHOOK_ON_VERSION_CREATED, name='other-scanner')
+        self._create_result(
+            during_validation,
+            results={'matchedRules': ['SOME_RULE']},
+            upload=self.get_upload('webextension.xpi'),
+        )
+        self._create_result(on_version_created, results={'matchedRules': []})
+        # This scanner skipped the event.
+        self._create_result(other, results=None)
+
+        self._run_task()
+
+        assert _call_webhook_mock.call_args[1]['payload']['scanner_results'] == {
+            'during_validation': {'some-scanner': {'matchedRules': ['SOME_RULE']}},
+            'on_version_created': {
+                'some-scanner': {'matchedRules': []},
+                'other-scanner': None,
+            },
+        }
+
+    def test_aggregates_the_results_of_a_deactivated_scanner(
+        self, _call_webhook_mock, apply_async_mock
+    ):
+        _call_webhook_mock.return_value = {}
+        event = self._create_event(WEBHOOK_ON_VERSION_CREATED, name='some-scanner')
+        self._create_result(event, results={'matchedRules': []})
+        # We already have its results, so we keep reporting them.
+        event.webhook.update(is_active=False)
+
+        self._run_task()
+
+        assert _call_webhook_mock.call_args[1]['payload']['scanner_results'] == {
+            'during_validation': {},
+            'on_version_created': {'some-scanner': {'matchedRules': []}},
+        }
+
+    def test_aggregates_the_last_result_of_a_scanner(
+        self, _call_webhook_mock, apply_async_mock
+    ):
+        _call_webhook_mock.return_value = {}
+        event = self._create_event(WEBHOOK_ON_VERSION_CREATED, name='some-scanner')
+        self._create_result(event, results={'matchedRules': ['FIRST']})
+        self._create_result(event, results={'matchedRules': ['LAST']})
+
+        self._run_task()
+
+        assert _call_webhook_mock.call_args[1]['payload']['scanner_results'][
+            'on_version_created'
+        ] == {'some-scanner': {'matchedRules': ['LAST']}}
+
+    def test_does_not_aggregate_incomplete_results(
+        self, _call_webhook_mock, apply_async_mock
+    ):
+        _call_webhook_mock.return_value = {}
+        event = self._create_event(WEBHOOK_ON_VERSION_CREATED, name='some-scanner')
+        self._create_result(event, results={'matchedRules': []})
+        # Another event for a scanner we are not waiting on (it was added after
+        # the version was created), with no results yet.
+        self._create_result(
+            self._create_event(
+                WEBHOOK_ON_VERSION_CREATED,
+                name='other-scanner',
+                created=datetime.now(),
+            )
+        )
+
+        self._run_task()
+
+        assert _call_webhook_mock.call_args[1]['payload']['scanner_results'][
+            'on_version_created'
+        ] == {'some-scanner': {'matchedRules': []}}
+
+    def test_does_not_call_the_webhook_twice(
+        self, _call_webhook_mock, apply_async_mock
+    ):
+        _call_webhook_mock.return_value = {}
+
+        self._run_task()
+        self._run_task()
+
+        assert _call_webhook_mock.call_count == 1
+        assert self._results_for(self.event).count() == 1
+
+    def test_calls_every_subscribed_webhook(self, _call_webhook_mock, apply_async_mock):
+        _call_webhook_mock.return_value = {}
+        other_event = self._create_event(
+            WEBHOOK_ON_VERSION_SCANNED, name='other-aggregating-scanner'
+        )
+
+        self._run_task()
+
+        assert _call_webhook_mock.call_count == 2
+        assert [call[1]['webhook'] for call in _call_webhook_mock.call_args_list] == [
+            self.event.webhook,
+            other_event.webhook,
+        ]
+
+    def test_does_not_stop_on_a_webhook_error(
+        self, _call_webhook_mock, apply_async_mock
+    ):
+        _call_webhook_mock.side_effect = [ValueError('scanner is down'), {}]
+        other_event = self._create_event(
+            WEBHOOK_ON_VERSION_SCANNED, name='other-aggregating-scanner'
+        )
+
+        self._run_task()
+
+        assert _call_webhook_mock.call_count == 2
+        assert self._results_for(self.event).get().results == []
+        assert self._results_for(other_event).get().results == {}
+
+    def test_waits_for_the_results_it_just_asked_for(
+        self, _call_webhook_mock, apply_async_mock
+    ):
+        # A `202` with no results: the scanner will send them later.
+        _call_webhook_mock.return_value = {}
+        self._create_result(
+            self._create_event(WEBHOOK_ON_VERSION_CREATED, name='some-scanner'),
+            results={'matchedRules': []},
+        )
+
+        self._run_task()
+
+        assert not self._results_for(self.event).get().is_complete
+        # Nothing was waiting for this result before we created it: the chain
+        # for the events we aggregate only ever watched those.
+        apply_async_mock.assert_called_once_with(
+            kwargs={
+                'version_pk': self.version.pk,
+                'event_ids': [WEBHOOK_ON_VERSION_SCANNED],
+            },
+            countdown=settings.SCANNER_WEBHOOK_RETRY_DELAY,
+        )
+
+    def test_does_not_wait_when_the_scanner_answered_synchronously(
+        self, _call_webhook_mock, apply_async_mock
+    ):
+        _call_webhook_mock.return_value = {'matchedRules': []}
+        self._create_result(
+            self._create_event(WEBHOOK_ON_VERSION_CREATED, name='some-scanner'),
+            results={'matchedRules': []},
+        )
+
+        self._run_task()
+
+        assert self._results_for(self.event).get().is_complete
+        apply_async_mock.assert_not_called()
+
+    def test_does_not_wait_when_there_is_nothing_to_send(
+        self, _call_webhook_mock, apply_async_mock
+    ):
+        self.event.update(is_active=False)
+
+        self._run_task()
+
+        _call_webhook_mock.assert_not_called()
+        apply_async_mock.assert_not_called()
+
+
+@mock.patch('olympia.scanners.tasks.call_webhooks_on_version_scanned.delay')
+class TestMaybeCallWebhooksOnVersionScanned(TestCase):
+    def setUp(self):
+        super().setUp()
+
+        self.version = version_factory(addon=addon_factory())
+        webhook = ScannerWebhook.objects.create(
+            name='some-scanner',
+            url='https://example.org/webhook',
+            api_key='some-api-key',
+            is_active=True,
+        )
+        webhook.update(modified=self.days_ago(1))
+        self.event = ScannerWebhookEvent.objects.create(
+            event=WEBHOOK_ON_VERSION_CREATED, webhook=webhook
+        )
+
+    def _create_result(self, **kwargs):
+        kwargs.setdefault('version', self.version)
+        kwargs.setdefault('webhook_event', self.event)
+        return ScannerResult.objects.create(scanner=WEBHOOK, **kwargs)
+
+    def test_schedules_the_task(self, delay_mock):
+        maybe_call_webhooks_on_version_scanned(
+            self._create_result(results={'matchedRules': []})
+        )
+
+        delay_mock.assert_called_once_with(version_pk=self.version.pk)
+
+    def test_schedules_the_task_when_the_event_was_skipped(self, delay_mock):
+        maybe_call_webhooks_on_version_scanned(self._create_result(results=None))
+
+        delay_mock.assert_called_once_with(version_pk=self.version.pk)
+
+    def test_does_nothing_when_the_result_is_incomplete(self, delay_mock):
+        maybe_call_webhooks_on_version_scanned(self._create_result())
+
+        delay_mock.assert_not_called()
+
+    def test_does_nothing_without_a_version(self, delay_mock):
+        maybe_call_webhooks_on_version_scanned(
+            self._create_result(version=None, results={'matchedRules': []})
+        )
+
+        delay_mock.assert_not_called()
+
+    def test_does_nothing_for_an_event_that_is_not_aggregated(self, delay_mock):
+        self.event.update(event=WEBHOOK_ON_SOURCE_CODE_UPLOADED)
+
+        maybe_call_webhooks_on_version_scanned(
+            self._create_result(results={'matchedRules': []})
+        )
+
+        delay_mock.assert_not_called()
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_scheduled_when_a_webhook_answers_synchronously(
+        self, _call_webhook_mock, delay_mock
+    ):
+        _call_webhook_mock.return_value = {'matchedRules': []}
+
+        call_webhooks(
+            event_id=WEBHOOK_ON_VERSION_CREATED,
+            payload={},
+            version=self.version,
+        )
+
+        delay_mock.assert_called_with(version_pk=self.version.pk)
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_not_scheduled_when_a_webhook_answers_asynchronously(
+        self, _call_webhook_mock, delay_mock
+    ):
+        # A `202` with no results: the scanner will send them later.
+        _call_webhook_mock.return_value = {}
+
+        call_webhooks(
+            event_id=WEBHOOK_ON_VERSION_CREATED,
+            payload={},
+            version=self.version,
+        )
+
+        delay_mock.assert_not_called()
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_scheduled_by_wait_for_scanner_results(
+        self, _call_webhook_mock, delay_mock
+    ):
+        _call_webhook_mock.return_value = {}
+        # Nothing left to wait for, which is what unlocks `on_version_scanned`.
+        self._create_result(results={'matchedRules': []})
+
+        wait_for_scanner_results.apply(
+            args=(self.version.pk, WEBHOOK_EVENTS_AGGREGATED_BY_ON_VERSION_SCANNED)
+        )
+
+        delay_mock.assert_called_with(version_pk=self.version.pk)
+
+    @mock.patch('olympia.scanners.tasks._call_webhook')
+    def test_not_scheduled_while_wait_for_scanner_results_is_still_waiting(
+        self, _call_webhook_mock, delay_mock
+    ):
+        _call_webhook_mock.return_value = {}
+        self._create_result()
+
+        with pytest.raises(Retry):
+            wait_for_scanner_results.apply(
+                args=(self.version.pk, WEBHOOK_EVENTS_AGGREGATED_BY_ON_VERSION_SCANNED)
+            )
+
+        delay_mock.assert_not_called()

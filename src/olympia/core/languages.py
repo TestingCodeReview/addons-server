@@ -1,234 +1,247 @@
-LANGUAGE_MAPPING = {
-    'af': {
-        'english': u'Afrikaans',
-        'native': u'Afrikaans'
+# These are all languages - both languages that do meet the threshold for being
+# available on AMO prod, and ones that don't - see PROD_LANGUAGES.
+# Where a language is not in AMO_LANGUAGES, we don't offer translations but they may
+# still be used to show that language a locale code maps to, for instance in statistics
+# views.
+ALL_LANGUAGES = {
+    'ach': {'english': 'Acholi', 'native': 'Acholi'},
+    'af': {'english': 'Afrikaans', 'native': 'Afrikaans'},
+    'ak': {'english': 'Akan', 'native': 'Akan'},
+    'am': {'english': 'Amharic', 'native': 'አማርኛ'},
+    'an': {'english': 'Aragonese', 'native': 'aragonés'},
+    'ar': {'english': 'Arabic', 'native': 'عربي'},
+    'as': {'english': 'Assamese', 'native': 'অসমীয়া'},
+    'ast': {'english': 'Asturian', 'native': 'Asturianu'},
+    'az': {'english': 'Azerbaijani', 'native': 'Azərbaycanca'},
+    'azz': {
+        'english': 'Highland Puebla Nahuatl',
+        'native': 'nahuatl sierra norte Puebla',
     },
-    'ar': {
-        'english': u'Arabic',
-        'native': u'\u0639\u0631\u0628\u064a'
+    'be': {'english': 'Belarusian', 'native': 'Беларуская'},
+    'bg': {'english': 'Bulgarian', 'native': 'Български'},
+    'bm': {'english': 'Bambara', 'native': 'Bamanankan'},
+    'bn': {'english': 'Bengali', 'native': 'বাংলা'},
+    'br': {'english': 'Breton', 'native': 'Brezhoneg'},
+    'brx': {'english': 'Bodo', 'native': "बर'"},
+    'bs': {'english': 'Bosnian', 'native': 'Bosanski'},
+    'ca': {'english': 'Catalan', 'native': 'Català'},
+    'ca-valencia': {'english': 'Catalan (Valencian)', 'native': 'català (valencià)'},
+    'cak': {'english': 'Kaqchikel', 'native': 'Maya Kaqchikel'},
+    'cs': {'english': 'Czech', 'native': 'Čeština'},
+    'csb': {'english': 'Kashubian', 'native': 'Kaszëbsczi'},
+    'cy': {'english': 'Welsh', 'native': 'Cymraeg'},
+    'da': {'english': 'Danish', 'native': 'Dansk'},
+    'de': {'english': 'German', 'native': 'Deutsch'},
+    'de-AT': {'english': 'German (Austria)', 'native': 'Deutsch (Österreich)'},
+    'de-CH': {'english': 'German (Switzerland)', 'native': 'Deutsch (Schweiz)'},
+    'de-DE': {'english': 'German (Germany)', 'native': 'Deutsch (Deutschland)'},
+    'dsb': {'english': 'Lower Sorbian', 'native': 'Dolnoserbšćina'},
+    'ee': {'english': 'Ewe', 'native': 'Eʋe'},
+    'el': {'english': 'Greek', 'native': 'Ελληνικά'},
+    'en-AU': {'english': 'English (Australian)', 'native': 'English (Australian)'},
+    'en-CA': {'english': 'English (Canadian)', 'native': 'English (Canadian)'},
+    'en-GB': {'english': 'English (British)', 'native': 'English (British)'},
+    'en-NZ': {'english': 'English (New Zealand)', 'native': 'English (New Zealand)'},
+    'en-US': {'english': 'English (US)', 'native': 'English (US)'},
+    'en-ZA': {
+        'english': 'English (South African)',
+        'native': 'English (South African)',
     },
-    'ast': {
-        'english': u'Asturian',
-        'native': u'Asturianu'
-    },
-    'az': {
-        'english': u'Azerbaijani',
-        'native': u'Az\u0259rbaycanca'
-    },
-    'bg': {
-        'english': u'Bulgarian',
-        'native': u'\u0411\u044a\u043b\u0433\u0430\u0440\u0441\u043a\u0438'
-    },
-    'bn-BD': {
-        'english': u'Bengali (Bangladesh)',
-        'native': u'\u09ac\u09be\u0982\u09b2\u09be (\u09ac\u09be\u0982\u09b2\u09be\u09a6\u09c7\u09b6)'  # noqa
-    },
-    'bs': {
-        'english': u'Bosnian',
-        'native': u'Bosanski'
-    },
-    'ca': {
-        'english': u'Catalan',
-        'native': u'Catal\xe0'
-    },
-    'cak': {
-        'english': u'Kaqchikel',
-        'native': u'Maya Kaqchikel'
-    },
-    'cs': {
-        'english': u'Czech',
-        'native': u'\u010ce\u0161tina'
-    },
-    'da': {
-        'english': u'Danish',
-        'native': u'Dansk'
-    },
-    'de': {
-        'english': u'German',
-        'native': u'Deutsch'
-    },
-    'dsb': {
-        'english': u'Lower Sorbian',
-        'native': u'Dolnoserb\u0161\u0107ina'
-    },
-    'el': {
-        'english': u'Greek',
-        'native': u'\u0395\u03bb\u03bb\u03b7\u03bd\u03b9\u03ba\u03ac'
-    },
-    'en-CA': {
-        'english': u'English (Canadian)',
-        'native': u'English (Canadian)'
-    },
-    'en-GB': {
-        'english': u'English (British)',
-        'native': u'English (British)'
-    },
-    'en-US': {
-        'english': u'English (US)',
-        'native': u'English (US)'
-    },
-    'es': {
-        'english': u'Spanish',
-        'native': u'Espa\xf1ol'
-    },
-    'eu': {
-        'english': u'Basque',
-        'native': u'Euskara'
-    },
-    'fa': {
-        'english': u'Persian',
-        'native': u'\u0641\u0627\u0631\u0633\u06cc'
-    },
-    'fi': {
-        'english': u'Finnish',
-        'native': u'suomi'
-    },
-    'fr': {
-        'english': u'French',
-        'native': u'Fran\xe7ais'
-    },
-    'fy-NL': {
-        'english': u'Frisian',
-        'native': u'Frysk'
-    },
-    'ga-IE': {
-        'english': u'Irish',
-        'native': u'Gaeilge'
-    },
-    'gu': {
-        'english': u'Gujarati',
-        'native': u'\u0a97\u0ac1\u0a9c\u0ab0\u0abe\u0aa4\u0ac0'
-    },
-    'he': {
-        'english': u'Hebrew',
-        'native': u'\u05e2\u05d1\u05e8\u05d9\u05ea'
-    },
-    'hsb': {
-        'english': u'Upper Sorbian',
-        'native': u'Hornjoserbsce'
-    },
-    'hu': {
-        'english': u'Hungarian',
-        'native': u'magyar'
-    },
-    'id': {
-        'english': u'Indonesian',
-        'native': u'Bahasa Indonesia'
-    },
-    'it': {
-        'english': u'Italian',
-        'native': u'Italiano'
-    },
-    'ja': {
-        'english': u'Japanese',
-        'native': u'\u65e5\u672c\u8a9e'
-    },
-    'ka': {
-        'english': u'Georgian',
-        'native': u'\u10e5\u10d0\u10e0\u10d7\u10e3\u10da\u10d8'
-    },
-    'kab': {
-        'english': u'Kabyle',
-        'native': u'Taqbaylit'
-    },
-    'ko': {
-        'english': u'Korean',
-        'native': u'\ud55c\uad6d\uc5b4'
-    },
-    'mk': {
-        'english': u'Macedonian',
-        'native': u'\u041c\u0430\u043a\u0435\u0434\u043e\u043d\u0441\u043a\u0438'  # noqa
-    },
-    'mn': {
-        'english': u'Mongolian',
-        'native': u'\u041c\u043e\u043d\u0433\u043e\u043b'
-    },
-    'ms': {
-        'english': u'Malay',
-        'native': u'Melayu'
-    },
-    'nb-NO': {
-        'english': u'Norwegian (Bokm\xe5l)',
-        'native': u'Norsk bokm\xe5l'
-    },
-    'nl': {
-        'english': u'Dutch',
-        'native': u'Nederlands'
-    },
-    'nn-NO': {
-        'english': u'Norwegian (Nynorsk)',
-        'native': u'Norsk nynorsk'
-    },
-    'pa-IN': {
-        'english': u'Punjabi (India)',
-        'native': u'\u0a2a\u0a70\u0a1c\u0a3e\u0a2c\u0a40 (\u0a2d\u0a3e\u0a30\u0a24)'  # noqa
-        },
-    'pl': {
-        'english': u'Polish',
-        'native': u'Polski'
-    },
+    'eo': {'english': 'Esperanto', 'native': 'Esperanto'},
+    'es-AR': {'english': 'Spanish (Argentina)', 'native': 'Español (de Argentina)'},
+    'es-CL': {'english': 'Spanish (Chile)', 'native': 'Español (de Chile)'},
+    'es-ES': {'english': 'Spanish (Spain)', 'native': 'Español (de España)'},
+    'es-MX': {'english': 'Spanish (Mexico)', 'native': 'Español (de México)'},
+    'et': {'english': 'Estonian', 'native': 'Eesti keel'},
+    'eu': {'english': 'Basque', 'native': 'Euskara'},
+    'fa': {'english': 'Persian', 'native': 'فارسی'},
+    'ff': {'english': 'Fulah', 'native': 'Pulaar-Fulfulde'},
+    'fi': {'english': 'Finnish', 'native': 'suomi'},
+    'fj-FJ': {'english': 'Fijian', 'native': 'Vosa vaka-Viti'},
+    'fr': {'english': 'French', 'native': 'Français'},
+    'fur': {'english': 'Friulian', 'native': 'Furlan'},
+    'fy-NL': {'english': 'Frisian', 'native': 'Frysk'},
+    'ga-IE': {'english': 'Irish', 'native': 'Gaeilge'},
+    'gd': {'english': 'Gaelic (Scotland)', 'native': 'Gàidhlig'},
+    'gl': {'english': 'Galician', 'native': 'Galego'},
+    'gn': {'english': 'Guarani', 'native': "Avañe'ẽ"},
+    'gu': {'english': 'Gujarati', 'native': 'ગુજરાતી'},
+    'gu-IN': {'english': 'Gujarati (India)', 'native': 'ગુજરાતી (ભારત)'},
+    'ha': {'english': 'Hausa', 'native': 'Hausa'},
+    'he': {'english': 'Hebrew', 'native': 'עברית'},
+    'hi': {'english': 'Hindi', 'native': 'हिन्दी'},
+    'hi-IN': {'english': 'Hindi (India)', 'native': 'हिन्दी (भारत)'},
+    'hr': {'english': 'Croatian', 'native': 'Hrvatski'},
+    'hsb': {'english': 'Upper Sorbian', 'native': 'Hornjoserbsce'},
+    'hu': {'english': 'Hungarian', 'native': 'magyar'},
+    'hy-AM': {'english': 'Armenian', 'native': 'Հայերեն'},
+    'ia': {'english': 'Interlingua', 'native': 'Interlingua'},
+    'id': {'english': 'Indonesian', 'native': 'Bahasa Indonesia'},
+    'ig': {'english': 'Igbo', 'native': 'Igbo'},
+    'is': {'english': 'Icelandic', 'native': 'íslenska'},
+    'it': {'english': 'Italian', 'native': 'Italiano'},
+    'ja': {'english': 'Japanese', 'native': '日本語'},
+    'ja-JP-mac': {'english': 'Japanese', 'native': '日本語'},
+    'ka': {'english': 'Georgian', 'native': 'ქართული'},
+    'kab': {'english': 'Kabyle', 'native': 'Taqbaylit'},
+    'kk': {'english': 'Kazakh', 'native': 'Қазақ'},
+    'km': {'english': 'Khmer', 'native': 'ខ្មែរ'},
+    'kn': {'english': 'Kannada', 'native': 'ಕನ್ನಡ'},
+    'ko': {'english': 'Korean', 'native': '한국어'},
+    'kok': {'english': 'Konkani', 'native': 'कोंकनी'},
+    'ks': {'english': 'Kashmiri', 'native': 'كشمیری'},
+    'ku': {'english': 'Kurdish', 'native': 'Kurdî'},
+    'la': {'english': 'Latin', 'native': 'Latina'},
+    'lg': {'english': 'Luganda', 'native': 'Luganda'},
+    'lij': {'english': 'Ligurian', 'native': 'Ligure'},
+    'ln': {'english': 'Lingala', 'native': 'Lingála'},
+    'lo': {'english': 'Lao', 'native': 'ພາສາລາວ'},
+    'lt': {'english': 'Lithuanian', 'native': 'Lietuvių'},
+    'ltg': {'english': 'Latgalian', 'native': 'Latgaliešu valoda'},
+    'lv': {'english': 'Latvian', 'native': 'Latviešu'},
+    'mai': {'english': 'Maithili', 'native': 'मैथिली মৈথিলী'},
+    'mg': {'english': 'Malagasy', 'native': 'Malagasy'},
+    'mi': {'english': 'Maori (Aotearoa)', 'native': 'Māori (Aotearoa)'},
+    'mk': {'english': 'Macedonian', 'native': 'Македонски'},
+    'ml': {'english': 'Malayalam', 'native': 'മലയാളം'},
+    'mn': {'english': 'Mongolian', 'native': 'Монгол'},
+    'mr': {'english': 'Marathi', 'native': 'मराठी'},
+    'ms': {'english': 'Malay', 'native': 'Melayu'},
+    'mt': {'english': 'Maltese', 'native': 'Malti'},
+    'my': {'english': 'Burmese', 'native': 'မြန်မာဘာသာ'},
+    'nb-NO': {'english': 'Norwegian (Bokmål)', 'native': 'Norsk bokmål'},
+    'ne-NP': {'english': 'Nepali', 'native': 'नेपाली'},
+    'nl': {'english': 'Dutch', 'native': 'Nederlands'},
+    'nn-NO': {'english': 'Norwegian (Nynorsk)', 'native': 'Norsk nynorsk'},
+    'nr': {'english': 'Ndebele, South', 'native': 'isiNdebele'},
+    'nso': {'english': 'Northern Sotho', 'native': 'Sepedi'},
+    'oc': {'english': 'Occitan', 'native': 'occitan'},
+    'or': {'english': 'Odia', 'native': 'ଓଡ଼ିଆ'},
+    'pa': {'english': 'Punjabi', 'native': 'ਪੰਜਾਬੀ'},
+    'pa-IN': {'english': 'Punjabi (India)', 'native': 'ਪੰਜਾਬੀ (ਭਾਰਤ)'},
+    'pl': {'english': 'Polish', 'native': 'Polski'},
     'pt-BR': {
-        'english': u'Portuguese (Brazilian)',
-           'native': u'Portugu\xeas (do\xa0Brasil)'
-        },
-    'pt-PT': {
-        'english': u'Portuguese (Portugal)',
-           'native': u'Portugu\xeas (Europeu)'
-        },
-    'ro': {
-        'english': u'Romanian',
-        'native': u'Rom\xe2n\u0103'
+        'english': 'Portuguese (Brazilian)',
+        'native': 'Português (do\xa0Brasil)',
     },
-    'ru': {
-        'english': u'Russian',
-        'native': u'\u0420\u0443\u0441\u0441\u043a\u0438\u0439'
-    },
-    'sk': {
-        'english': u'Slovak',
-        'native': u'sloven\u010dina'
-    },
-    'sl': {
-        'english': u'Slovenian',
-        'native': u'Sloven\u0161\u010dina'
-    },
-    'sq': {
-        'english': u'Albanian',
-        'native': u'Shqip'
-    },
-    'sv-SE': {
-        'english': u'Swedish',
-        'native': u'Svenska'
-    },
-    'te': {
-        'english': u'Telugu',
-        'native': u'\u0c24\u0c46\u0c32\u0c41\u0c17\u0c41'
-    },
-    'th': {
-        'english': u'Thai',
-        'native': u'\u0e44\u0e17\u0e22'
-    },
-    'tr': {
-        'english': u'Turkish',
-        'native': u'T\xfcrk\xe7e'
-    },
-    'uk': {
-        'english': u'Ukrainian',
-        'native': u'\u0423\u043a\u0440\u0430\u0457\u043d\u0441\u044c\u043a\u0430'  # noqa
-    },
-    'ur': {
-        'english': u'Urdu',
-        'native': u'\u0627\u064f\u0631\u062f\u0648'
-    },
-    'vi': {
-        'english': u'Vietnamese',
-        'native': u'Ti\u1ebfng Vi\u1ec7t'
-    },
-    'zh-CN': {
-        'english': u'Chinese (Simplified)',
-        'native': u'\u4e2d\u6587 (\u7b80\u4f53)'
-        },
-    'zh-TW': {
-        'english': u'Chinese (Traditional)',
-        'native': u'\u6b63\u9ad4\u4e2d\u6587 (\u7e41\u9ad4)'
-    }
+    'pt-PT': {'english': 'Portuguese (Portugal)', 'native': 'Português (Europeu)'},
+    'rm': {'english': 'Romansh', 'native': 'rumantsch'},
+    'ro': {'english': 'Romanian', 'native': 'Română'},
+    'ru': {'english': 'Russian', 'native': 'Русский'},
+    'rw': {'english': 'Kinyarwanda', 'native': 'Ikinyarwanda'},
+    'sa': {'english': 'Sanskrit', 'native': 'संस्कृत'},
+    'sah': {'english': 'Sakha', 'native': 'Сахалыы'},
+    'sat': {'english': 'Santali', 'native': 'ᱥᱟᱱᱛᱟᱲᱤ'},
+    'si': {'english': 'Sinhala', 'native': 'සිංහල'},
+    'sk': {'english': 'Slovak', 'native': 'slovenčina'},
+    'skr': {'english': 'Saraiki', 'native': 'سرائیکی'},
+    'sl': {'english': 'Slovenian', 'native': 'Slovenščina'},
+    'son': {'english': 'Songhai', 'native': 'Soŋay'},
+    'sq': {'english': 'Albanian', 'native': 'Shqip'},
+    'sr': {'english': 'Serbian', 'native': 'Српски'},
+    'sr-Cyrl': {'english': 'Serbian', 'native': 'Српски'},
+    'sr-Latn': {'english': 'Serbian', 'native': 'Srpski'},
+    'ss': {'english': 'Siswati', 'native': 'siSwati'},
+    'st': {'english': 'Southern Sotho', 'native': 'Sesotho'},
+    'sv-SE': {'english': 'Swedish', 'native': 'Svenska'},
+    'sw': {'english': 'Swahili', 'native': 'Kiswahili'},
+    'ta': {'english': 'Tamil', 'native': 'தமிழ்'},
+    'ta-IN': {'english': 'Tamil (India)', 'native': 'தமிழ் (இந்தியா)'},
+    'ta-LK': {'english': 'Tamil (Sri Lanka)', 'native': 'தமிழ் (இலங்கை)'},
+    'te': {'english': 'Telugu', 'native': 'తెలుగు'},
+    'th': {'english': 'Thai', 'native': 'ไทย'},
+    'tl': {'english': 'Tagalog', 'native': 'Tagalog'},
+    'tn': {'english': 'Tswana', 'native': 'Setswana'},
+    'tr': {'english': 'Turkish', 'native': 'Türkçe'},
+    'ts': {'english': 'Tsonga', 'native': 'Xitsonga'},
+    'tsz': {'english': 'Purépecha', 'native': 'Purépecha'},
+    'tt-RU': {'english': 'Tatar', 'native': 'Tatarça'},
+    'uk': {'english': 'Ukrainian', 'native': 'Українська'},
+    'ur': {'english': 'Urdu', 'native': 'اُردو'},
+    'uz': {'english': 'Uzbek', 'native': 'Oʻzbek tili'},
+    've': {'english': 'Venda', 'native': 'Tshivenḓa'},
+    'vi': {'english': 'Vietnamese', 'native': 'Tiếng Việt'},
+    'wo': {'english': 'Wolof', 'native': 'Wolof'},
+    'x-testing': {'english': 'Testing', 'native': 'Ŧḗşŧīƞɠ'},
+    'xh': {'english': 'Xhosa', 'native': 'isiXhosa'},
+    'yo': {'english': 'Yoruba', 'native': 'Yorùbá'},
+    'zh-CN': {'english': 'Chinese (Simplified)', 'native': '中文 (简体)'},
+    'zh-TW': {'english': 'Chinese (Traditional)', 'native': '正體中文 (繁體)'},
+    'zu': {'english': 'Zulu', 'native': 'isiZulu'},
 }
+
+
+# these are used by prod and stage settings
+PROD_LANGUAGES = [
+    'cs',
+    'de',
+    'dsb',
+    'el',
+    'en-CA',
+    'en-GB',
+    'en-US',
+    'es-AR',
+    'es-CL',
+    'es-ES',
+    'es-MX',
+    'fa',
+    'fi',
+    'fr',
+    'fur',
+    'fy-NL',
+    'he',
+    'hr',
+    'hsb',
+    'hu',
+    'ia',
+    'it',
+    'ja',
+    'ka',
+    'kab',
+    'ko',
+    'nb-NO',
+    'nl',
+    'nn-NO',
+    'pl',
+    'pt-BR',
+    'pt-PT',
+    'ro',
+    'ru',
+    'sk',
+    'sl',
+    'sq',
+    'sr',
+    'sv-SE',
+    'tr',
+    'uk',
+    'vi',
+    'zh-CN',
+    'zh-TW',
+]
+
+# Languages we can support, but have to fake support for Babel.
+# See olympia.amo.utils.get_locale_from_lang
+LANGUAGES_NOT_IN_BABEL = [
+    'ach',
+    'azz',
+    'cak',
+    'csb',
+    'fj-FJ',
+    'son',
+    'tl',
+    'tsz',
+]
+
+# Languages we've historically supported for statistics, etc, but we can't use because
+# they have a format we don't support in urls
+UNSUPPORTED_LANGUAGES = [
+    'ca-valencia',
+    'ja-JP-mac',
+    'sr-Cyrl',
+    'sr-Latn',
+    'x-testing',
+]
+
+# Languages that we support on AMO
+# Overriden in prod (&stage) settings to locales that have a high % completeness
+AMO_LANGUAGES = [lang for lang in ALL_LANGUAGES if lang not in UNSUPPORTED_LANGUAGES]

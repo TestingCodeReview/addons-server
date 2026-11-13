@@ -1,26 +1,22 @@
-import waffle
+from rest_framework import serializers
+from rest_framework.exceptions import ParseError
 
-from olympia.lib.akismet.models import AkismetReport
-
-from .tasks import check_akismet_reports
-
-
-def maybe_check_with_akismet(request, instance, pre_save_body):
-    akismet_reports = get_rating_akismet_reports(
-        request, instance, pre_save_body)
-    if akismet_reports:
-        check_akismet_reports.delay([rep.id for rep in akismet_reports])
-    return akismet_reports != []
+from .models import RatingAggregate
 
 
-def get_rating_akismet_reports(request, instance, pre_save_body):
-    should_check = (
-        instance.body and instance.body != pre_save_body and
-        getattr(instance, 'user_responsible', None) == instance.user and
-        waffle.switch_is_active('akismet-spam-check'))
-    if should_check:
-        return [AkismetReport.create_for_rating(
-            instance,
-            request.META.get('HTTP_USER_AGENT'),
-            request.META.get('HTTP_REFERER'))]
-    return []
+def get_grouped_ratings(request, addon):
+    if 'show_grouped_ratings' in request.GET:
+        try:
+            show_grouped_ratings = serializers.BooleanField().to_internal_value(
+                request.GET['show_grouped_ratings']
+            )
+        except serializers.ValidationError as exc:
+            raise ParseError(
+                'show_grouped_ratings parameter should be a boolean'
+            ) from exc
+        if show_grouped_ratings and addon:
+            try:
+                aggregate = addon.ratingaggregate
+            except RatingAggregate.DoesNotExist:
+                aggregate = RatingAggregate()
+            return {idx: getattr(aggregate, f'count_{idx}') for idx in range(1, 6)}

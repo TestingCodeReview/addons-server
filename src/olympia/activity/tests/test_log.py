@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import json
 
 from olympia import amo, core
@@ -9,7 +8,7 @@ from olympia.users.models import UserProfile
 
 class LogTest(TestCase):
     def setUp(self):
-        super(LogTest, self).setUp()
+        super().setUp()
         u = UserProfile.objects.create(username='foo')
         core.set_user(u)
 
@@ -18,9 +17,9 @@ class LogTest(TestCase):
         If we get details, verify they are stored as JSON, and we get out what
         we put in.
         """
-        addon = addon_factory(name=u'kümar is awesome')
-        magic = {'title': u'nô', 'body': u'wày!'}
-        al = ActivityLog.create(amo.LOG.DELETE_RATING, 1, addon, details=magic)
+        addon = addon_factory(name='kümar is awesome')
+        magic = {'title': 'nô', 'body': 'wày!'}
+        al = ActivityLog.objects.create(amo.LOG.DELETE_RATING, 1, addon, details=magic)
 
         assert al.details == magic
         assert al._details == json.dumps(magic)

@@ -1,20 +1,7 @@
-import logging
-
+# ruff: noqa: F405
 from olympia.lib.settings_base import *  # noqa
+from olympia.core.languages import PROD_LANGUAGES
 
-
-CSP_BASE_URI += (
-    # Required for the legacy discovery pane.
-    'https://addons.allizom.org',
-)
-CDN_HOST = 'https://addons-stage-cdn.allizom.org'
-CSP_CONNECT_SRC += (CDN_HOST,)
-CSP_FONT_SRC += (CDN_HOST,)
-CSP_IMG_SRC += (CDN_HOST,)
-CSP_SCRIPT_SRC += (
-    CDN_HOST,
-)
-CSP_STYLE_SRC += (CDN_HOST,)
 
 ENGAGE_ROBOTS = False
 
@@ -25,120 +12,67 @@ EMAIL_BACKEND = EMAIL_URL['EMAIL_BACKEND']
 EMAIL_HOST_USER = EMAIL_URL['EMAIL_HOST_USER']
 EMAIL_HOST_PASSWORD = EMAIL_URL['EMAIL_HOST_PASSWORD']
 
-ENV = env('ENV')
-
 API_THROTTLING = True
 
 DOMAIN = env('DOMAIN', default='addons.allizom.org')
+SERVICES_DOMAIN = env('SERVICES_DOMAIN', default='services.addons.allizom.org')
 SERVER_EMAIL = 'zstage@addons.mozilla.org'
 SITE_URL = 'https://' + DOMAIN
-SERVICES_URL = env('SERVICES_URL',
-                   default='https://services.addons.allizom.org')
-STATIC_URL = '%s/static/' % CDN_HOST
-MEDIA_URL = '%s/user-media/' % CDN_HOST
+INTERNAL_SITE_URL = env('INTERNAL_SITE_URL', default='https://addons.allizom.org')
+EXTERNAL_SITE_URL = env('EXTERNAL_SITE_URL', default='https://addons.allizom.org')
+SERVICES_URL = 'https://' + SERVICES_DOMAIN
+STATIC_URL = '%s/static-server/' % EXTERNAL_SITE_URL
+MEDIA_URL = '%s/user-media/' % EXTERNAL_SITE_URL
 
-SESSION_COOKIE_DOMAIN = ".%s" % DOMAIN
+CONTENT_SECURITY_POLICY['DIRECTIVES']['font-src'] += (STATIC_URL,)
+# img-src already contains 'self', but we could be on reviewers or admin
+# domain and want to load things from the regular domain.
+CONTENT_SECURITY_POLICY['DIRECTIVES']['img-src'] += (MEDIA_URL, STATIC_URL)
+CONTENT_SECURITY_POLICY['DIRECTIVES']['script-src'] += (STATIC_URL,)
+CONTENT_SECURITY_POLICY['DIRECTIVES']['style-src'] += (STATIC_URL,)
+
+SESSION_COOKIE_DOMAIN = '.%s' % DOMAIN
 
 # Domain emails should be sent to.
-INBOUND_EMAIL_DOMAIN = env('INBOUND_EMAIL_DOMAIN',
-                           default='addons.allizom.org')
+INBOUND_EMAIL_DOMAIN = env('INBOUND_EMAIL_DOMAIN', default='addons.allizom.org')
 
 DATABASES = {
-    'default': get_db_config('DATABASES_DEFAULT_URL', charset='utf8mb4'),
-    'slave': get_db_config(
-        'DATABASES_SLAVE_URL', atomic_requests=False, charset='utf8mb4',
-    ),
+    'default': get_db_config('DATABASES_DEFAULT_URL'),
+    'replica': get_db_config('DATABASES_REPLICA_URL', atomic_requests=False),
 }
 
-SERVICES_DATABASE = get_db_config('SERVICES_DATABASE_URL')
-
-SLAVE_DATABASES = ['slave']
-
-CACHES = {}
-CACHES['default'] = env.cache('CACHES_DEFAULT')
-CACHES['default']['TIMEOUT'] = 500
-CACHES['default']['BACKEND'] = 'django.core.cache.backends.memcached.MemcachedCache'  # noqa
-CACHES['default']['KEY_PREFIX'] = CACHE_KEY_PREFIX
+REPLICA_DATABASES = ['replica']
 
 # Celery
 CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 
-LOGGING['loggers'].update({
-    'z.task': {'level': logging.DEBUG},
-    'z.pool': {'level': logging.ERROR},
-})
-
 # Update the logger name used for mozlog
 LOGGING['formatters']['json']['logger_name'] = 'http_app_addons_stage'
 
-csp = 'csp.middleware.CSPMiddleware'
-
 ES_TIMEOUT = 60
-ES_HOSTS = env('ES_HOSTS')
-ES_URLS = ['http://%s' % h for h in ES_HOSTS]
-ES_INDEXES = dict((k, '%s_%s' % (v, ENV)) for k, v in ES_INDEXES.items())
-
-CEF_PRODUCT = STATSD_PREFIX
-
-NEW_FEATURES = True
-
-REDIRECT_URL = 'https://outgoing.stage.mozaws.net/v1/'
-
-ADDONS_LINTER_BIN = 'node_modules/.bin/addons-linter'
-
-XSENDFILE_HEADER = 'X-Accel-Redirect'
+ES_INDEXES = {k: f'{v}_{ENV}' for k, v in ES_INDEXES.items()}
 
 ALLOW_SELF_REVIEWS = True
 
-PERSONA_DEFAULT_PAGES = 5
-
-NEWRELIC_ENABLE = env.bool('NEWRELIC_ENABLE', default=False)
-
-if NEWRELIC_ENABLE:
-    NEWRELIC_INI = '/etc/newrelic.d/%s.ini' % DOMAIN
-
 FXA_CONFIG = {
-    'default': {
-        'client_id': env('FXA_CLIENT_ID'),
-        'client_secret': env('FXA_CLIENT_SECRET'),
-        'content_host': 'https://accounts.firefox.com',
-        'oauth_host': 'https://oauth.accounts.firefox.com/v1',
-        'profile_host': 'https://profile.accounts.firefox.com/v1',
-        'redirect_url':
-            'https://%s/api/v3/accounts/authenticate/' % DOMAIN,
-        'scope': 'profile',
-    },
-    'amo': {
-        'client_id': env('AMO_FXA_CLIENT_ID'),
-        'client_secret': env('AMO_FXA_CLIENT_SECRET'),
-        'content_host': 'https://accounts.firefox.com',
-        'oauth_host': 'https://oauth.accounts.firefox.com/v1',
-        'profile_host': 'https://profile.accounts.firefox.com/v1',
-        'redirect_url':
-            'https://addons.allizom.org/api/v3/accounts/authenticate/',
-        'scope': 'profile',
-        'skip_register_redirect': True,
-    },
+    **FXA_CONFIG,
     'local': {
         'client_id': env('DEVELOPMENT_FXA_CLIENT_ID'),
         'client_secret': env('DEVELOPMENT_FXA_CLIENT_SECRET'),
-        'content_host': 'https://stable.dev.lcip.org',
-        'oauth_host': 'https://oauth-stable.dev.lcip.org/v1',
-        'profile_host': 'https://stable.dev.lcip.org/profile/v1',
-        'redirect_url': 'http://localhost:3000/fxa-authenticate',
-        'scope': 'profile',
+        # fxa redirects to http://localhost:3000/api/auth/authenticate-callback/?config=local
     },
 }
-DEFAULT_FXA_CONFIG_NAME = 'default'
-ALLOWED_FXA_CONFIGS = ['default', 'amo', 'local']
 
-TAAR_LITE_RECOMMENDATION_ENGINE_URL = env(
-    'TAAR_LITE_RECOMMENDATION_ENGINE_URL',
-    default=('https://taarlite.prod.mozaws.net/taarlite/api/v1/'
-             'addon_recommendations/'))
+FXA_ACTIVES_BIGQUERY_TABLE = (
+    'moz-fx-fxa-prod.fxa_rp_active_accounts.client_1e5a77cf09e5b4b5_active_accounts'
+)
 
-FXA_SQS_AWS_QUEUE_URL = (
-    'https://sqs.us-west-2.amazonaws.com/361527076523/'
-    'amo-account-change-stage')
+REMOTE_SETTINGS_WRITER_URL = env(
+    'REMOTE_SETTINGS_WRITER_URL', default='https://remote-settings.allizom.org/v1/'
+)
 
-VAMO_URL = 'https://versioncheck.allizom.org'
+CINDER_QUEUE_PREFIX = 'amo-stage-'
+
+ENABLE_ADMIN_MLBF_UPLOAD = True
+
+AMO_LANGUAGES = PROD_LANGUAGES

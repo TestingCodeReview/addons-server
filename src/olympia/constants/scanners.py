@@ -1,0 +1,195 @@
+# We prefix the scanners we no longer use with '_' but we need to keep the
+# constants for the model definition. We shouldn't use them, though.
+_CUSTOMS = 1
+_WAT = 2
+YARA = 3
+_MAD = 4
+NARC = 5
+WEBHOOK = 6
+
+SCANNERS = {
+    _CUSTOMS: 'customs (legacy)',
+    _WAT: 'wat',
+    YARA: 'yara',
+    _MAD: 'mad',
+    NARC: 'narc',
+    WEBHOOK: 'webhook',
+}
+
+# Action IDs are also used for severity (the higher, the more severe).
+# The field is a PositiveSmallIntegerField, it should go up to 65535.
+NO_ACTION = 1
+FLAG_FOR_HUMAN_REVIEW = 20
+DELAY_AUTO_APPROVAL = 100
+DELAY_AUTO_APPROVAL_INDEFINITELY = 200
+DELAY_AUTO_APPROVAL_INDEFINITELY_AND_RESTRICT = 300
+DELAY_AUTO_APPROVAL_INDEFINITELY_AND_RESTRICT_FUTURE_APPROVALS = 400
+DISABLE_AND_BLOCK = 500
+
+
+ACTIONS = {
+    NO_ACTION: 'No action',
+    FLAG_FOR_HUMAN_REVIEW: 'Flag for human review',
+    DELAY_AUTO_APPROVAL: 'Delay auto-approval',
+    DELAY_AUTO_APPROVAL_INDEFINITELY: 'Delay auto-approval indefinitely',
+    DELAY_AUTO_APPROVAL_INDEFINITELY_AND_RESTRICT: (
+        'Delay auto-approval indefinitely and add restrictions'
+    ),
+    DELAY_AUTO_APPROVAL_INDEFINITELY_AND_RESTRICT_FUTURE_APPROVALS: (
+        'Delay auto-approval indefinitely and add restrictions to future approvals'
+    ),
+    DISABLE_AND_BLOCK: ('Force-disable and block'),
+}
+
+NEW = 1
+RUNNING = 2
+ABORTED = 3
+COMPLETED = 4
+ABORTING = 5
+SCHEDULED = 6
+
+QUERY_RULE_STATES = {
+    NEW: 'New',
+    RUNNING: 'Running',
+    ABORTED: 'Aborted',
+    ABORTING: 'Aborting',
+    COMPLETED: 'Completed',
+    SCHEDULED: 'Scheduled',
+}
+
+# Query rules currently only support yara and narc.
+SCANNER_CHOICES_API = {
+    YARA: 'yara',
+    NARC: 'narc',
+}
+
+QUERY_RULE_STATES_CHOICES_API = {
+    NEW: 'new',
+    RUNNING: 'running',
+    ABORTED: 'aborted',
+    ABORTING: 'aborting',
+    COMPLETED: 'completed',
+    SCHEDULED: 'scheduled',
+}
+
+# Scanner service accounts group
+SCANNER_SERVICE_ACCOUNTS_GROUP = 'Service accounts for scanners'
+
+# Webhook events
+WEBHOOK_DURING_VALIDATION = 1
+WEBHOOK_ON_SOURCE_CODE_UPLOADED = 2
+WEBHOOK_ON_VERSION_CREATED = 3
+WEBHOOK_PUSH = 4
+WEBHOOK_ON_LISTING_CHANGED = 5
+WEBHOOK_ON_VERSION_SCANNED = 6
+WEBHOOK_ON_VERSION_ENTERED_REVIEW_QUEUE = 7
+
+WEBHOOK_EVENTS = {
+    WEBHOOK_DURING_VALIDATION: 'during_validation',
+    WEBHOOK_ON_SOURCE_CODE_UPLOADED: 'on_source_code_uploaded',
+    WEBHOOK_ON_VERSION_CREATED: 'on_version_created',
+    WEBHOOK_PUSH: 'push',
+    WEBHOOK_ON_LISTING_CHANGED: 'on_listing_changed',
+    WEBHOOK_ON_VERSION_SCANNED: 'on_version_scanned',
+    WEBHOOK_ON_VERSION_ENTERED_REVIEW_QUEUE: 'on_version_entered_review_queue',
+}
+
+# The events whose results are aggregated into the `on_version_scanned`
+# payload. We wait for all of them before sending it.
+WEBHOOK_EVENTS_AGGREGATED_BY_ON_VERSION_SCANNED = [
+    WEBHOOK_DURING_VALIDATION,
+    WEBHOOK_ON_VERSION_CREATED,
+]
+
+# Events we wait on before auto-approving a version.
+WEBHOOK_EVENTS_BLOCKING_AUTO_APPROVAL = [
+    *WEBHOOK_EVENTS_AGGREGATED_BY_ON_VERSION_SCANNED,
+    WEBHOOK_ON_VERSION_SCANNED,
+]
+
+# Events whose results trigger scanner actions as soon as they are received.
+WEBHOOK_EVENTS_SHOULD_RUN_ACTIONS_ON_RESULTS = [
+    WEBHOOK_ON_LISTING_CHANGED,
+    WEBHOOK_ON_SOURCE_CODE_UPLOADED,
+    WEBHOOK_ON_VERSION_ENTERED_REVIEW_QUEUE,
+    WEBHOOK_PUSH,
+]
+
+# Number of retries before we give up on the scanners for a version.
+WEBHOOK_MAX_RETRIES = 12
+
+# Special rule name used as fallback when a scanner has no better rule to
+# associate with an annotation.
+ANNOTATIONS_RULE_NAME = 'ANNOTATIONS'
+
+# Special rule name used when a scanner never sent its results for a version.
+SCANNER_RESULTS_MISSING_RULE_NAME = 'SCANNER_RESULTS_MISSING'
+
+# Special empty configuration schema to use when the rule is being created
+EMPTY_RULE_CONFIGURATION_SCHEMA = {
+    'type': 'object',
+    'keys': {},
+}
+
+# Default configuration for rules other than NARC.
+DEFAULT_RULE_CONFIGURATION_SCHEMA = EMPTY_RULE_CONFIGURATION_SCHEMA
+
+# Narc configuration schema
+NARC_RULE_CONFIGURATION_SCHEMA = {
+    'type': 'object',
+    'keys': {
+        'examine_slug': {
+            'type': 'boolean',
+            'default': False,
+            'helpText': (
+                'Run the rule against the add-on slug used for the listing on AMO'
+            ),
+        },
+        'examine_listing_names': {
+            'type': 'boolean',
+            'default': True,
+            'helpText': (
+                'Run the rule against the add-on name(s) used for the listing on AMO'
+            ),
+        },
+        'examine_listing_summaries': {
+            'type': 'boolean',
+            'default': False,
+            'helpText': (
+                'Run the rule against the add-on summary/summaries used for the '
+                'listing on AMO'
+            ),
+        },
+        'examine_xpi_names': {
+            'type': 'boolean',
+            'default': True,
+            'helpText': 'Run the rule against the add-on name(s) in the XPI',
+        },
+        'examine_xpi_descriptions': {
+            'type': 'boolean',
+            'default': False,
+            'helpText': 'Run the rule against the add-on description(s) in the XPI',
+        },
+        'examine_authors_names': {
+            'type': 'boolean',
+            'default': True,
+            'helpText': (
+                'Run the rule against the name of each author attached to the add-on'
+            ),
+        },
+        'examine_normalized_variants': {
+            'type': 'boolean',
+            'default': True,
+            'helpText': (
+                'For each string being examined, also examine a normalized variant'
+            ),
+        },
+        'examine_homoglyphs_variants': {
+            'type': 'boolean',
+            'default': True,
+            'helpText': (
+                'For each string being examined, also examine homoglyphs variants'
+            ),
+        },
+    },
+}

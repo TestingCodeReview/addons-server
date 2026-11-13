@@ -1,0 +1,158 @@
+import { css, html, LitElement, nothing } from 'lit';
+import { customElement, property } from 'lit/decorators.js';
+import { BASE } from '../base';
+import { type Addon, resolveListingState } from '../data';
+import '../foundations/badges';
+import './addon-actions-menu';
+
+// Host only (strip scheme/path) for the compact homepage link in the stats row.
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+}
+
+@customElement('addon-manage-header')
+export class AddonManageHeader extends LitElement {
+  @property({ attribute: false }) addon!: Addon;
+
+  static styles = css`
+    :host {
+      display: block;
+    }
+    moz-breadcrumb-group {
+      display: block;
+      margin: var(--space-large) 0;
+    }
+    .bar {
+      display: flex;
+      align-items: flex-start;
+      gap: var(--space-large);
+    }
+    .logo {
+      width: 56px;
+      height: 56px;
+      border-radius: var(--border-radius-medium, 8px);
+      flex: none;
+    }
+    .body {
+      flex: 1;
+      min-width: 0;
+    }
+    .title {
+      display: flex;
+      align-items: center;
+      gap: var(--space-xlarge);
+      margin-bottom: var(--space-xsmall);
+    }
+    h1 {
+      margin: 0;
+      font-size: 1.5rem;
+    }
+    .tagline {
+      margin: 0 0 var(--space-small);
+      color: var(--text-color-deemphasized, GrayText);
+    }
+    .stats {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: var(--space-xsmall) var(--space-small);
+      color: var(--text-color-deemphasized, GrayText);
+    }
+    .stats .sep {
+      opacity: 0.5;
+    }
+    .stats a {
+      color: var(--link-color, LinkText);
+    }
+    .rating {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--space-xxsmall);
+    }
+    .actions {
+      flex: none;
+      display: flex;
+      align-items: center;
+      gap: var(--space-medium);
+    }
+  `;
+
+  #stats() {
+    const a = this.addon;
+    const parts = [];
+    if (a.rating != null) {
+      parts.push(html`
+        <span class="rating">
+          <moz-five-star rating=${a.rating}></moz-five-star>
+          ${a.rating.toFixed(1)}${
+            a.reviewCount != null ? html` (${a.reviewCount} reviews)` : nothing
+          }
+        </span>
+      `);
+    }
+    if (a.averageDailyUsers != null) {
+      parts.push(
+        html`<span>${a.averageDailyUsers.toLocaleString('en-US')} users</span>`,
+      );
+    }
+    if (a.homepageUrl) {
+      parts.push(
+        html`<a href=${a.homepageUrl} target="_blank" rel="noopener"
+          >${hostOf(a.homepageUrl)}</a
+        >`,
+      );
+    }
+    parts.push(html`<span>Last updated ${a.lastUpdated}</span>`);
+    if (a.listingUrl) {
+      parts.push(
+        html`<a href=${a.listingUrl} target="_blank" rel="noopener"
+          >View listing page</a
+        >`,
+      );
+    }
+    return parts.flatMap((p, i) =>
+      i === 0 ? [p] : [html`<span class="sep">·</span>`, p],
+    );
+  }
+
+  render() {
+    const a = this.addon;
+    const state = resolveListingState(a.status, a.visibility);
+    return html`
+      <moz-breadcrumb-group label="Breadcrumb">
+        <moz-breadcrumb href="${BASE}/">Dashboard</moz-breadcrumb>
+        <moz-breadcrumb>${a.name}</moz-breadcrumb>
+      </moz-breadcrumb-group>
+      <div class="bar">
+        ${
+          a.iconUrl
+            ? html`<img class="logo" src=${a.iconUrl} alt="" />`
+            : undefined
+        }
+        <div class="body">
+          <div class="title">
+            <h1>${a.name}</h1>
+            <div class="actions">
+              <listing-status-badge type=${state.badge}>
+                ${state.label}
+              </listing-status-badge>
+              <addon-actions-menu .addon=${a}></addon-actions-menu>
+            </div>
+          </div>
+          ${a.summary ? html`<p class="tagline">${a.summary}</p>` : nothing}
+          <div class="stats">${this.#stats()}</div>
+        </div>
+      </div>
+    `;
+  }
+}
+
+declare global {
+  interface HTMLElementTagNameMap {
+    'addon-manage-header': AddonManageHeader;
+  }
+}

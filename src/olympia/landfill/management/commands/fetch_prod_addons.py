@@ -1,15 +1,15 @@
-import requests
-import six
 import uuid
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.db.transaction import atomic
 
+import requests
+
 from olympia import amo
+from olympia.addons.models import Addon
 from olympia.amo.tests import addon_factory, user_factory
 from olympia.constants.categories import CATEGORIES
-from olympia.addons.models import Addon, Category
 from olympia.users.models import UserProfile
 
 
@@ -19,30 +19,33 @@ class KeyboardInterruptError(Exception):
 
 class Command(BaseCommand):
     """Download and save all AMO add-ons public data."""
-    SEARCH_API_URL = 'https://addons.mozilla.org/api/v4/addons/search/'
+
+    SEARCH_API_URL = 'https://addons.mozilla.org/api/v5/addons/search/'
 
     def add_arguments(self, parser):
         parser.add_argument(
-            '--max', metavar='max', type=int,
-            help='max amount of pages to fetch.'
+            '--max', metavar='max', type=int, help='max amount of pages to fetch.'
         )
         parser.add_argument(
-            '--guid', metavar='guid', type=str,
-            help='specific guid(s) to fetch.'
+            '--guid', metavar='guid', type=str, help='specific guid(s) to fetch.'
         )
         parser.add_argument(
-            '--type', metavar='type', type=str,
-            help='only consider this specific add-on type'
+            '--type',
+            metavar='type',
+            type=str,
+            help='only consider this specific add-on type',
         )
         parser.add_argument(
-            '--query', metavar='type', type=six.text_type,
-            help='only consider add-ons matching this query'
+            '--query',
+            metavar='type',
+            type=str,
+            help='only consider add-ons matching this query',
         )
 
     def handle(self, *args, **options):
-        if not settings.DEBUG:
+        if not settings.DEV_MODE:
             raise CommandError(
-                'As a safety precaution this command only works if DEBUG=True.'
+                'As a safety precaution this command only works in DEV_MODE.'
             )
         self.fetch_addon_data(options)
 
@@ -53,9 +56,7 @@ class Command(BaseCommand):
     def _get_addons_from_page(self, page, params=None):
         data = []
         print('fetching %s' % page)
-        query_params = {
-            'page': page
-        }
+        query_params = {'page': page}
         if params:
             query_params.update(params)
         response = requests.get(self.SEARCH_API_URL, params=query_params)
@@ -68,21 +69,17 @@ class Command(BaseCommand):
 
     def _handle_addon(self, addon_data):
         version = addon_data['current_version']
-        files = version['files'] or []
-
-        file_kw = {}
+        file_data = version['file']
 
         try:
             file_kw = {
-                'hash': files[0]['hash'],
-                'status': amo.STATUS_CHOICES_API_LOOKUP[files[0]['status']],
-                'platform': amo.PLATFORM_DICT[files[0]['platform']].id,
-                'size': files[0]['size'],
-                'is_webextension': files[0]['is_webextension'],
+                'hash': file_data['hash'],
+                'status': amo.STATUS_CHOICES_API_LOOKUP[file_data['status']],
+                'size': file_data['size'],
                 'is_mozilla_signed_extension': (
-                    files[0]['is_mozilla_signed_extension']),
-                'strict_compatibility': (
-                    version['is_strict_compatibility_enabled'])
+                    file_data['is_mozilla_signed_extension']
+                ),
+                'strict_compatibility': (version['is_strict_compatibility_enabled']),
             }
         except (KeyError, IndexError):
             file_kw = {}
@@ -97,8 +94,10 @@ class Command(BaseCommand):
             print('Skipping %s (slug already exists)' % addon_data['slug'])
             return
 
-        if addon_data['guid'] and Addon.objects.filter(
-                guid=addon_data['guid']).exists():
+        if (
+            addon_data['guid']
+            and Addon.objects.filter(guid=addon_data['guid']).exists()
+        ):
             print('Skipping %s (guid already exists)' % addon_data['guid'])
             return
 
@@ -118,13 +117,11 @@ class Command(BaseCommand):
         else:
             category = None
 
-        if category not in CATEGORIES[amo.FIREFOX.id][addon_type]:
+        if category not in CATEGORIES[addon_type]:
             category = None
             print('Category %s' % category, 'not found')
         else:
-            category = Category.from_static_category(
-                CATEGORIES[amo.FIREFOX.id][addon_type][category],
-                True)
+            category = CATEGORIES[addon_type][category]
 
         print('Creating add-on %s' % addon_data['slug'])
 
@@ -170,7 +167,7 @@ class Command(BaseCommand):
         pages = range(1, self.get_max_pages(params) + 1)
 
         if options.get('max'):
-            pages = pages[:options.get('max')]
+            pages = pages[: options.get('max')]
 
         print('Fetching pages from 1 to %s' % max(pages))
         for page in pages:

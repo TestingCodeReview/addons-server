@@ -1,38 +1,23 @@
 from django.template import loader
 
 import jinja2
-
+import markupsafe
 from django_jinja import library
 
 from olympia import amo
-from olympia.access import acl
 from olympia.addons.models import Addon
-from olympia.bandwagon.models import Collection
 
 
 @library.global_function
-@jinja2.contextfunction
-def report_menu(context, request, report, obj=None):
-    """Reports Menu. navigation for the various statistic reports."""
-    if obj:
-        if isinstance(obj, Addon):
-            has_privs = False
-            if (request.user.is_authenticated and (
-                    acl.action_allowed(request, amo.permissions.STATS_VIEW) or
-                    obj.has_author(request.user))):
-                has_privs = True
-            t = loader.get_template('stats/addon_report_menu.html')
-            c = {
-                'addon': obj,
-                'has_privs': has_privs
-            }
-            return jinja2.Markup(t.render(c))
-        if isinstance(obj, Collection):
-            t = loader.get_template('stats/collection_report_menu.html')
-            c = {
-                'collection': obj,
-            }
-            return jinja2.Markup(t.render(c))
-
-    t = loader.get_template('stats/global_report_menu.html')
-    return jinja2.Markup(t.render())
+@jinja2.pass_context
+def report_menu(context, request, report, obj):
+    """Renders navigation for the various statistic reports."""
+    if isinstance(obj, Addon):
+        tpl = loader.get_template('stats/addon_report_menu.html')
+        ctx = {
+            'has_listed_versions': obj.has_version_in_channel(
+                amo.CHANNEL_LISTED, include_deleted=True
+            ),
+            'slug_or_id': obj.id if obj.is_deleted else obj.slug,
+        }
+        return markupsafe.Markup(tpl.render(ctx))

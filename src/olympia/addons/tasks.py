@@ -1,160 +1,91 @@
 import hashlib
-import os
-import uuid
+import mimetypes
+from datetime import date
 
-from datetime import datetime
-
-from django.conf import settings
 from django.core.files.storage import default_storage as storage
 from django.db import transaction
-from django.forms import ValidationError
-from django.utils import translation
+from django.db.models import Q, Value
+from django.db.models.functions import Collate
 
-import six
-import waffle
-
-from django_statsd.clients import statsd
-from elasticsearch_dsl import Search
-from PIL import Image
+from elasticsearch.dsl import Search
 
 import olympia.core
-
 from olympia import activity, amo
 from olympia.addons.indexers import AddonIndexer
 from olympia.addons.models import (
-    Addon, AddonCategory, AppSupport, Category, CompatOverride,
-    IncompatibleVersions, MigratedLWT, Persona, Preview, attach_tags,
-    attach_translations)
-from olympia.addons.utils import (
-    build_static_theme_xpi_from_lwt, build_webext_dictionary_from_legacy)
-from olympia.bandwagon.models import CollectionAddon
-from olympia.amo.celery import pause_all_tasks, resume_all_tasks, task
+    Addon,
+    DeniedGuid,
+    DisabledAddonContent,
+    Preview,
+    attach_tags,
+    attach_translations_dict,
+)
+from olympia.addons.utils import compute_last_updated, remove_icons
+from olympia.amo.celery import task
 from olympia.amo.decorators import set_modified_on, use_primary_db
-from olympia.amo.storage_utils import rm_stored_dir
-from olympia.amo.templatetags.jinja_helpers import user_media_path
 from olympia.amo.utils import (
-    ImageCheck, LocalFileStorage, StopWatch, cache_ns_key,
-    extract_colors_from_image, pngcrush_image)
-from olympia.applications.models import AppVersion
-from olympia.constants.categories import CATEGORIES
-from olympia.constants.licenses import (
-    LICENSE_COPYRIGHT_AR, PERSONA_LICENSES_IDS)
-from olympia.files.models import File, FileUpload
-from olympia.files.utils import (
-    RDFExtractor, SafeZip, get_file, get_filepath, parse_addon)
-from olympia.lib.crypto.signing import sign_file
-from olympia.lib.es.utils import index_objects
-from olympia.ratings.models import Rating
-from olympia.reviewers.models import RereviewQueueTheme
-from olympia.stats.utils import migrate_theme_update_count
-from olympia.tags.models import AddonTag, Tag
-from olympia.translations.models import Translation
-from olympia.users.models import UserProfile
-from olympia.versions.models import (
-    generate_static_theme_preview, License, Version, VersionPreview)
+    SafeStorage,
+    backup_storage_enabled,
+    copy_file_to_backup_storage,
+    download_file_contents_from_backup_storage,
+    extract_colors_from_image,
+)
+from olympia.devhub.tasks import resize_image
+from olympia.files.models import File
+from olympia.files.utils import get_filepath, parse_addon
+from olympia.reviewers.models import NeedsHumanReview, UsageTier
+from olympia.search.utils import get_es, index_objects, unindex_objects
+from olympia.users.utils import get_task_user
+from olympia.versions.models import Version, VersionPreview
+from olympia.versions.tasks import generate_static_theme_preview
 
 
 log = olympia.core.logger.getLogger('z.task')
 
 
+MINIMUM_ADU_FOR_HOTNESS_NONTHEME = 100
+MINIMUM_ADU_FOR_HOTNESS_THEME = 250
+
+
 @task
 @use_primary_db
 def version_changed(addon_id, **kw):
-    update_last_updated(addon_id)
-    update_appsupport([addon_id])
-
-
-def update_last_updated(addon_id):
-    queries = Addon._last_updated_queries()
     try:
         addon = Addon.objects.get(pk=addon_id)
     except Addon.DoesNotExist:
-        log.info('[1@None] Updating last updated for %s failed, no addon found'
-                 % addon_id)
+        log.info(
+            '[1@None] Updating last updated for %s failed, no addon found' % addon_id
+        )
         return
-
-    log.info('[1@None] Updating last updated for %s.' % addon_id)
-
-    if addon.is_persona():
-        q = 'personas'
-    elif addon.status == amo.STATUS_PUBLIC:
-        q = 'public'
-    else:
-        q = 'exp'
-    qs = queries[q].filter(pk=addon_id).using('default')
-    res = qs.values_list('id', 'last_updated')
-    if res:
-        pk, t = res[0]
-        Addon.objects.filter(pk=pk).update(last_updated=t)
-
-
-@task
-@use_primary_db
-def update_appsupport(ids, **kw):
-    log.info("[%s@None] Updating appsupport for %s." % (len(ids), ids))
-
-    addons = Addon.objects.filter(id__in=ids).no_transforms()
-    support = []
-    for addon in addons:
-        for app, appver in addon.compatible_apps.items():
-            if appver is None:
-                # Fake support for all version ranges.
-                min_, max_ = 0, 999999999999999999
-            else:
-                min_, max_ = appver.min.version_int, appver.max.version_int
-
-            support.append(AppSupport(addon=addon, app=app.id,
-                                      min=min_, max=max_))
-
-    if not support:
-        return
-
-    with transaction.atomic():
-        AppSupport.objects.filter(addon__id__in=ids).delete()
-        AppSupport.objects.bulk_create(support)
+    log.info('[1@None] Updating last updated for %s.' % addon.pk)
+    addon.update(last_updated=compute_last_updated(addon))
 
 
 @task
 def update_addon_average_daily_users(data, **kw):
-    log.info("[%s] Updating add-ons ADU totals." % (len(data)))
+    log.info('[%s] Updating add-ons ADU totals.' % (len(data)))
 
-    if not waffle.switch_is_active('local-statistics-processing'):
-        return False
-
-    for pk, count in data:
+    for addon_guid, count in data:
         try:
-            addon = Addon.objects.get(pk=pk)
+            # guids are technically case-insensitive in AMO, but not in
+            # BigQuery, so we may be receiving the same guid multiple times in
+            # different cases. We want to avoid accidentally overwriting the
+            # value in the database, so we force an exact match here.
+            addon = (
+                Addon.unfiltered.all()
+                .no_transforms()
+                .get(guid=Collate(Value(addon_guid), 'utf8mb4_bin'))
+            )
         except Addon.DoesNotExist:
             # The processing input comes from metrics which might be out of
             # date in regards to currently existing add-ons
             m = "Got an ADU update (%s) but the add-on doesn't exist (%s)"
-            log.debug(m % (count, pk))
+            log.info(m % (count, addon_guid))
             continue
 
-        addon.update(average_daily_users=int(float(count)))
-
-
-@task
-def update_addon_download_totals(data, **kw):
-    log.info('[%s] Updating add-ons download+average totals.' % (len(data)))
-
-    if not waffle.switch_is_active('local-statistics-processing'):
-        return False
-
-    for pk, sum_download_counts in data:
-        try:
-            addon = Addon.objects.get(pk=pk)
-            # Don't trigger a save unless we have to (the counts may not have
-            # changed)
-            if (sum_download_counts and
-                    addon.total_downloads != sum_download_counts):
-                addon.update(total_downloads=sum_download_counts)
-        except Addon.DoesNotExist:
-            # We exclude deleted add-ons in the cron, but an add-on could have
-            # been deleted by the time the task is processed.
-            msg = ("Got new download totals (total=%s) but the add-on"
-                   "doesn't exist (%s)" % (sum_download_counts, pk))
-            log.debug(msg)
+        average_daily_users = int(float(count))
+        if addon.average_daily_users != average_daily_users:
+            addon.update(average_daily_users=average_daily_users)
 
 
 @task
@@ -162,268 +93,119 @@ def delete_preview_files(id, **kw):
     Preview.delete_preview_files(sender=None, instance=Preview(id=id))
 
 
+@task
+@use_primary_db
+def delete_all_addon_media_with_backup(id, **kwargs):
+    """Delete all media files for a given add-on by id, backing them up to
+    reported content bucket in cloud storage.
+
+    Used when force-disabling an add-on."""
+    addon = Addon.unfiltered.all().get(pk=id)
+    disabled_addon_content = DisabledAddonContent.objects.get_or_create(addon=addon)[0]
+
+    if addon.icon_type:
+        icon_path = None
+        for size in ['original'] + sorted(amo.ADDON_ICON_SIZES, reverse=True):
+            _icon_path = addon.get_icon_path(size)
+            if storage.exists(_icon_path):
+                icon_path = _icon_path
+                break
+        if backup_storage_enabled() and icon_path:
+            backup_file_name = copy_file_to_backup_storage(icon_path, addon.icon_type)
+            disabled_addon_content.update(icon_backup_name=backup_file_name)
+        remove_icons(addon)
+
+    for preview in addon.previews.all():
+        if not storage.exists(preview.original_path):
+            continue
+        if backup_storage_enabled() and storage.exists(preview.original_path):
+            backup_file_name = copy_file_to_backup_storage(
+                preview.original_path, mimetypes.guess_type(preview.original_path)[0]
+            )
+            disabled_addon_content.deletedpreviewfile_set.create(
+                preview=preview, backup_name=backup_file_name
+            )
+        preview.__class__.delete_preview_files(sender=None, instance=preview)
+
+    for preview in VersionPreview.objects.filter(version__addon=addon):
+        # VersionPreview are automatically generated from the xpi file so they
+        # don't require a dedicated backup.
+        preview.__class__.delete_preview_files(sender=None, instance=preview)
+
+
+@task
+@use_primary_db
+def restore_all_addon_media_from_backup(id, **kwargs):
+    addon = Addon.unfiltered.all().get(pk=id)
+    disabled_addon_content = DisabledAddonContent.objects.filter(addon=addon).last()
+    if disabled_addon_content:
+        log.info('Found some disable content to restore for addon %s', addon.pk)
+        if backup_storage_enabled():
+            if disabled_addon_content.icon_backup_name and (
+                icon_contents := download_file_contents_from_backup_storage(
+                    disabled_addon_content.icon_backup_name
+                )
+            ):
+                icon_path = addon.get_icon_path('original')
+                log.info('Restoring icon %s for addon %s', icon_path, addon.pk)
+                with storage.open(icon_path, 'wb') as original_file:
+                    original_file.write(icon_contents)
+                resize_icon.delay(
+                    icon_path,
+                    addon.pk,
+                    amo.ADDON_ICON_SIZES,
+                    set_modified_on=addon.serializable_reference(),
+                )
+            for deleted_preview in disabled_addon_content.deletedpreviewfile_set.all():
+                preview = deleted_preview.preview
+                if preview_contents := download_file_contents_from_backup_storage(
+                    deleted_preview.backup_name
+                ):
+                    preview_path = preview.original_path
+                    log.info(
+                        'Restoring preview %s for addon %s', preview_path, addon.pk
+                    )
+                    with storage.open(preview_path, 'wb') as original_file:
+                        original_file.write(preview_contents)
+                    resize_preview.delay(
+                        preview_path,
+                        preview.pk,
+                        set_modified_on=addon.serializable_reference(),
+                    )
+        else:
+            log.info(
+                'Backup storage disabled, not restoring content for addon %s', addon.pk
+            )
+        disabled_addon_content.delete()
+    if addon.type == amo.ADDON_STATICTHEME:
+        recreate_theme_previews.delay([addon.pk])
+
+
 @task(acks_late=True)
+@use_primary_db
 def index_addons(ids, **kw):
-    log.info('Indexing addons %s-%s. [%s]' % (ids[0], ids[-1], len(ids)))
-    transforms = (attach_tags, attach_translations)
-    index_objects(ids, Addon, AddonIndexer.extract_document,
-                  kw.pop('index', None), transforms, Addon.unfiltered)
-
-
-@task
-def unindex_addons(ids, **kw):
-    for addon in ids:
-        log.info('Removing addon [%s] from search index.' % addon)
-        Addon.unindex(addon)
-
-
-@task
-def delete_persona_image(dst, **kw):
-    log.info('[1@None] Deleting persona image: %s.' % dst)
-    if not dst.startswith(user_media_path('addons')):
-        log.error("Someone tried deleting something they shouldn't: %s" % dst)
-        return
-    try:
-        storage.delete(dst)
-    except Exception as e:
-        log.error('Error deleting persona image: %s' % e)
-
-
-@set_modified_on
-def create_persona_preview_images(src, full_dst, **kw):
-    """
-    Creates a 680x100 thumbnail used for the Persona preview and
-    a 32x32 thumbnail used for search suggestions/detail pages.
-    """
-    log.info('[1@None] Resizing persona images: %s' % full_dst)
-    preview, full = amo.PERSONA_IMAGE_SIZES['header']
-    preview_w, preview_h = preview
-    orig_w, orig_h = full
-    with storage.open(src) as fp:
-        i_orig = i = Image.open(fp)
-
-        # Crop image from the right.
-        i = i.crop((orig_w - (preview_w * 2), 0, orig_w, orig_h))
-
-        # Resize preview.
-        i = i.resize(preview, Image.ANTIALIAS)
-        i.load()
-        with storage.open(full_dst[0], 'wb') as fp:
-            i.save(fp, 'png')
-
-        _, icon_size = amo.PERSONA_IMAGE_SIZES['icon']
-        icon_w, icon_h = icon_size
-
-        # Resize icon.
-        i = i_orig
-        i.load()
-        i = i.crop((orig_w - (preview_h * 2), 0, orig_w, orig_h))
-        i = i.resize(icon_size, Image.ANTIALIAS)
-        i.load()
-        with storage.open(full_dst[1], 'wb') as fp:
-            i.save(fp, 'png')
-    pngcrush_image(full_dst[0])
-    pngcrush_image(full_dst[1])
-    return True
-
-
-@set_modified_on
-def save_persona_image(src, full_dst, **kw):
-    """Creates a PNG of a Persona header image."""
-    log.info('[1@None] Saving persona image: %s' % full_dst)
-    img = ImageCheck(storage.open(src))
-    if not img.is_image():
-        log.error('Not an image: %s' % src, exc_info=True)
-        return
-    with storage.open(src, 'rb') as fp:
-        i = Image.open(fp)
-        with storage.open(full_dst, 'wb') as fp:
-            i.save(fp, 'png')
-    pngcrush_image(full_dst)
-    return True
-
-
-@task
-def update_incompatible_appversions(data, **kw):
-    """Updates the incompatible_versions table for this version."""
-    log.info('Updating incompatible_versions for %s versions.' % len(data))
-
-    addon_ids = set()
-
-    for version_id in data:
-        # This is here to handle both post_save and post_delete hooks.
-        IncompatibleVersions.objects.filter(version=version_id).delete()
-
-        try:
-            version = Version.objects.get(pk=version_id)
-        except Version.DoesNotExist:
-            log.info('Version ID [%d] not found. Incompatible versions were '
-                     'cleared.' % version_id)
-            return
-
-        addon_ids.add(version.addon_id)
-
-        try:
-            compat = CompatOverride.objects.get(addon=version.addon)
-        except CompatOverride.DoesNotExist:
-            log.info('Compat override for addon with version ID [%d] not '
-                     'found. Incompatible versions were cleared.' % version_id)
-            return
-
-        app_ranges = []
-        ranges = compat.collapsed_ranges()
-
-        for range in ranges:
-            if range.min == '0' and range.max == '*':
-                # Wildcard range, add all app ranges
-                app_ranges.extend(range.apps)
-            else:
-                # Since we can't rely on add-on version numbers, get the min
-                # and max ID values and find versions whose ID is within those
-                # ranges, being careful with wildcards.
-                min_id = max_id = None
-
-                if range.min == '0':
-                    versions = (Version.objects.filter(addon=version.addon_id)
-                                .order_by('id')
-                                .values_list('id', flat=True)[:1])
-                    if versions:
-                        min_id = versions[0]
-                else:
-                    try:
-                        min_id = Version.objects.get(addon=version.addon_id,
-                                                     version=range.min).id
-                    except Version.DoesNotExist:
-                        pass
-
-                if range.max == '*':
-                    versions = (Version.objects.filter(addon=version.addon_id)
-                                .order_by('-id')
-                                .values_list('id', flat=True)[:1])
-                    if versions:
-                        max_id = versions[0]
-                else:
-                    try:
-                        max_id = Version.objects.get(addon=version.addon_id,
-                                                     version=range.max).id
-                    except Version.DoesNotExist:
-                        pass
-
-                if min_id and max_id:
-                    if min_id <= version.id <= max_id:
-                        app_ranges.extend(range.apps)
-
-        for app_range in app_ranges:
-            IncompatibleVersions.objects.create(version=version,
-                                                app=app_range.app.id,
-                                                min_app_version=app_range.min,
-                                                max_app_version=app_range.max)
-            log.info('Added incompatible version for version ID [%d]: '
-                     'app:%d, %s -> %s' % (version_id, app_range.app.id,
-                                           app_range.min, app_range.max))
-
-    # Increment namespace cache of compat versions.
-    for addon_id in addon_ids:
-        cache_ns_key('d2c-versions:%s' % addon_id, increment=True)
-
-
-def make_checksum(header_path):
-    ls = LocalFileStorage()
-    raw_checksum = ls._open(header_path).read()
-    return hashlib.sha224(raw_checksum).hexdigest()
-
-
-def theme_checksum(theme, **kw):
-    theme.checksum = make_checksum(theme.header_path)
-    dupe_personas = Persona.objects.filter(checksum=theme.checksum)
-    if dupe_personas.exists():
-        theme.dupe_persona = dupe_personas[0]
-    theme.save()
-
-
-def rereviewqueuetheme_checksum(rqt, **kw):
-    """Check for possible duplicate theme images."""
-    dupe_personas = Persona.objects.filter(
-        checksum=make_checksum(rqt.header_path or rqt.theme.header_path)
+    """Adds, removes, or updates, add-on objects in the elasticsearch index(es)."""
+    queryset = (
+        Addon.objects.public()
+        .filter(id__in=ids)
+        .transform(attach_tags)
+        .transform(attach_translations_dict)
     )
-    if dupe_personas.exists():
-        rqt.dupe_persona = dupe_personas[0]
-        rqt.save()
+    index_ids = list(queryset.values_list('pk', flat=True))
+    exclude_ids = [pk for pk in ids if pk not in index_ids]
 
-
-@task
-@use_primary_db
-def save_theme(header, addon_pk, **kw):
-    """Save theme image and calculates checksum after theme save."""
-    addon = Addon.objects.get(pk=addon_pk)
-    dst_root = os.path.join(user_media_path('addons'), str(addon.id))
-    header = os.path.join(settings.TMP_PATH, 'persona_header', header)
-    header_dst = os.path.join(dst_root, 'header.png')
-
-    try:
-        save_persona_image(src=header, full_dst=header_dst)
-        create_persona_preview_images(
-            src=header, full_dst=[os.path.join(dst_root, 'preview.png'),
-                                  os.path.join(dst_root, 'icon.png')],
-            set_modified_on=addon.serializable_reference())
-        theme_checksum(addon.persona)
-    except IOError:
-        addon.delete()
-        raise
-
-
-@task
-@use_primary_db
-def save_theme_reupload(header, addon_pk, **kw):
-    addon = Addon.objects.get(pk=addon_pk)
-    header_dst = None
-    dst_root = os.path.join(user_media_path('addons'), str(addon.id))
-
-    try:
-        if header:
-            header = os.path.join(settings.TMP_PATH, 'persona_header', header)
-            header_dst = os.path.join(dst_root, 'pending_header.png')
-            save_persona_image(src=header, full_dst=header_dst)
-    except IOError as e:
-        log.error(str(e))
-        raise
-
-    if header_dst:
-        theme = addon.persona
-        header = 'pending_header.png' if header_dst else theme.header
-
-        # Store pending header file paths for review.
-        RereviewQueueTheme.objects.filter(theme=theme).delete()
-        rqt = RereviewQueueTheme(theme=theme, header=header)
-        rereviewqueuetheme_checksum(rqt=rqt)
-        rqt.save()
-
-
-@task
-@use_primary_db
-def calc_checksum(theme_id, **kw):
-    """For migration 596."""
-    lfs = LocalFileStorage()
-    theme = Persona.objects.get(id=theme_id)
-    header = theme.header_path
-
-    # Delete invalid themes that are not images (e.g. PDF, EXE).
-    try:
-        Image.open(header)
-    except IOError:
-        log.info('Deleting invalid theme [%s] (header: %s)' %
-                 (theme.addon.id, header))
-        theme.addon.delete()
-        theme.delete()
-        rm_stored_dir(header.replace('header.png', ''), storage=lfs)
-        return
-
-    # Calculate checksum and save.
-    try:
-        theme.checksum = make_checksum(header)
-        theme.save()
-    except IOError as e:
-        log.error(str(e))
+    if queryset:
+        log.info(f'Indexing addons {index_ids[0]}-{index_ids[-1]}. [{len(index_ids)}]')
+        index_objects(
+            queryset=queryset,
+            indexer_class=AddonIndexer,
+            index=kw.pop('index', None),
+        )
+    if exclude_ids:
+        log.info(
+            f'Removing addons {exclude_ids[0]}-{exclude_ids[-1]}. [{len(exclude_ids)}]'
+        )
+        unindex_objects(exclude_ids, indexer_class=AddonIndexer)
 
 
 @task
@@ -432,505 +214,57 @@ def find_inconsistencies_between_es_and_db(ids, **kw):
     length = len(ids)
     log.info(
         'Searching for inconsistencies between db and es %d-%d [%d].',
-        ids[0], ids[-1], length)
+        ids[0],
+        ids[-1],
+        length,
+    )
     db_addons = Addon.unfiltered.in_bulk(ids)
-    es_addons = Search(
-        doc_type=AddonIndexer.get_doctype_name(),
-        index=AddonIndexer.get_index_alias(),
-        using=amo.search.get_es()).filter('ids', values=ids)[:length].execute()
-    es_addons = es_addons
+    es_addons = (
+        Search(
+            index=AddonIndexer.get_index_alias(),
+            using=get_es(),
+        )
+        .filter('ids', values=ids)[:length]
+        .execute()
+    )
     db_len = len(db_addons)
     es_len = len(es_addons)
     if db_len != es_len:
-        log.info('Inconsistency found: %d in db vs %d in es.',
-                 db_len, es_len)
+        log.info('Inconsistency found: %d in db vs %d in es.', db_len, es_len)
     for result in es_addons.hits.hits:
         pk = result['_source']['id']
         db_modified = db_addons[pk].modified.isoformat()
         es_modified = result['_source']['modified']
         if db_modified != es_modified:
-            log.info('Inconsistency found for addon %d: '
-                     'modified is %s in db vs %s in es.',
-                     pk, db_modified, es_modified)
+            log.info(
+                'Inconsistency found for addon %d: modified is %s in db vs %s in es.',
+                pk,
+                db_modified,
+                es_modified,
+            )
         db_status = db_addons[pk].status
         es_status = result['_source']['status']
         if db_status != es_status:
-            log.info('Inconsistency found for addon %d: '
-                     'status is %s in db vs %s in es.',
-                     pk, db_status, es_status)
-
-
-@task
-@use_primary_db
-def add_firefox57_tag(ids, **kw):
-    """Add firefox57 tag to addons with the specified ids."""
-    log.info(
-        'Adding firefox57 tag to addons %d-%d [%d].',
-        ids[0], ids[-1], len(ids))
-
-    addons = Addon.objects.filter(id__in=ids)
-    for addon in addons:
-        # This will create a couple extra queries to check for tag/addontag
-        # existence, and then trigger update_tag_stat tasks. But the
-        # alternative is adding activity log manually, making sure we don't
-        # add duplicate tags, manually updating the tag stats, so it's ok for
-        # a one-off task.
-        Tag(tag_text='firefox57').save_tag(addon)
-
-
-@task
-@use_primary_db
-def add_dynamic_theme_tag(ids, **kw):
-    """Add dynamic theme tag to addons with the specified ids."""
-    log.info(
-        'Adding  dynamic theme tag to addons %d-%d [%d].',
-        ids[0], ids[-1], len(ids))
-
-    addons = Addon.objects.filter(id__in=ids)
-    for addon in addons:
-        files = addon.current_version.all_files
-        if any('theme' in file_.webext_permissions_list for file_ in files):
-            Tag(tag_text='dynamic theme').save_tag(addon)
-            index_addons.delay([addon.id])
-
-
-def extract_strict_compatibility_value_for_addon(addon):
-    strict_compatibility = None  # We don't know yet.
-    try:
-        # We take a shortcut here and only look at the first file we
-        # find...
-        # Note that we can't use parse_addon() wrapper because it no longer
-        # exposes the real value of `strictCompatibility`...
-        path = addon.current_version.all_files[0].file_path
-        zip_file = SafeZip(get_file(path))
-        parser = RDFExtractor(zip_file)
-        strict_compatibility = parser.find('strictCompatibility') == 'true'
-    except Exception as exc:
-        # A number of things can go wrong: missing file, path somehow not
-        # existing, etc. In any case, that means the add-on is in a weird
-        # state and should be ignored (this is a one off task).
-        log.exception(u'bump_appver_for_legacy_addons: ignoring addon %d, '
-                      u'received %s when extracting.',
-                      addon.pk, six.text_type(exc))
-    return strict_compatibility
-
-
-def bump_appver_for_addon_if_necessary(
-        addon, application_id, new_max_appver, strict_compatibility=None):
-    # Find the applicationversion for Firefox for the current version of this
-    # addon.
-    application_versions = addon.current_version.compatible_apps.get(
-        amo.APPS_ALL[application_id])
-
-    # Make sure it's not compatible already...
-    if application_versions and (
-            application_versions.max.version_int < new_max_appver.version_int):
-        if strict_compatibility is None:
-            # We don't know yet if the add-on had strictCompatibility enabled
-            # (either because it's the first time we called the function for
-            # this addon, or because it was not neccessary to bump the last
-            # time we called, or because we had an error before). Let's parse
-            # it to find out.
-            strict_compatibility = (
-                extract_strict_compatibility_value_for_addon(addon))
-        if strict_compatibility is False:
-            # It had not enabled strict compatibility. That means we should
-            # bump it!
-            application_versions.max = new_max_appver
-            application_versions.save()
-    return strict_compatibility
-
-
-# Rate limit is per-worker. Kept low to not overload the database with updates.
-# We have 5 workers in the default queue, we have roughly 25.000 add-ons to go
-# through, since process_addons() chunks contain 100 add-ons the task should be
-# fired 250 times. With 5 workers at 5 tasks / minute limit we should do 25
-# tasks in a minute, taking ~ 10 minutes for the whole thing to finish.
-@task(rate_limit='5/m')
-@use_primary_db
-def bump_appver_for_legacy_addons(ids, **kw):
-    """
-    Task to bump the max appversion to 56.* for legacy add-ons that have not
-    enabled strictCompatibility in their manifest.
-    """
-    addons = Addon.objects.filter(id__in=ids)
-    # The AppVersions we want to point to now.
-    new_max_appversions = {
-        amo.FIREFOX.id: AppVersion.objects.get(
-            application=amo.FIREFOX.id, version='56.*'),
-        amo.ANDROID.id: AppVersion.objects.get(
-            application=amo.ANDROID.id, version='56.*')
-    }
-
-    addons_to_reindex = []
-    for addon in addons:
-        strict_compatibility = bump_appver_for_addon_if_necessary(
-            addon, amo.FIREFOX.id, new_max_appversions[amo.FIREFOX.id])
-        # If strict_compatibility is True, we know we should skip bumping this
-        # add-on entirely. Otherwise (False or None), we need to continue with
-        # Firefox for Android, which might have different compat info than
-        # Firefox. We pass the value we already have for strict_compatibility,
-        # if it's not None bump_appver_for_addon_if_necessary() will avoid
-        # re-extracting a second time.
-        if strict_compatibility is not True:
-            android_strict_compatibility = bump_appver_for_addon_if_necessary(
-                addon, amo.ANDROID.id, new_max_appversions[amo.ANDROID.id],
-                strict_compatibility=strict_compatibility)
-
-            if (android_strict_compatibility is False or
-                    strict_compatibility is False):
-                # We did something to that add-on compat, it needs reindexing.
-                addons_to_reindex.append(addon.pk)
-    if addons_to_reindex:
-        index_addons.delay(addons_to_reindex)
-
-
-def _get_lwt_default_author():
-    user, created = UserProfile.objects.get_or_create(
-        email=settings.MIGRATED_LWT_DEFAULT_OWNER_EMAIL)
-    if created:
-        user.anonymize_username()
-    return user
-
-
-@transaction.atomic
-@statsd.timer('addons.tasks.migrate_lwts_to_static_theme.add_from_lwt')
-def add_static_theme_from_lwt(lwt):
-    from olympia.activity.models import AddonLog
-
-    timer = StopWatch(
-        'addons.tasks.migrate_lwts_to_static_theme.add_from_lwt.')
-    timer.start()
-
-    olympia.core.set_user(UserProfile.objects.get(pk=settings.TASK_USER_ID))
-    # Try to handle LWT with no authors
-    author = (lwt.listed_authors or [_get_lwt_default_author()])[0]
-    # Wrap zip in FileUpload for Addon/Version from_upload to consume.
-    upload = FileUpload.objects.create(
-        user=author, valid=True)
-    filename = uuid.uuid4().hex + '.xpi'
-    destination = os.path.join(user_media_path('addons'), 'temp', filename)
-    build_static_theme_xpi_from_lwt(lwt, destination)
-    upload.update(path=destination, name=filename)
-    timer.log_interval('1.build_xpi')
-
-    # Create addon + version
-    parsed_data = parse_addon(upload, user=author)
-    timer.log_interval('2a.parse_addon')
-
-    addon = Addon.initialize_addon_from_upload(
-        parsed_data, upload, amo.RELEASE_CHANNEL_LISTED, author)
-    addon_updates = {}
-    timer.log_interval('2b.initialize_addon')
-
-    # static themes are only compatible with Firefox at the moment,
-    # not Android
-    version = Version.from_upload(
-        upload, addon, selected_apps=[amo.FIREFOX.id],
-        channel=amo.RELEASE_CHANNEL_LISTED,
-        parsed_data=parsed_data)
-    timer.log_interval('3.initialize_version')
-
-    # Set category
-    lwt_category = (lwt.categories.all() or [None])[0]  # lwt only have 1 cat.
-    lwt_category_slug = lwt_category.slug if lwt_category else 'other'
-    for app, type_dict in CATEGORIES.items():
-        static_theme_categories = type_dict.get(amo.ADDON_STATICTHEME, [])
-        static_category = static_theme_categories.get(
-            lwt_category_slug, static_theme_categories.get('other'))
-        AddonCategory.objects.create(
-            addon=addon,
-            category=Category.from_static_category(static_category, True))
-    timer.log_interval('4.set_categories')
-
-    # Set license
-    lwt_license = PERSONA_LICENSES_IDS.get(
-        lwt.persona.license, LICENSE_COPYRIGHT_AR)  # default to full copyright
-    static_license = License.objects.get(builtin=lwt_license.builtin)
-    version.update(license=static_license)
-    timer.log_interval('5.set_license')
-
-    # Set tags
-    for addon_tag in AddonTag.objects.filter(addon=lwt):
-        AddonTag.objects.create(addon=addon, tag=addon_tag.tag)
-    timer.log_interval('6.set_tags')
-
-    # Steal the ratings (even with soft delete they'll be deleted anyway)
-    addon_updates.update(
-        average_rating=lwt.average_rating,
-        bayesian_rating=lwt.bayesian_rating,
-        total_ratings=lwt.total_ratings,
-        text_ratings_count=lwt.text_ratings_count)
-    Rating.unfiltered.filter(addon=lwt).update(addon=addon, version=version)
-    timer.log_interval('7.move_ratings')
-
-    # Replace the lwt in collections
-    CollectionAddon.objects.filter(addon=lwt).update(addon=addon)
-
-    # Modify the activity log entry too.
-    rating_activity_log_ids = [
-        l.id for l in amo.LOG if getattr(l, 'action_class', '') == 'review']
-    addonlog_qs = AddonLog.objects.filter(
-        addon=lwt, activity_log__action__in=rating_activity_log_ids)
-    [alog.transfer(addon) for alog in addonlog_qs.iterator()]
-    timer.log_interval('8.move_activity_logs')
-
-    # Copy the ADU statistics - the raw(ish) daily UpdateCounts for stats
-    # dashboard and future update counts, and copy the average_daily_users.
-    # hotness will be recalculated by the deliver_hotness() cron in a more
-    # reliable way that we could do, so skip it entirely.
-    migrate_theme_update_count(lwt, addon)
-    addon_updates.update(
-        average_daily_users=lwt.persona.popularity or 0,
-        hotness=0)
-    timer.log_interval('9.copy_statistics')
-
-    # Logging
-    activity.log_create(
-        amo.LOG.CREATE_STATICTHEME_FROM_PERSONA, addon, user=author)
-
-    # And finally sign the files (actually just one)
-    for file_ in version.all_files:
-        sign_file(file_)
-        file_.update(
-            datestatuschanged=lwt.last_updated,
-            reviewed=datetime.now(),
-            status=amo.STATUS_PUBLIC)
-    timer.log_interval('10.sign_files')
-    addon_updates['status'] = amo.STATUS_PUBLIC
-
-    # set the modified and creation dates to match the original.
-    addon_updates['created'] = lwt.created
-    addon_updates['modified'] = lwt.modified
-    addon_updates['last_updated'] = lwt.last_updated
-
-    addon.update(**addon_updates)
-    return addon
-
-
-@task
-@use_primary_db
-def migrate_lwts_to_static_themes(ids, **kw):
-    """With the specified ids, create new static themes based on an existing
-    lightweight themes (personas), and delete the lightweight themes after."""
-    mlog = olympia.core.logger.getLogger('z.task.lwtmigrate')
-    mlog.info(
-        '[Info] Migrating LWT to static theme %d-%d [%d].', ids[0], ids[-1],
-        len(ids))
-
-    # Incoming ids should already by type=persona only
-    lwts = Addon.objects.filter(id__in=ids)
-    for lwt in lwts:
-        static = None
-        pause_all_tasks()
-        try:
-            timer = StopWatch('addons.tasks.migrate_lwts_to_static_theme')
-            timer.start()
-            with translation.override(lwt.default_locale):
-                static = add_static_theme_from_lwt(lwt)
-            mlog.info(
-                '[Success] Static theme %r created from LWT %r', static, lwt)
-            if not static:
-                raise Exception('add_static_theme_from_lwt returned falsey')
-            MigratedLWT.objects.create(
-                lightweight_theme=lwt, getpersonas_id=lwt.persona.persona_id,
-                static_theme=static)
-            # Steal the lwt's slug after it's deleted.
-            slug = lwt.slug
-            lwt.delete(send_delete_email=False)
-            static.update(slug=slug)
-            timer.log_interval('')
-        except Exception as e:
-            # If something went wrong, don't migrate - we need to debug.
-            mlog.debug('[Fail] LWT %r:', lwt, exc_info=e)
-        finally:
-            resume_all_tasks()
-
-
-@task
-@use_primary_db
-def migrate_legacy_dictionaries_to_webextension(ids, **kw):
-    """Migrate a chunk of legacy dictionaries to webextension format.
-    Used by process_addons command."""
-    log.info(
-        'Migrating legacy dictionaries to webextension %d-%d [%d].',
-        ids[0], ids[-1], len(ids))
-    addons = list(Addon.objects.filter(id__in=ids))
-    migrated = []
-    for addon in addons:
-        try:
-            migrate_legacy_dictionary_to_webextension(addon)
-            migrated.append(addon)
-        except ValidationError as exc:
-            # Ignore broken dictionaries, just log and continue. The function
-            # is decorated by @atomic so it will rollback the transaction.
-            log.warning(
-                'Migrating dictionary %d raised %s', addon.pk, exc.message)
-            continue
-    if migrated:
-        index_addons.delay(migrated)
-
-
-@transaction.atomic()
-def migrate_legacy_dictionary_to_webextension(addon):
-    """Migrate a single legacy dictionary to webextension format, creating a
-    new package from the current_version, faking an upload to create a new
-    Version instance."""
-    user = UserProfile.objects.get(pk=settings.TASK_USER_ID)
-    now = datetime.now()
-
-    # Wrap zip in FileUpload for Version.from_upload() to consume.
-    upload = FileUpload.objects.create(
-        user=user, valid=True)
-
-    filename = uuid.uuid4().hex + '.xpi'
-    destination = os.path.join(user_media_path('addons'), 'temp', filename)
-    target_language = build_webext_dictionary_from_legacy(addon, destination)
-    if not addon.target_locale:
-        addon.update(target_locale=target_language)
-
-    upload.update(path=destination, name=filename)
-
-    parsed_data = parse_addon(upload, addon=addon, user=user)
-    # Create version.
-    # WebExtension dictionaries are only compatible with Firefox Desktop
-    # Firefox for Android uses the OS spellchecking.
-    version = Version.from_upload(
-        upload, addon, selected_apps=[amo.FIREFOX.id],
-        channel=amo.RELEASE_CHANNEL_LISTED, parsed_data=parsed_data)
-    activity.log_create(amo.LOG.ADD_VERSION, version, addon, user=user)
-
-    # Sign the file, and set it to public. That should automatically set
-    # current_version to the version we created.
-    file_ = version.all_files[0]
-    sign_file(file_)
-    file_.update(datestatuschanged=now, reviewed=now, status=amo.STATUS_PUBLIC)
-
-
-# Rate limiting to 1 per minute to not overload our networking filesystem
-# and block our celery workers. Extraction to our git backend doesn't have
-# to be fast. Each instance processes 100 add-ons so we'll process
-# 6000 add-ons per hour which is fine.
-@task(rate_limit='1/m')
-def migrate_webextensions_to_git_storage(ids, **kw):
-    # recursive imports...
-    from olympia.versions.tasks import extract_version_to_git
-
-    log.info(
-        'Migrating add-ons to git storage %d-%d [%d].',
-        ids[0], ids[-1], len(ids))
-
-    addons = Addon.unfiltered.filter(id__in=ids)
-
-    for addon in addons:
-        # Filter out versions that are already present in the git
-        # storage.
-        versions = addon.versions.filter(git_hash='').order_by('created')
-
-        for version in versions:
-            # Back in the days an add-on was able to have multiple files
-            # per version. That changed, we are very naive here and extracting
-            # simply the first file in the list. For WebExtensions there is
-            # only a very very small number that have different files for
-            # a single version.
-            unique_file_hashes = set([
-                x.original_hash for x in version.all_files
-            ])
-
-            if len(unique_file_hashes) > 1:
-                # Log actually different hashes so that we can clean them
-                # up manually and work together with developers later.
-                log.info(
-                    'Version {version} of {addon} has more than one uploaded '
-                    'file'.format(version=repr(version), addon=repr(addon)))
-
-            if not unique_file_hashes:
-                log.info('No files found for {version} from {addon}'.format(
-                    version=repr(version), addon=repr(addon)))
-                continue
-
-            # Don't call the task as a task but do the extraction in process
-            # this makes sure we don't overwhelm the storage and also makes
-            # sure we don't end up with tasks committing at random times but
-            # correctly in-order instead.
-            try:
-                file_id = version.all_files[0].pk
-
-                log.info('Extracting file {file_id} to git storage'.format(
-                    file_id=file_id))
-
-                extract_version_to_git(version.pk)
-
-                log.info(
-                    'Extraction of file {file_id} into git storage succeeded'
-                    .format(file_id=file_id))
-            except Exception:
-                log.exception(
-                    'Extraction of file {file_id} from {version} '
-                    '({addon}) failed'.format(
-                        file_id=version.all_files[0],
-                        version=repr(version),
-                        addon=repr(addon)))
-                continue
-
-
-@task
-@use_primary_db
-def disable_legacy_files(ids, **kw):
-    """Delete legacy files from the specified add-on ids."""
-    log.info(
-        'Disabling legacy files from addons %d-%d [%d].',
-        ids[0], ids[-1], len(ids))
-    qs = Addon.unfiltered.filter(id__in=ids)
-    for addon in qs:
-        with transaction.atomic():
-            # We're dealing with an addon that has the type we care about, and
-            # that we've identified as containing legacy File instances.
-            files = File.objects.filter(
-                is_webextension=False, is_mozilla_signed_extension=False,
-                version__addon=addon).exclude(status=amo.STATUS_DISABLED)
-            for file_ in files:
-                log.info('Disabling file %d from addon %s', file_.pk, addon.pk)
-                file_.update(status=amo.STATUS_DISABLED)
-
-
-@task
-@use_primary_db
-def remove_amo_links_in_url_fields(ids, **kw):
-    """With the specified ids, remove the AMO links in the following URL fields
-    of each add-on: homepage, support_url, contribution."""
-    log.info('Deleting AMO links in URL fields %d-%d [%d].', ids[0], ids[-1],
-             len(ids))
-    addons = Addon.objects.filter(id__in=ids)
-    for addon in addons:
-        with transaction.atomic():
-            translation_ids = []
-            if addon.homepage_id:
-                translation_ids.append(addon.homepage_id)
-            if addon.support_url_id:
-                translation_ids.append(addon.support_url_id)
-            if translation_ids:
-                Translation.objects.filter(
-                    id__in=translation_ids,
-                    localized_string__icontains=settings.DOMAIN
-                ).update(localized_string=u'', localized_string_clean=u'')
-            if settings.DOMAIN.lower() in addon.contributions.lower():
-                addon.update(contributions=u'')
+            log.info(
+                'Inconsistency found for addon %d: status is %s in db vs %s in es.',
+                pk,
+                db_status,
+                es_status,
+            )
 
 
 @task
 @use_primary_db
 def extract_colors_from_static_themes(ids, **kw):
     """Extract and store colors from existing static themes."""
-    log.info('Extracting static themes colors %d-%d [%d].', ids[0], ids[-1],
-             len(ids))
+    log.info('Extracting static themes colors %d-%d [%d].', ids[0], ids[-1], len(ids))
     addons = Addon.objects.filter(id__in=ids)
     extracted = []
     for addon in addons:
-        first_preview = addon.current_previews.first()
-        if first_preview and not first_preview.colors:
-            colors = extract_colors_from_image(first_preview.thumbnail_path)
-            addon.current_previews.update(colors=colors)
+        if addon.current_previews and not addon.current_previews[0].colors:
+            colors = extract_colors_from_image(addon.current_previews[0].thumbnail_path)
+            addon.current_version.previews.update(colors=colors)
+            del addon.current_previews
             extracted.append(addon.pk)
     if extracted:
         index_addons.delay(extracted)
@@ -939,26 +273,311 @@ def extract_colors_from_static_themes(ids, **kw):
 @task
 @use_primary_db
 def recreate_theme_previews(addon_ids, **kw):
-    log.info('[%s@%s] Recreating previews for themes starting at id: %s...'
-             % (len(addon_ids), recreate_theme_previews.rate_limit,
-                addon_ids[0]))
-    addons = Addon.objects.filter(pk__in=addon_ids).no_transforms()
+    log.info(
+        '[%s@%s] Recreating previews for themes starting at id: %s...'
+        % (len(addon_ids), recreate_theme_previews.rate_limit, addon_ids[0])
+    )
+    version_ids = Addon.objects.filter(pk__in=addon_ids).values_list('_current_version')
+    versions = Version.objects.filter(pk__in=version_ids)
     only_missing = kw.get('only_missing', False)
 
-    for addon in addons:
-        version = addon.current_version
-        if not version:
-            continue
+    renders = {
+        (render['full'], render['image_format']): {
+            'thumb_size': render['thumbnail'],
+            'thumb_format': render['thumbnail_format'],
+        }
+        for render in amo.THEME_PREVIEW_RENDERINGS.values()
+    }
+
+    for version in versions:
         try:
             if only_missing:
-                with_size = (VersionPreview.objects.filter(version=version)
-                             .exclude(sizes={}).count())
-                if with_size == len(amo.THEME_PREVIEW_SIZES):
+                existing_full_sizes = {
+                    (tuple(size.get('image', ())), size.get('image_format', 'png'))
+                    for size in VersionPreview.objects.filter(
+                        version=version
+                    ).values_list('sizes', flat=True)
+                }
+                all_full_sizes_present = not set(renders.keys()) - existing_full_sizes
+                if all_full_sizes_present:
+                    # i.e. we have all renders
+                    log.info('Resizing thumbnails for theme: %s' % version.addon_id)
+                    for preview in list(VersionPreview.objects.filter(version=version)):
+                        # so check the thumbnail size/format for each preview
+                        preview_dimension_format = (
+                            tuple(preview.image_dimensions),
+                            preview.get_format('image'),
+                        )
+                        render = renders.get(preview_dimension_format)
+                        if render and (
+                            render['thumb_size'] != tuple(preview.thumbnail_dimensions)
+                            or render['thumb_format'] != preview.get_format('thumbnail')
+                        ):
+                            preview.sizes['thumbnail_format'] = render['thumb_format']
+                            preview.sizes['thumbnail'] = render['thumb_size']
+                            resize_image(
+                                preview.image_path,
+                                preview.thumbnail_path,
+                                render['thumb_size'],
+                                format=render['thumb_format'],
+                                quality=35,
+                            )
+                            preview.save()
+
                     continue
-            log.info('Recreating previews for theme: %s' % addon.id)
-            VersionPreview.objects.filter(version=version).delete()
-            xpi = get_filepath(version.all_files[0])
+                # else carry on with a full preview generation
+            log.info('Recreating previews for theme: %s' % version.addon_id)
+            xpi = get_filepath(version.file)
             theme_data = parse_addon(xpi, minimal=True).get('theme', {})
-            generate_static_theme_preview(theme_data, version.id)
-        except IOError:
+            generate_static_theme_preview.apply_async(
+                args=(theme_data, version.id), queue='adhoc'
+            )
+        except OSError:
             pass
+    index_addons.delay(addon_ids)
+
+
+@task
+@use_primary_db
+def delete_addons(addon_ids, with_deleted=False, deny_guids=True, **kw):
+    """Delete the given addon ids.
+
+    If `with_deleted=True` the delete is a hard delete - i.e. the addon record
+    and all linked records in other models are deleted from the database. We
+    use the queryset delete method to bypass Addon.delete().
+
+    If `with_deleted=False` Addon.delete() is called for each addon id, which
+    typically* soft deletes - i.e. some metadata and files are removed but the
+    records in the database persist, and the Addon.status is set to
+    STATUS_DELETED.  *Addon.delete() only does a hard-delete where the Addon
+    has no versions or files - and has never had any versions or files.
+
+    If `deny_guids=True` the guid will be blocked from re-use.  If `deny_guids=False`
+    a DeniedGuid instance won't be created so the guid could be re-used.  Note: this
+    only applies when `with_deleted=True` - for `with_deleted=False` see Addon.delete
+    for logic around when a DeniedGuid is created otherwise.
+    """
+    log.info(
+        '[%s@%s] %sDeleting addons starting at id: %s...'
+        % (
+            'Hard ' if with_deleted else '',
+            len(addon_ids),
+            delete_addons.rate_limit,
+            addon_ids[0],
+        )
+    )
+    addons = Addon.unfiltered.filter(pk__in=addon_ids).no_transforms()
+    if with_deleted:
+        with transaction.atomic():
+            if deny_guids:
+                # Stop any of these guids from being reused
+                guids_to_block_qs = addons.exclude(guid=None).values_list(
+                    'guid', flat=True
+                )
+                denied = [
+                    DeniedGuid(
+                        guid=guid, comments='Hard deleted with delete_addons task'
+                    )
+                    for guid in list(guids_to_block_qs)
+                ]
+                DeniedGuid.objects.bulk_create(denied, ignore_conflicts=True)
+            # Call QuerySet.delete rather than Addon.delete.
+            addons.delete()
+    else:
+        for addon in addons:
+            addon.delete(send_delete_email=False)
+
+
+@task
+@use_primary_db
+def update_addon_hotness(averages):
+    log.info('[%s] Updating add-ons hotness scores.', (len(averages)))
+
+    averages = dict(averages)
+    addons = Addon.unfiltered.filter(guid__in=averages.keys()).no_transforms()
+
+    for addon in addons:
+        average = averages.get(addon.guid)
+
+        # See: https://github.com/mozilla/addons-server/issues/15525
+        if not average:
+            log.error(
+                'Averages not found for addon with id=%s and GUID=%s.',
+                addon.id,
+                addon.guid,
+            )
+            continue
+
+        this_week = average['avg_this_week']
+        previous_week = max(average['avg_previous_week'], 1)
+        threshold = (
+            MINIMUM_ADU_FOR_HOTNESS_THEME
+            if addon.type == amo.ADDON_STATICTHEME
+            else MINIMUM_ADU_FOR_HOTNESS_NONTHEME
+        )
+        if this_week >= threshold:
+            hotness = (this_week - previous_week) / float(previous_week)
+        else:
+            hotness = 0
+        # Update the hotness score but only if necessary - We don't want
+        # trigger useless reindexes.
+        if addon.hotness != hotness:
+            addon.update(hotness=hotness)
+
+
+@task
+def update_addon_weekly_downloads(data):
+    log.info('[%s] Updating add-ons weekly downloads.', len(data))
+
+    for hashed_guid, count in data:
+        try:
+            addon = (
+                Addon.objects.all()
+                .no_transforms()
+                .get(addonguid__hashed_guid=hashed_guid)
+            )
+        except Addon.DoesNotExist:
+            # The processing input comes from metrics which might be out of
+            # date in regards to currently existing add-ons.
+            log.info(
+                'Got a weekly_downloads update (%s) but the add-on '
+                "doesn't exist (hashed_guid=%s).",
+                count,
+                hashed_guid,
+            )
+            continue
+
+        weekly_downloads = int(float(count))
+        if addon.weekly_downloads != weekly_downloads:
+            addon.update(weekly_downloads=weekly_downloads)
+
+
+@task
+@set_modified_on
+def resize_icon(source, addon_id, target_sizes, **kw):
+    """Resizes addon icons."""
+    log.info('[1@None] Resizing icon for addon %s' % addon_id)
+    addon = Addon(pk=addon_id)  # to make get_icon_path() work.
+    try:
+        # Resize in every size we want.
+        dest_file = None
+        for size in target_sizes:
+            dest_file = addon.get_icon_path(size)
+            resize_image(source, dest_file, (size, size))
+
+        # Store the original hash, we'll return it to update the corresponding
+        # add-on. We only care about the first 8 chars of the md5, it's
+        # unlikely a new icon on the same add-on would get the same first 8
+        # chars, especially with icon changes being so rare in the first place.
+        with open(source, 'rb') as fd:
+            icon_hash = hashlib.md5(fd.read()).hexdigest()[:8]
+
+        # Keep a copy of the original image. This might not be the right
+        # extension as it hasn't been converted into a different format.
+        dest_file = addon.get_icon_path('original')
+        if source != dest_file:
+            storage.move_stored_file(source, dest_file)
+        return {'icon_hash': icon_hash}
+    except Exception as e:
+        log.error(f'Error saving addon icon ({dest_file}): {e}')
+
+
+@task
+@set_modified_on
+def resize_preview(src, preview_pk, **kw):
+    """Resizes preview images and stores the sizes on the preview."""
+    preview = Preview.objects.get(pk=preview_pk)
+    preview.sizes = {'thumbnail_format': amo.ADDON_PREVIEW_SIZES['thumbnail_format']}
+    thumb_dst, full_dst, orig_dst = (
+        preview.thumbnail_path,
+        preview.image_path,
+        preview.original_path,
+    )
+    log.info('[1@None] Resizing preview and storing size: %s' % thumb_dst)
+    try:
+        (preview.sizes['thumbnail'], preview.sizes['original']) = resize_image(
+            src,
+            thumb_dst,
+            amo.ADDON_PREVIEW_SIZES['thumbnail'],
+            format=amo.ADDON_PREVIEW_SIZES['thumbnail_format'],
+        )
+        (preview.sizes['image'], _) = resize_image(
+            src,
+            full_dst,
+            amo.ADDON_PREVIEW_SIZES['full'],
+        )
+        if src != orig_dst:
+            tmp_storage = SafeStorage(root_setting='TMP_PATH')
+            storage.move_stored_file(tmp_storage.path(src), orig_dst)
+        preview.save()
+        return True
+    except Exception as e:
+        log.error('Error saving preview: %s' % e)
+
+
+@task
+@use_primary_db
+def disable_addons(addon_ids, **kw):
+    """Set the given addon ids to disabled (amo.STATUS_DISABLED)."""
+    log.info(
+        '[%s@%s] Disabling addons starting at id: %s...'
+        % (
+            len(addon_ids),
+            disable_addons.rate_limit,
+            addon_ids[0],
+        )
+    )
+    addons = Addon.unfiltered.filter(pk__in=addon_ids).no_transforms()
+    for addon in addons:
+        activity.log_create(amo.LOG.FORCE_DISABLE, addon, user=get_task_user())
+    addons.update(status=amo.STATUS_DISABLED, _current_version=None)
+    Addon.disable_all_files(addons, File.STATUS_DISABLED_REASONS.ADDON_DISABLE)
+    index_addons.delay(addon_ids)
+
+
+@task
+@use_primary_db
+def flag_high_hotness_according_to_review_tier():
+    usage_tiers = UsageTier.objects.filter(
+        # We don't compute hotness below that, other signals could still apply.
+        lower_adu_threshold__gte=MINIMUM_ADU_FOR_HOTNESS_NONTHEME,
+        # Tiers with no upper adu threshold are special cases with their own
+        # way of flagging add-ons for review (either notable or promoted).
+        upper_adu_threshold__isnull=False,
+        # Need a hotness threshold to be set for the tier.
+        growth_threshold_before_flagging__isnull=False,
+    )
+    # Build a single queryset with all add-ons we want to flag for each tier.
+    base_qs = UsageTier.get_base_addons()
+    hotness_per_tier_filters = Q()
+    for usage_tier in usage_tiers:
+        hotness_per_tier_filters |= usage_tier.get_growth_threshold_q_object()
+    if not hotness_per_tier_filters:
+        return
+    qs = base_qs.filter(hotness_per_tier_filters)
+    NeedsHumanReview.set_on_addons_latest_signed_versions(
+        qs, NeedsHumanReview.REASONS.HOTNESS_THRESHOLD
+    )
+
+
+ERRONEOUSLY_ADDED_OVERGROWTH_DATE_RANGE = (
+    date(2024, 11, 5),
+    date(2024, 11, 7),
+)
+
+
+@task
+@use_primary_db
+def delete_erroneously_added_overgrowth_needshumanreview(addon_ids, **kw):
+    addons = Addon.unfiltered.filter(pk__in=addon_ids).no_transforms()
+    for addon in addons:
+        log.info(
+            'Deleting erroneously added NHR and updating due dates for %s', addon.pk
+        )
+        NeedsHumanReview.objects.filter(
+            version__addon=addon,
+            reason=NeedsHumanReview.REASONS.HOTNESS_THRESHOLD,
+            created__range=ERRONEOUSLY_ADDED_OVERGROWTH_DATE_RANGE,
+            is_active=True,
+        ).delete()
+        addon.update_all_due_dates()

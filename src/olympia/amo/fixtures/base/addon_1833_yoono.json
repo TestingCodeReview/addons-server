@@ -1,5 +1,4 @@
-[
-    {
+[{
         "pk": 426250,
         "model": "translations.translation",
         "fields": {
@@ -31,8 +30,6 @@
             "eula": null,
             "_current_version": 101235,
             "last_updated": "2010-03-26 08:22:39",
-            "view_source": false,
-            "total_downloads": 4396083,
             "disabled_by_user": false,
             "guid": "{d9284e50-81fc-11da-a72b-0800200c9a66}",
             "weekly_downloads": 53380,
@@ -40,7 +37,6 @@
             "average_daily_users": 131815,
             "bayesian_rating": 4.2253800000000004,
             "support_email": null,
-            "public_stats": false,
             "status": 4,
             "default_locale": "en-US",
             "target_locale": null,
@@ -81,10 +77,10 @@
             "hash": "sha256:1597d05c39e78df750aaeb3a71e387146f75fdc2fe0b5283841b361daa9a6b71",
             "created": "2010-03-25 14:25:19",
             "modified": "2010-03-26 08:22:39",
-            "filename": "yoono-7.1.6-fx.xpi",
-            "platform": 1,
+            "file": "33/1833/1833/yoono-7.1.6.xpi",
             "version": 101235,
             "size": 2777088,
+            "manifest_version": 2,
             "datestatuschanged": "2010-03-26 08:22:39"
         }
     },
@@ -151,16 +147,6 @@
             "version": 101235,
             "min": 233,
             "max": 303
-        }
-    },
-    {
-        "pk": 3,
-        "model": "addons.appsupport",
-        "fields": {
-            "app": 1,
-            "addon": 1833,
-            "modified": "2010-10-04 13:01:45",
-            "created": "2010-10-04 13:01:45"
         }
     }
 ]

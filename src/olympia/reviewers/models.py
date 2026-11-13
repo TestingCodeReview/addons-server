@@ -1,34 +1,36 @@
 import json
-
-from collections import OrderedDict
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
+from types import DynamicClassAttribute
 
 from django.conf import settings
 from django.core.cache import cache
 from django.db import models
-from django.db.models import Q, Sum
+from django.db.models import Avg, Count, OuterRef, Q
+from django.db.models.functions import Greatest
+from django.dispatch import receiver
 from django.template import loader
-from django.utils.encoding import python_2_unicode_compatible
-from django.utils.translation import ugettext, ugettext_lazy as _
+from django.urls import reverse
+from django.utils.functional import cached_property
 
-import six
+import waffle
 
 import olympia.core.logger
-
-from olympia import amo
-from olympia.abuse.models import AbuseReport
+from olympia import activity, amo, core
+from olympia.abuse.models import AbuseReport, CinderPolicy
 from olympia.access import acl
-from olympia.addons.models import Addon, Persona
-from olympia.amo.fields import PositiveAutoField
-from olympia.amo.models import ManagerBase, ModelBase
+from olympia.addons.models import Addon, AddonApprovalsCounter
+from olympia.amo.enum import EnumChoices
+from olympia.amo.models import ModelBase
 from olympia.amo.templatetags.jinja_helpers import absolutify
-from olympia.amo.urlresolvers import reverse
-from olympia.amo.utils import cache_ns_key, send_mail
-from olympia.files.models import FileValidation
+from olympia.amo.utils import send_mail
+from olympia.constants.scanners import WEBHOOK_EVENTS_BLOCKING_AUTO_APPROVAL
+from olympia.files.models import File, FileValidation
 from olympia.ratings.models import Rating
-from olympia.reviewers.sql_model import RawSQLModel
-from olympia.users.models import UserForeignKey, UserProfile
+from olympia.users.models import UserProfile
+from olympia.users.utils import get_task_user
 from olympia.versions.models import Version, version_uploaded
+from olympia.versions.utils import get_staggered_review_due_date_generator
+from olympia.zadmin.models import get_config
 
 
 user_log = olympia.core.logger.getLogger('z.users')
@@ -37,23 +39,43 @@ log = olympia.core.logger.getLogger('z.reviewers')
 
 
 VIEW_QUEUE_FLAGS = (
-    ('needs_admin_code_review', 'needs-admin-code-review',
-        _('Needs Admin Code Review')),
-    ('needs_admin_content_review', 'needs-admin-content-review',
-        _('Needs Admin Content Review')),
-    ('needs_admin_theme_review', 'needs-admin-theme-review',
-        _('Needs Admin Static Theme Review')),
-    ('is_jetpack', 'jetpack', _('Jetpack Add-on')),
-    ('is_restart_required', 'is_restart_required', _('Requires Restart')),
-    ('pending_info_request', 'info', _('More Information Requested')),
-    ('expired_info_request', 'expired-info', _('Expired Information Request')),
-    ('sources_provided', 'sources-provided', _('Sources provided')),
-    ('is_webextension', 'webextension', _('WebExtension')),
+    (
+        'needs_admin_theme_review',
+        'Needs Admin Static Theme Review',
+    ),
+    (
+        'sources_provided',
+        'Source Code Provided',
+    ),
+    (
+        'auto_approval_disabled',
+        'Auto-approval disabled',
+    ),
+    (
+        'auto_approval_delayed_temporarily',
+        'Auto-approval delayed temporarily',
+    ),
+    (
+        'auto_approval_delayed_indefinitely',
+        'Auto-approval delayed indefinitely',
+    ),
+    (
+        'auto_approval_disabled_unlisted',
+        'Unlisted Auto-approval disabled',
+    ),
+    (
+        'auto_approval_delayed_temporarily_unlisted',
+        'Unlisted Auto-approval delayed temporarily',
+    ),
+    (
+        'auto_approval_delayed_indefinitely_unlisted',
+        'Unlisted Auto-approval delayed indefinitely',
+    ),
 )
 
 
 def get_reviewing_cache_key(addon_id):
-    return 'review_viewing:{id}'.format(id=addon_id)
+    return f'review_viewing:{addon_id}'
 
 
 def clear_reviewing_cache(addon_id):
@@ -67,842 +89,339 @@ def get_reviewing_cache(addon_id):
 def set_reviewing_cache(addon_id, user_id):
     # We want to save it for twice as long as the ping interval,
     # just to account for latency and the like.
-    cache.set(get_reviewing_cache_key(addon_id),
-              user_id,
-              amo.REVIEWER_VIEWING_INTERVAL * 2)
-
-
-@python_2_unicode_compatible
-class CannedResponse(ModelBase):
-    id = PositiveAutoField(primary_key=True)
-    name = models.CharField(max_length=255)
-    response = models.TextField()
-    sort_group = models.CharField(max_length=255)
-    type = models.PositiveIntegerField(
-        choices=amo.CANNED_RESPONSE_CHOICES.items(), db_index=True, default=0)
-
-    class Meta:
-        db_table = 'cannedresponses'
-
-    def __str__(self):
-        return six.text_type(self.name)
+    cache.set(
+        get_reviewing_cache_key(addon_id), user_id, amo.REVIEWER_VIEWING_INTERVAL * 2
+    )
 
 
 def get_flags(addon, version):
     """Return a list of tuples (indicating which flags should be displayed for
     a particular add-on."""
-    return [(cls, title) for (prop, cls, title) in VIEW_QUEUE_FLAGS
-            if getattr(version, prop, getattr(addon, prop, None))]
+    exclude_flags_by_channel = {
+        amo.CHANNEL_ENTERPRISE: (
+            'auto_approval_disabled',
+            'auto_approval_delayed_temporarily',
+            'auto_approval_delayed_indefinitely',
+            'auto_approval_disabled_unlisted',
+            'auto_approval_delayed_temporarily_unlisted',
+            'auto_approval_delayed_indefinitely_unlisted',
+        ),
+        amo.CHANNEL_UNLISTED: (
+            'auto_approval_disabled',
+            'auto_approval_delayed_temporarily',
+            'auto_approval_delayed_indefinitely',
+        ),
+        amo.CHANNEL_LISTED: (
+            'auto_approval_disabled_unlisted',
+            'auto_approval_delayed_temporarily_unlisted',
+            'auto_approval_delayed_indefinitely_unlisted',
+        ),
+    }
+    flags = [
+        (prop.replace('_', '-'), title)
+        for (prop, title) in VIEW_QUEUE_FLAGS
+        + tuple((entry.annotation, entry.label) for entry in NeedsHumanReview.REASONS)
+        if getattr(version, prop, getattr(addon, prop, None))
+        and prop
+        not in exclude_flags_by_channel.get(getattr(version, 'channel', None), ())
+    ]
 
-
-def get_flags_for_row(record):
-    """Like get_flags(), but for the queue pages, using fields directly
-    returned by the queues SQL query."""
-    return [(cls, title) for (prop, cls, title) in VIEW_QUEUE_FLAGS
-            if getattr(record, prop)]
-
-
-class ViewQueue(RawSQLModel):
-    id = models.IntegerField()
-    addon_name = models.CharField(max_length=255)
-    addon_slug = models.CharField(max_length=30)
-    addon_status = models.IntegerField()
-    addon_type_id = models.IntegerField()
-    needs_admin_code_review = models.NullBooleanField()
-    needs_admin_content_review = models.NullBooleanField()
-    needs_admin_theme_review = models.NullBooleanField()
-    is_restart_required = models.BooleanField()
-    is_jetpack = models.BooleanField()
-    source = models.CharField(max_length=100)
-    is_webextension = models.BooleanField()
-    latest_version = models.CharField(max_length=255)
-    pending_info_request = models.DateTimeField()
-    expired_info_request = models.NullBooleanField()
-    waiting_time_days = models.IntegerField()
-    waiting_time_hours = models.IntegerField()
-    waiting_time_min = models.IntegerField()
-
-    def base_query(self):
-        return {
-            'select': OrderedDict([
-                ('id', 'addons.id'),
-                ('addon_name', 'tr.localized_string'),
-                ('addon_status', 'addons.status'),
-                ('addon_type_id', 'addons.addontype_id'),
-                ('addon_slug', 'addons.slug'),
-                ('needs_admin_code_review',
-                    'addons_addonreviewerflags.needs_admin_code_review'),
-                ('needs_admin_content_review',
-                    'addons_addonreviewerflags.needs_admin_content_review'),
-                ('needs_admin_theme_review',
-                    'addons_addonreviewerflags.needs_admin_theme_review'),
-                ('latest_version', 'versions.version'),
-                ('pending_info_request',
-                    'addons_addonreviewerflags.pending_info_request'),
-                ('expired_info_request', (
-                    'TIMEDIFF(addons_addonreviewerflags.pending_info_request,'
-                    'NOW()) < 0')),
-                ('is_jetpack', 'MAX(files.jetpack_version IS NOT NULL)'),
-                ('is_restart_required', 'MAX(files.is_restart_required)'),
-                ('source', 'versions.source'),
-                ('is_webextension', 'MAX(files.is_webextension)'),
-                ('waiting_time_days',
-                    'TIMESTAMPDIFF(DAY, MAX(versions.nomination), NOW())'),
-                ('waiting_time_hours',
-                    'TIMESTAMPDIFF(HOUR, MAX(versions.nomination), NOW())'),
-                ('waiting_time_min',
-                    'TIMESTAMPDIFF(MINUTE, MAX(versions.nomination), NOW())'),
-            ]),
-            'from': [
-                'addons',
-                """
-                LEFT JOIN addons_addonreviewerflags ON (
-                    addons.id = addons_addonreviewerflags.addon_id)
-                LEFT JOIN versions ON (addons.id = versions.addon_id)
-                LEFT JOIN files ON (files.version_id = versions.id)
-
-                JOIN translations AS tr ON (
-                    tr.id = addons.name
-                    AND tr.locale = addons.defaultlocale)
-                """
-            ],
-            'where': [
-                'NOT addons.inactive',  # disabled_by_user
-                'versions.channel = %s' % amo.RELEASE_CHANNEL_LISTED,
-                'files.status = %s' % amo.STATUS_AWAITING_REVIEW,
-            ],
-            'group_by': 'id'}
-
-    @property
-    def sources_provided(self):
-        return bool(self.source)
-
-    @property
-    def flags(self):
-        return get_flags_for_row(self)
-
-
-class ViewFullReviewQueue(ViewQueue):
-
-    def base_query(self):
-        q = super(ViewFullReviewQueue, self).base_query()
-        q['where'].append('addons.status = %s' % amo.STATUS_NOMINATED)
-        return q
-
-
-class ViewPendingQueue(ViewQueue):
-
-    def base_query(self):
-        q = super(ViewPendingQueue, self).base_query()
-        q['where'].append('addons.status = %s' % amo.STATUS_PUBLIC)
-        return q
-
-
-class ViewUnlistedAllList(RawSQLModel):
-    id = models.IntegerField()
-    addon_name = models.CharField(max_length=255)
-    addon_slug = models.CharField(max_length=30)
-    guid = models.CharField(max_length=255)
-    version_date = models.DateTimeField()
-    _author_ids = models.CharField(max_length=255)
-    _author_usernames = models.CharField()
-    review_date = models.DateField()
-    review_version_num = models.CharField(max_length=255)
-    review_log_id = models.IntegerField()
-    addon_status = models.IntegerField()
-    latest_version = models.CharField(max_length=255)
-    needs_admin_code_review = models.NullBooleanField()
-    needs_admin_content_review = models.NullBooleanField()
-    needs_admin_theme_review = models.NullBooleanField()
-    is_deleted = models.BooleanField()
-
-    def base_query(self):
-        review_ids = ','.join([str(r) for r in amo.LOG_REVIEWER_REVIEW_ACTION])
-        return {
-            'select': OrderedDict([
-                ('id', 'addons.id'),
-                ('addon_name', 'tr.localized_string'),
-                ('addon_status', 'addons.status'),
-                ('addon_slug', 'addons.slug'),
-                ('latest_version', 'versions.version'),
-                ('guid', 'addons.guid'),
-                ('_author_ids', 'GROUP_CONCAT(authors.user_id)'),
-                ('_author_usernames', 'GROUP_CONCAT(users.username)'),
-                ('needs_admin_code_review',
-                    'addons_addonreviewerflags.needs_admin_code_review'),
-                ('needs_admin_content_review',
-                    'addons_addonreviewerflags.needs_admin_content_review'),
-                ('needs_admin_theme_review',
-                    'addons_addonreviewerflags.needs_admin_theme_review'),
-                ('is_deleted', 'IF (addons.status=11, true, false)'),
-                ('version_date', 'versions.nomination'),
-                ('review_date', 'reviewed_versions.created'),
-                ('review_version_num', 'reviewed_versions.version'),
-                ('review_log_id', 'reviewed_versions.log_id'),
-            ]),
-            'from': [
-                'addons',
-                """
-                JOIN (
-                    SELECT MAX(id) AS latest_version, addon_id FROM versions
-                    WHERE channel = {channel}
-                    GROUP BY addon_id
-                    ) AS latest_version
-                    ON latest_version.addon_id = addons.id
-                LEFT JOIN addons_addonreviewerflags ON (
-                    addons.id = addons_addonreviewerflags.addon_id)
-                LEFT JOIN versions
-                    ON (latest_version.latest_version = versions.id)
-                JOIN translations AS tr ON (
-                    tr.id = addons.name AND
-                    tr.locale = addons.defaultlocale)
-                LEFT JOIN addons_users AS authors
-                    ON addons.id = authors.addon_id
-                LEFT JOIN users as users ON users.id = authors.user_id
-                LEFT JOIN (
-                    SELECT versions.id AS id, addon_id, log.created, version,
-                           log.id AS log_id
-                    FROM versions
-                    JOIN log_activity_version AS log_v ON (
-                        log_v.version_id=versions.id)
-                    JOIN log_activity as log ON (
-                        log.id=log_v.activity_log_id)
-                    WHERE log.user_id <> {task_user} AND
-                        log.action in ({review_actions}) AND
-                        versions.channel = {channel}
-                    ORDER BY id desc
-                    ) AS reviewed_versions
-                    ON reviewed_versions.addon_id = addons.id
-                """.format(task_user=settings.TASK_USER_ID,
-                           review_actions=review_ids,
-                           channel=amo.RELEASE_CHANNEL_UNLISTED),
-            ],
-            'where': [
-                'NOT addons.inactive',  # disabled_by_user
-                'versions.channel = %s' % amo.RELEASE_CHANNEL_UNLISTED,
-                """((reviewed_versions.id = (select max(reviewed_versions.id)))
-                    OR
-                    (reviewed_versions.id IS NULL))
-                """,
-                'addons.status <> %s' % amo.STATUS_DISABLED
-            ],
-            'group_by': 'id'}
-
-    @property
-    def authors(self):
-        ids = self._explode_concat(self._author_ids)
-        usernames = self._explode_concat(
-            self._author_usernames, cast=six.text_type)
-        return list(set(zip(ids, usernames)))
-
-
-class PerformanceGraph(RawSQLModel):
-    id = models.IntegerField()
-    yearmonth = models.CharField(max_length=7)
-    approval_created = models.DateTimeField()
-    user_id = models.IntegerField()
-    total = models.IntegerField()
-
-    def base_query(self):
-        request_ver = amo.LOG.REQUEST_VERSION.id
-        review_ids = [str(r) for r in amo.LOG_REVIEWER_REVIEW_ACTION
-                      if r != request_ver]
-
-        return {
-            'select': OrderedDict([
-                ('yearmonth',
-                 "DATE_FORMAT(`log_activity`.`created`, '%%Y-%%m')"),
-                ('approval_created', '`log_activity`.`created`'),
-                ('user_id', '`log_activity`.`user_id`'),
-                ('total', 'COUNT(*)')
-            ]),
-            'from': [
-                'log_activity',
-            ],
-            'where': [
-                'log_activity.action in (%s)' % ','.join(review_ids),
-                'user_id <> %s' % settings.TASK_USER_ID  # No auto-approvals.
-            ],
-            'group_by': 'yearmonth, user_id'
-        }
+    # add in the promoted group flag and return
+    if promoted := addon.promoted_groups(currently_approved=False):
+        for group in promoted:
+            flags.append((f'promoted-{group.api_name}', group.name))
+    return flags
 
 
 class ReviewerSubscription(ModelBase):
-    user = models.ForeignKey(UserProfile)
-    addon = models.ForeignKey(Addon)
+    user = models.ForeignKey(UserProfile, on_delete=models.CASCADE)
+    addon = models.ForeignKey(Addon, on_delete=models.CASCADE)
+    channel = models.PositiveSmallIntegerField(choices=amo.CHANNEL_CHOICES.items())
 
     class Meta:
         db_table = 'editor_subscriptions'
 
     def send_notification(self, version):
-        user_log.info('Sending addon update notice to %s for %s' %
-                      (self.user.email, self.addon.pk))
+        user_log.info(
+            'Sending addon update notice to %s for %s'
+            % (self.user.email, self.addon.pk)
+        )
+
+        if version.channel == amo.CHANNEL_LISTED:
+            listing_url = absolutify(
+                reverse('addons.detail', args=[self.addon.pk], add_prefix=False)
+            )
+        else:
+            # If the submission went to the unlisted or enterprise
+            # channels, do not link to the listing.
+            listing_url = None
         context = {
             'name': self.addon.name,
-            'url': absolutify(reverse('addons.detail', args=[self.addon.pk],
-                                      add_prefix=False)),
+            'url': listing_url,
             'number': version.version,
-            'review': absolutify(reverse('reviewers.review',
-                                         args=[self.addon.pk],
-                                         add_prefix=False)),
+            'channel': amo.CHANNEL_CHOICES_API[version.channel],
+            'review': absolutify(
+                reverse(
+                    'reviewers.review',
+                    kwargs={
+                        'addon_id': self.addon.pk,
+                        'channel': amo.CHANNEL_CHOICES_API[version.channel],
+                    },
+                    add_prefix=False,
+                )
+            ),
             'SITE_URL': settings.SITE_URL,
         }
         # Not being localised because we don't know the reviewer's locale.
         subject = 'Mozilla Add-ons: %s Updated' % self.addon.name
         template = loader.get_template('reviewers/emails/notify_update.ltxt')
-        send_mail(subject, template.render(context),
-                  recipient_list=[self.user.email],
-                  from_email=settings.ADDONS_EMAIL,
-                  use_deny_list=False)
+        send_mail(
+            subject,
+            template.render(context),
+            recipient_list=[self.user.email],
+            use_deny_list=False,
+        )
 
 
-def send_notifications(signal=None, sender=None, **kw):
-    if sender.channel != amo.RELEASE_CHANNEL_LISTED:
-        return
-
-    subscribers = sender.addon.reviewersubscription_set.all()
+def send_notifications(sender=None, instance=None, signal=None, **kw):
+    subscribers = instance.addon.reviewersubscription_set.all()
 
     if not subscribers:
         return
 
+    listed_perms = [
+        amo.permissions.ADDONS_REVIEW,
+        amo.permissions.ADDONS_CONTENT_REVIEW,
+        amo.permissions.STATIC_THEMES_REVIEW,
+        amo.permissions.REVIEWER_TOOLS_VIEW,
+    ]
+
+    unlisted_perms = [
+        amo.permissions.ADDONS_REVIEW_UNLISTED,
+        amo.permissions.REVIEWER_TOOLS_UNLISTED_VIEW,
+    ]
+
     for subscriber in subscribers:
         user = subscriber.user
-        is_reviewer = (
-            user and not user.deleted and user.email and
-            acl.is_user_any_kind_of_reviewer(user))
-        if is_reviewer:
-            subscriber.send_notification(sender)
+        is_active_user = user and not user.deleted and user.email
+        is_reviewer_and_listed_submission = (
+            subscriber.channel == amo.CHANNEL_LISTED
+            and instance.channel == amo.CHANNEL_LISTED
+            and any(acl.action_allowed_for(user, perm) for perm in listed_perms)
+        )
+        action_allowed_unlisted = any(
+            acl.action_allowed_for(user, perm) for perm in unlisted_perms
+        )
+        is_unlisted_reviewer_and_unlisted_submission = (
+            subscriber.channel == amo.CHANNEL_UNLISTED
+            and instance.channel == amo.CHANNEL_UNLISTED
+            and action_allowed_unlisted
+        )
+        is_unlisted_reviewer_and_enterprise_submission = (
+            subscriber.channel == amo.CHANNEL_ENTERPRISE
+            and instance.channel == amo.CHANNEL_ENTERPRISE
+            and action_allowed_unlisted
+        )
+        if is_active_user and (
+            is_reviewer_and_listed_submission
+            or is_unlisted_reviewer_and_unlisted_submission
+            or is_unlisted_reviewer_and_enterprise_submission
+        ):
+            subscriber.send_notification(instance)
 
 
 version_uploaded.connect(send_notifications, dispatch_uid='send_notifications')
-
-
-class ReviewerScore(ModelBase):
-    id = PositiveAutoField(primary_key=True)
-    user = models.ForeignKey(UserProfile, related_name='_reviewer_scores')
-    addon = models.ForeignKey(Addon, blank=True, null=True, related_name='+')
-    version = models.ForeignKey(Version, blank=True, null=True,
-                                related_name='+')
-    score = models.IntegerField()
-    # For automated point rewards.
-    note_key = models.SmallIntegerField(choices=amo.REVIEWED_CHOICES.items(),
-                                        default=0)
-    # For manual point rewards with a note.
-    note = models.CharField(max_length=255)
-
-    class Meta:
-        db_table = 'reviewer_scores'
-        ordering = ('-created',)
-
-    @classmethod
-    def get_key(cls, key=None, invalidate=False):
-        namespace = 'riscore'
-        if not key:  # Assuming we're invalidating the namespace.
-            cache_ns_key(namespace, invalidate)
-            return
-        else:
-            # Using cache_ns_key so each cache val is invalidated together.
-            ns_key = cache_ns_key(namespace, invalidate)
-            return '%s:%s' % (ns_key, key)
-
-    @classmethod
-    def get_event(cls, addon, status, version=None, post_review=False,
-                  content_review=False):
-        """Return the review event type constant.
-
-        This is determined by the addon.type and the queue the addon is
-        currently in (which is determined from the various parameters sent
-        down from award_points()).
-
-        Note: We're not using addon.status or addon.current_version because
-        this is called after the status/current_version might have been updated
-        by the reviewer action.
-
-        """
-        reviewed_score_name = None
-        if content_review:
-            # Content review always gives the same amount of points.
-            reviewed_score_name = 'REVIEWED_CONTENT_REVIEW'
-        elif post_review:
-            # There are 4 tiers of post-review scores depending on the addon
-            # weight.
-            try:
-                if version is None:
-                    raise AutoApprovalSummary.DoesNotExist
-                weight = version.autoapprovalsummary.weight
-            except AutoApprovalSummary.DoesNotExist as exception:
-                log.exception(
-                    'No such version/auto approval summary when determining '
-                    'event type to award points: %r', exception)
-                weight = 0
-
-            if addon.type == amo.ADDON_DICT:
-                reviewed_score_name = 'REVIEWED_DICT_FULL'
-            elif addon.type in [amo.ADDON_LPAPP, amo.ADDON_LPADDON]:
-                reviewed_score_name = 'REVIEWED_LP_FULL'
-            elif addon.type == amo.ADDON_SEARCH:
-                reviewed_score_name = 'REVIEWED_SEARCH_FULL'
-            elif weight > amo.POST_REVIEW_WEIGHT_HIGHEST_RISK:
-                reviewed_score_name = 'REVIEWED_EXTENSION_HIGHEST_RISK'
-            elif weight > amo.POST_REVIEW_WEIGHT_HIGH_RISK:
-                reviewed_score_name = 'REVIEWED_EXTENSION_HIGH_RISK'
-            elif weight > amo.POST_REVIEW_WEIGHT_MEDIUM_RISK:
-                reviewed_score_name = 'REVIEWED_EXTENSION_MEDIUM_RISK'
-            else:
-                reviewed_score_name = 'REVIEWED_EXTENSION_LOW_RISK'
-        else:
-            if status == amo.STATUS_NOMINATED:
-                queue = 'FULL'
-            elif status == amo.STATUS_PUBLIC:
-                queue = 'UPDATE'
-            else:
-                queue = ''
-
-            if (addon.type in [amo.ADDON_EXTENSION, amo.ADDON_PLUGIN,
-                               amo.ADDON_API] and queue):
-                reviewed_score_name = 'REVIEWED_ADDON_%s' % queue
-            elif addon.type == amo.ADDON_DICT and queue:
-                reviewed_score_name = 'REVIEWED_DICT_%s' % queue
-            elif addon.type in [amo.ADDON_LPAPP, amo.ADDON_LPADDON] and queue:
-                reviewed_score_name = 'REVIEWED_LP_%s' % queue
-            elif addon.type == amo.ADDON_PERSONA:
-                reviewed_score_name = 'REVIEWED_PERSONA'
-            elif addon.type == amo.ADDON_STATICTHEME:
-                reviewed_score_name = 'REVIEWED_STATICTHEME'
-            elif addon.type == amo.ADDON_SEARCH and queue:
-                reviewed_score_name = 'REVIEWED_SEARCH_%s' % queue
-            elif addon.type == amo.ADDON_THEME and queue:
-                reviewed_score_name = 'REVIEWED_XUL_THEME_%s' % queue
-
-        if reviewed_score_name:
-            return getattr(amo, reviewed_score_name)
-        return None
-
-    @classmethod
-    def award_points(cls, user, addon, status, version=None,
-                     post_review=False, content_review=False,
-                     extra_note=''):
-        """Awards points to user based on an event and the queue.
-
-        `event` is one of the `REVIEWED_` keys in constants.
-        `status` is one of the `STATUS_` keys in constants.
-        `version` is the `Version` object that was affected by the review.
-        `post_review` is set to True if the add-on was auto-approved and the
-                      reviewer is confirming/rejecting post-approval.
-        `content_review` is set to True if it's a content-only review of an
-                         auto-approved add-on.
-
-        """
-
-        # If a webextension file gets approved manually (e.g. because
-        # auto-approval is disabled), 'post-review' is set to False, treating
-        # the file as a legacy file which is not what we want. The file is
-        # still a webextension and should treated as such, regardless of
-        # auto-approval being disabled or not.
-        # As a hack, we set 'post_review' to True.
-        if (version and
-                version.is_webextension and
-                addon.type in amo.GROUP_TYPE_ADDON):
-            post_review = True
-
-        user_log.info(
-            (u'Determining award points for user %s for version %s of addon %s'
-             % (user, version, addon.id)).encode('utf-8'))
-
-        event = cls.get_event(
-            addon, status, version=version, post_review=post_review,
-            content_review=content_review)
-        score = amo.REVIEWED_SCORES.get(event)
-
-        user_log.info(
-            (u'Determined %s award points (event: %s) for user %s for version '
-             u'%s of addon %s' % (score, event, user, version, addon.id))
-            .encode('utf-8'))
-
-        # Add bonus to reviews greater than our limit to encourage fixing
-        # old reviews. Does not apply to content-review/post-review at the
-        # moment, because it would need to be calculated differently.
-        award_overdue_bonus = (
-            version and version.nomination and
-            not post_review and not content_review)
-        if award_overdue_bonus:
-            waiting_time_days = (datetime.now() - version.nomination).days
-            days_over = waiting_time_days - amo.REVIEWED_OVERDUE_LIMIT
-            if days_over > 0:
-                bonus = days_over * amo.REVIEWED_OVERDUE_BONUS
-                score = score + bonus
-
-        if score is not None:
-            cls.objects.create(user=user, addon=addon, score=score,
-                               note_key=event, note=extra_note,
-                               version=version)
-            cls.get_key(invalidate=True)
-            user_log.info(
-                (u'Awarding %s points to user %s for "%s" for addon %s' % (
-                    score, user, amo.REVIEWED_CHOICES[event], addon.id))
-                .encode('utf-8'))
-        return score
-
-    @classmethod
-    def award_moderation_points(cls, user, addon, review_id, undo=False):
-        """Awards points to user based on moderated review."""
-        event = (amo.REVIEWED_ADDON_REVIEW if not undo else
-                 amo.REVIEWED_ADDON_REVIEW_POORLY)
-        score = amo.REVIEWED_SCORES.get(event)
-
-        cls.objects.create(user=user, addon=addon, score=score, note_key=event)
-        cls.get_key(invalidate=True)
-        user_log.info(
-            u'Awarding %s points to user %s for "%s" for review %s' % (
-                score, user, amo.REVIEWED_CHOICES[event], review_id))
-
-    @classmethod
-    def get_total(cls, user):
-        """Returns total points by user."""
-        key = cls.get_key('get_total:%s' % user.id)
-        val = cache.get(key)
-        if val is not None:
-            return val
-
-        val = list(ReviewerScore.objects.filter(user=user)
-                                        .aggregate(total=Sum('score'))
-                                        .values())[0]
-        if val is None:
-            val = 0
-
-        cache.set(key, val, None)
-        return val
-
-    @classmethod
-    def get_recent(cls, user, limit=5, addon_type=None):
-        """Returns most recent ReviewerScore records."""
-        key = cls.get_key('get_recent:%s' % user.id)
-        val = cache.get(key)
-        if val is not None:
-            return val
-
-        val = ReviewerScore.objects.filter(user=user)
-        if addon_type is not None:
-            val.filter(addon__type=addon_type)
-
-        val = list(val[:limit])
-        cache.set(key, val, None)
-        return val
-
-    @classmethod
-    def get_breakdown(cls, user):
-        """Returns points broken down by addon type."""
-        key = cls.get_key('get_breakdown:%s' % user.id)
-        val = cache.get(key)
-        if val is not None:
-            return val
-
-        sql = """
-             SELECT `reviewer_scores`.*,
-                    SUM(`reviewer_scores`.`score`) AS `total`,
-                    `addons`.`addontype_id` AS `atype`
-             FROM `reviewer_scores`
-             LEFT JOIN `addons` ON (`reviewer_scores`.`addon_id`=`addons`.`id`)
-             WHERE `reviewer_scores`.`user_id` = %s
-             GROUP BY `addons`.`addontype_id`
-             ORDER BY `total` DESC
-        """
-        val = list(ReviewerScore.objects.raw(sql, [user.id]))
-        cache.set(key, val, None)
-        return val
-
-    @classmethod
-    def get_breakdown_since(cls, user, since):
-        """
-        Returns points broken down by addon type since the given datetime.
-        """
-        key = cls.get_key('get_breakdown:%s:%s' % (user.id, since.isoformat()))
-        val = cache.get(key)
-        if val is not None:
-            return val
-
-        sql = """
-             SELECT `reviewer_scores`.*,
-                    SUM(`reviewer_scores`.`score`) AS `total`,
-                    `addons`.`addontype_id` AS `atype`
-             FROM `reviewer_scores`
-             LEFT JOIN `addons` ON (`reviewer_scores`.`addon_id`=`addons`.`id`)
-             WHERE `reviewer_scores`.`user_id` = %s AND
-                   `reviewer_scores`.`created` >= %s
-             GROUP BY `addons`.`addontype_id`
-             ORDER BY `total` DESC
-        """
-        val = list(ReviewerScore.objects.raw(sql, [user.id, since]))
-        cache.set(key, val, 3600)
-        return val
-
-    @classmethod
-    def _leaderboard_list(cls, since=None, types=None, addon_type=None):
-        """
-        Returns base leaderboard list. Each item will be a tuple containing
-        (user_id, name, total).
-        """
-
-        reviewers = (UserProfile.objects
-                                .filter(groups__name__startswith='Reviewers: ')
-                                .exclude(groups__name__in=('Staff', 'Admins',
-                                         'No Reviewer Incentives'))
-                                .distinct())
-        qs = (cls.objects
-                 .values_list('user__id')
-                 .filter(user__in=reviewers)
-                 .annotate(total=Sum('score'))
-                 .order_by('-total'))
-
-        if since is not None:
-            qs = qs.filter(created__gte=since)
-
-        if types is not None:
-            qs = qs.filter(note_key__in=types)
-
-        if addon_type is not None:
-            qs = qs.filter(addon__type=addon_type)
-
-        users = {reviewer.pk: reviewer for reviewer in reviewers}
-        return [
-            (item[0], users.get(item[0], UserProfile()).name, item[1])
-            for item in qs]
-
-    @classmethod
-    def get_leaderboards(cls, user, days=7, types=None, addon_type=None):
-        """Returns leaderboards with ranking for the past given days.
-
-        This will return a dict of 3 items::
-
-            {'leader_top': [...],
-             'leader_near: [...],
-             'user_rank': (int)}
-
-        If the user is not in the leaderboard, or if the user is in the top 5,
-        'leader_near' will be an empty list and 'leader_top' will contain 5
-        elements instead of the normal 3.
-
-        """
-        key = cls.get_key('get_leaderboards:%s' % user.id)
-        val = cache.get(key)
-        if val is not None:
-            return val
-
-        week_ago = date.today() - timedelta(days=days)
-
-        leader_top = []
-        leader_near = []
-
-        leaderboard = cls._leaderboard_list(
-            since=week_ago, types=types, addon_type=addon_type)
-
-        scores = []
-
-        user_rank = 0
-        in_leaderboard = False
-        for rank, row in enumerate(leaderboard, 1):
-            user_id, name, total = row
-            scores.append({
-                'user_id': user_id,
-                'name': name,
-                'rank': rank,
-                'total': int(total),
-            })
-            if user_id == user.id:
-                user_rank = rank
-                in_leaderboard = True
-
-        if not in_leaderboard:
-            leader_top = scores[:5]
-        else:
-            if user_rank <= 5:  # User is in top 5, show top 5.
-                leader_top = scores[:5]
-            else:
-                leader_top = scores[:3]
-                leader_near = [scores[user_rank - 2], scores[user_rank - 1]]
-                try:
-                    leader_near.append(scores[user_rank])
-                except IndexError:
-                    pass  # User is last on the leaderboard.
-
-        val = {
-            'leader_top': leader_top,
-            'leader_near': leader_near,
-            'user_rank': user_rank,
-        }
-        cache.set(key, val, None)
-        return val
-
-    @classmethod
-    def all_users_by_score(cls):
-        """
-        Returns reviewers ordered by highest total points first.
-        """
-        leaderboard = cls._leaderboard_list()
-        scores = []
-
-        for row in leaderboard:
-            user_id, name, total = row
-            user_level = len(amo.REVIEWED_LEVELS) - 1
-            for i, level in enumerate(amo.REVIEWED_LEVELS):
-                if total < level['points']:
-                    user_level = i - 1
-                    break
-
-            # Only show level if it changes.
-            if user_level < 0:
-                level = ''
-            else:
-                level = six.text_type(amo.REVIEWED_LEVELS[user_level]['name'])
-
-            scores.append({
-                'user_id': user_id,
-                'name': name,
-                'total': int(total),
-                'level': level,
-            })
-
-        prev = None
-        for score in reversed(scores):
-            if score['level'] == prev:
-                score['level'] = ''
-            else:
-                prev = score['level']
-
-        return scores
-
-
-class AutoApprovalNotEnoughFilesError(Exception):
-    pass
 
 
 class AutoApprovalNoValidationResultError(Exception):
     pass
 
 
-@python_2_unicode_compatible
 class AutoApprovalSummary(ModelBase):
     """Model holding the results of an auto-approval attempt on a Version."""
-    version = models.OneToOneField(
-        Version, on_delete=models.CASCADE, primary_key=True)
-    is_locked = models.BooleanField(default=False)
-    has_auto_approval_disabled = models.BooleanField(default=False)
+
+    version = models.OneToOneField(Version, on_delete=models.CASCADE, primary_key=True)
+    is_locked = models.BooleanField(default=False, help_text='Is locked by a reviewer')
+    has_auto_approval_disabled = models.BooleanField(
+        default=False, help_text='Has auto-approval disabled/delayed flag set'
+    )
+    is_promoted_prereview = models.BooleanField(
+        default=False,
+        help_text='Is in a promoted add-on group that requires pre-review',
+    )
+    should_be_delayed = models.BooleanField(
+        default=False, help_text="Delayed because it's the first listed version"
+    )
+    is_blocked = models.BooleanField(
+        default=False, help_text='Version string and guid match a blocklist Block'
+    )
+    is_pending_rejection = models.BooleanField(
+        default=False, help_text='Is pending rejection'
+    )
+    is_waiting_on_scanners = models.BooleanField(
+        default=False, help_text='Is waiting on scanners'
+    )
+    scanner_actions_executed = models.BooleanField(
+        default=False, null=True, help_text='Scanner actions have been executed'
+    )
     verdict = models.PositiveSmallIntegerField(
-        choices=amo.AUTO_APPROVAL_VERDICT_CHOICES,
-        default=amo.NOT_AUTO_APPROVED)
+        choices=amo.AUTO_APPROVAL_VERDICT_CHOICES, default=amo.NOT_AUTO_APPROVED
+    )
     weight = models.IntegerField(default=0)
-    confirmed = models.NullBooleanField(default=None)
+    metadata_weight = models.IntegerField(default=0)
+    code_weight = models.IntegerField(default=0)
+    weight_info = models.JSONField(default=dict, null=True)
+    confirmed = models.BooleanField(null=True, default=None)
 
     class Meta:
         db_table = 'editors_autoapprovalsummary'
 
+    # List of fields to check when determining whether a version should be
+    # auto-approved or not. Each should be a boolean, a value of true means
+    # the version will *not* auto-approved. Each should have a corresponding
+    # check_<reason>(version) classmethod defined that will be used by
+    # create_summary_for_version() to set the corresponding field on the
+    # instance.
+    auto_approval_verdict_fields = (
+        'has_auto_approval_disabled',
+        'is_locked',
+        'is_promoted_prereview',
+        'should_be_delayed',
+        'is_blocked',
+        'is_pending_rejection',
+        'is_waiting_on_scanners',
+    )
+
     def __str__(self):
-        return u'%s %s' % (self.version.addon.name, self.version)
+        return f'{self.version.addon.name} {self.version}'
 
     def calculate_weight(self):
         """Calculate the weight value for this version according to various
-        risk factors, setting the weight property on the instance and returning
-        a dict of risk factors.
+        risk factors, setting the weight (an integer) and weight_info (a dict
+        of risk factors strings -> integer values) properties on the instance.
 
-        That value is then used in reviewer tools to prioritize add-ons in the
-        auto-approved queue."""
-        # Note: for the moment, some factors are in direct contradiction with
-        # the rules determining whether or not an add-on can be auto-approved
-        # in the first place, but we'll relax those rules as we move towards
-        # post-review.
+        The weight value is then used in reviewer tools to prioritize add-ons
+        in the auto-approved queue, the weight_info shown to reviewers in the
+        review page."""
+        metadata_weight_factors = self.calculate_metadata_weight_factors()
+        code_weight_factors = self.calculate_code_weight_factors()
+        self.metadata_weight = sum(metadata_weight_factors.values())
+        self.code_weight = sum(code_weight_factors.values())
+        self.weight_info = {
+            k: v
+            for k, v in dict(**metadata_weight_factors, **code_weight_factors).items()
+            # No need to keep 0 value items in the breakdown in the db, they won't be
+            # displayed anyway.
+            if v
+        }
+        self.weight = self.metadata_weight + self.code_weight
+        return self.weight_info
+
+    def calculate_metadata_weight_factors(self):
         addon = self.version.addon
         one_year_ago = (self.created or datetime.now()) - timedelta(days=365)
         six_weeks_ago = (self.created or datetime.now()) - timedelta(days=42)
         factors = {
-            # Add-ons under admin code review: 100 added to weight.
-            'admin_code_review': 100 if addon.needs_admin_code_review else 0,
             # Each abuse reports for the add-on or one of the listed developers
             # in the last 6 weeks adds 15 to the weight, up to a maximum of
             # 100.
             'abuse_reports': min(
-                AbuseReport.objects
-                .filter(Q(addon=addon) | Q(user__in=addon.listed_authors))
-                .filter(created__gte=six_weeks_ago).count() * 15, 100),
+                AbuseReport.objects.filter(
+                    Q(guid=addon.guid) | Q(user__in=addon.listed_authors)
+                )
+                .filter(created__gte=six_weeks_ago)
+                .count()
+                * 15,
+                100,
+            ),
             # 1% of the total of "recent" ratings with a score of 3 or less
             # adds 2 to the weight, up to a maximum of 100.
-            'negative_ratings': min(int(
-                Rating.objects
-                .filter(addon=addon)
-                .filter(rating__lte=3, created__gte=one_year_ago)
-                .count() / 100.0 * 2.0), 100),
+            'negative_ratings': min(
+                int(
+                    Rating.objects.filter(addon=addon)
+                    .filter(rating__lte=3, created__gte=one_year_ago)
+                    .count()
+                    / 100.0
+                    * 2.0
+                ),
+                100,
+            ),
             # Reputation is set by admin - the value is inverted to add from
             # -300 (decreasing priority for "trusted" add-ons) to 0.
-            'reputation': (
-                max(min(int(addon.reputation or 0) * -100, 0), -300)),
+            'reputation': (max(min(int(addon.reputation or 0) * -100, 0), -300)),
             # Average daily users: value divided by 10000 is added to the
             # weight, up to a maximum of 100.
-            'average_daily_users': min(
-                addon.average_daily_users // 10000, 100),
-            # Pas rejection history: each "recent" rejected version (disabled
-            # with an original status of null, so not disabled by a developer)
+            'average_daily_users': min(addon.average_daily_users // 10000, 100),
+            # Past rejection history: each "recent" rejected version
             # adds 10 to the weight, up to a maximum of 100.
             'past_rejection_history': min(
-                Version.objects
-                .filter(addon=addon,
-                        files__reviewed__gte=one_year_ago,
-                        files__original_status=amo.STATUS_NULL,
-                        files__status=amo.STATUS_DISABLED)
-                .distinct().count() * 10, 100),
+                Version.objects.filter(
+                    addon=addon,
+                    human_review_date__gte=one_year_ago,
+                    file__status_disabled_reason=File.STATUS_DISABLED_REASONS.NONE,
+                    file__status=amo.STATUS_DISABLED,
+                ).count()
+                * 10,
+                100,
+            ),
         }
-        factors.update(self.calculate_static_analysis_weight_factors())
-        self.weight = sum(factors.values())
         return factors
 
-    def calculate_static_analysis_weight_factors(self):
+    def calculate_code_weight_factors(self):
         """Calculate the static analysis risk factors, returning a dict of
         risk factors.
 
         Used by calculate_weight()."""
         try:
             innerhtml_count = self.count_uses_innerhtml(self.version)
-            unknown_minified_code_count = (
-                self.count_uses_unknown_minified_code(self.version))
+            unknown_minified_code_count = self.count_uses_unknown_minified_code(
+                self.version
+            )
 
             factors = {
                 # Static analysis flags from linter:
                 # eval() or document.write(): 50.
                 'uses_eval_or_document_write': (
-                    50 if self.count_uses_eval_or_document_write(self.version)
-                    else 0),
+                    50 if self.count_uses_eval_or_document_write(self.version) else 0
+                ),
                 # Implied eval in setTimeout/setInterval/ on* attributes: 5.
                 'uses_implied_eval': (
-                    5 if self.count_uses_implied_eval(self.version)
-                    else 0),
+                    5 if self.count_uses_implied_eval(self.version) else 0
+                ),
                 # innerHTML / unsafe DOM: 50+10 per instance.
                 'uses_innerhtml': (
-                    50 + 10 * (innerhtml_count - 1) if innerhtml_count else 0),
+                    50 + 10 * (innerhtml_count - 1) if innerhtml_count else 0
+                ),
                 # custom CSP: 90.
                 'uses_custom_csp': (
-                    90 if self.count_uses_custom_csp(self.version)
-                    else 0),
+                    90 if self.count_uses_custom_csp(self.version) else 0
+                ),
                 # nativeMessaging permission: 100.
                 'uses_native_messaging': (
-                    100 if self.check_uses_native_messaging(self.version)
-                    else 0),
+                    100 if self.check_uses_native_messaging(self.version) else 0
+                ),
                 # remote scripts: 100.
                 'uses_remote_scripts': (
-                    100 if self.count_uses_remote_scripts(self.version)
-                    else 0),
+                    100 if self.count_uses_remote_scripts(self.version) else 0
+                ),
                 # violates mozilla conditions of use: 20.
                 'violates_mozilla_conditions': (
-                    20 if self.count_violates_mozilla_conditions(self.version)
-                    else 0),
+                    20 if self.count_violates_mozilla_conditions(self.version) else 0
+                ),
                 # libraries of unreadable code: 100+10 per instance.
                 'uses_unknown_minified_code': (
                     100 + 10 * (unknown_minified_code_count - 1)
-                    if unknown_minified_code_count else 0),
+                    if unknown_minified_code_count
+                    else 0
+                ),
                 # Size of code changes: 5kB is one point, up to a max of 100.
                 'size_of_code_changes': min(
-                    self.calculate_size_of_code_changes() // 5000, 100),
+                    self.calculate_size_of_code_changes() // 5000, 100
+                ),
                 # Seems to be using a coinminer: 2000
                 'uses_coinminer': (
-                    2000 if self.count_uses_uses_coinminer(self.version)
-                    else 0),
+                    2000 if self.count_uses_uses_coinminer(self.version) else 0
+                ),
             }
         except AutoApprovalNoValidationResultError:
             # We should have a FileValidationResult... since we don't and
@@ -912,14 +431,27 @@ class AutoApprovalSummary(ModelBase):
             }
         return factors
 
+    def get_pretty_weight_info(self):
+        """Returns a list of strings containing weight information."""
+        if self.weight_info:
+            weight_info = sorted(
+                '%s: %d' % (k, v) for k, v in self.weight_info.items() if v
+            )
+        else:
+            weight_info = ['Weight breakdown not available.']
+        return weight_info
+
     def find_previous_confirmed_version(self):
         """Return the most recent version in the add-on history that has been
         confirmed, excluding the one this summary is about, or None if there
         isn't one."""
         addon = self.version.addon
         try:
-            version = addon.versions.exclude(pk=self.version.pk).filter(
-                autoapprovalsummary__confirmed=True).latest()
+            version = (
+                addon.versions.exclude(pk=self.version.pk)
+                .filter(autoapprovalsummary__confirmed=True)
+                .latest()
+            )
         except Version.DoesNotExist:
             version = None
         return version
@@ -927,23 +459,18 @@ class AutoApprovalSummary(ModelBase):
     def calculate_size_of_code_changes(self):
         """Return the size of code changes between the version being
         approved and the previous public one."""
+
         def find_code_size(version):
-            # There could be multiple files: if that's the case, take the
-            # total for all files and divide it by the number of files.
-            number_of_files = len(version.all_files) or 1
-            total_code_size = 0
-            for file_ in version.all_files:
-                data = json.loads(file_.validation.validation)
-                total_code_size += (
-                    data.get('metadata', {}).get('totalScannedFileSize', 0))
-            return total_code_size // number_of_files
+            data = json.loads(version.file.validation.validation)
+            total_code_size = data.get('metadata', {}).get('totalScannedFileSize', 0)
+            return total_code_size
 
         try:
             old_version = self.find_previous_confirmed_version()
             old_size = find_code_size(old_version) if old_version else 0
             new_size = find_code_size(self.version)
-        except FileValidation.DoesNotExist:
-            raise AutoApprovalNoValidationResultError()
+        except FileValidation.DoesNotExist as exc:
+            raise AutoApprovalNoValidationResultError() from exc
         # We don't really care about whether it's a negative or positive change
         # in size, we just need the absolute value (if there is no current
         # public version, that value ends up being the total code size of the
@@ -952,7 +479,7 @@ class AutoApprovalSummary(ModelBase):
 
     def calculate_verdict(self, dry_run=False, pretty=False):
         """Calculate the verdict for this instance based on the values set
-        on it and the current configuration.
+        on it previously and the current configuration.
 
         Return a dict containing more information about what critera passed
         or not."""
@@ -963,11 +490,8 @@ class AutoApprovalSummary(ModelBase):
             success_verdict = amo.AUTO_APPROVED
             failure_verdict = amo.NOT_AUTO_APPROVED
 
-        # Currently the only thing that can prevent approval are a reviewer
-        # lock and having auto-approval disabled flag set on the add-on.
         verdict_info = {
-            'is_locked': self.is_locked,
-            'has_auto_approval_disabled': self.has_auto_approval_disabled,
+            key: bool(getattr(self, key)) for key in self.auto_approval_verdict_fields
         }
         if any(verdict_info.values()):
             self.verdict = failure_verdict
@@ -983,39 +507,31 @@ class AutoApprovalSummary(ModelBase):
     def verdict_info_prettifier(cls, verdict_info):
         """Return a generator of strings representing the a verdict_info
         (as computed by calculate_verdict()) in human-readable form."""
-        mapping = {
-            'is_locked': ugettext('Is locked by a reviewer.'),
-            'has_auto_approval_disabled': ugettext(
-                'Has auto-approval disabled flag set.')
-        }
-        return (mapping[key] for key, value in sorted(verdict_info.items())
-                if value)
+        return (
+            str(cls._meta.get_field(key).help_text)
+            for key, value in sorted(verdict_info.items())
+            if value
+        )
 
     @classmethod
     def _count_linter_flag(cls, version, flag):
-        def _count_linter_flag_in_file(file_):
-            try:
-                validation = file_.validation
-            except FileValidation.DoesNotExist:
-                raise AutoApprovalNoValidationResultError()
-            validation_data = json.loads(validation.validation)
-            return sum(flag in message['id']
-                       for message in validation_data.get('messages', []))
-        return max(_count_linter_flag_in_file(file_)
-                   for file_ in version.all_files)
+        try:
+            validation = version.file.validation
+        except FileValidation.DoesNotExist as exc:
+            raise AutoApprovalNoValidationResultError() from exc
+        validation_data = json.loads(validation.validation)
+        return sum(
+            flag in message['id'] for message in validation_data.get('messages', [])
+        )
 
     @classmethod
     def _count_metadata_property(cls, version, prop):
-        def _count_property_in_linter_metadata_in_file(file_):
-            try:
-                validation = file_.validation
-            except FileValidation.DoesNotExist:
-                raise AutoApprovalNoValidationResultError()
-            validation_data = json.loads(validation.validation)
-            return len(validation_data.get(
-                'metadata', {}).get(prop, []))
-        return max(_count_property_in_linter_metadata_in_file(file_)
-                   for file_ in version.all_files)
+        try:
+            validation = version.file.validation
+        except FileValidation.DoesNotExist as exc:
+            raise AutoApprovalNoValidationResultError() from exc
+        validation_data = json.loads(validation.validation)
+        return len(validation_data.get('metadata', {}).get(prop, []))
 
     @classmethod
     def count_uses_unknown_minified_code(cls, version):
@@ -1031,9 +547,9 @@ class AutoApprovalSummary(ModelBase):
 
     @classmethod
     def count_uses_eval_or_document_write(cls, version):
-        return (
-            cls._count_linter_flag(version, 'NO_DOCUMENT_WRITE') or
-            cls._count_linter_flag(version, 'DANGEROUS_EVAL'))
+        return cls._count_linter_flag(
+            version, 'NO_DOCUMENT_WRITE'
+        ) or cls._count_linter_flag(version, 'DANGEROUS_EVAL')
 
     @classmethod
     def count_uses_implied_eval(cls, version):
@@ -1053,17 +569,136 @@ class AutoApprovalSummary(ModelBase):
 
     @classmethod
     def check_uses_native_messaging(cls, version):
-        return any('nativeMessaging' in file_.webext_permissions_list
-                   for file_ in version.all_files)
+        return 'nativeMessaging' in version.file.permissions
 
     @classmethod
     def check_is_locked(cls, version):
-        locked = get_reviewing_cache(version.addon.pk)
-        return bool(locked) and locked != settings.TASK_USER_ID
+        """Check whether the add-on is locked by a reviewer.
+
+        Doesn't apply to langpacks, which are submitted as part of Firefox
+        release process and should always be auto-approved."""
+        is_langpack = version.addon.type == amo.ADDON_LPAPP
+        locked_by = get_reviewing_cache(version.addon.pk)
+        return (
+            not is_langpack and bool(locked_by) and locked_by != settings.TASK_USER_ID
+        )
 
     @classmethod
     def check_has_auto_approval_disabled(cls, version):
-        return bool(version.addon.auto_approval_disabled)
+        """Check whether the add-on has auto approval disabled or delayed.
+
+        It could be:
+        - Disabled
+        - Disabled until next manual approval
+        - Delayed until a future date
+
+        Those flags are set by scanners or reviewers for a specific channel.
+        They are ignored for enterprise versions, which should not have their
+        auto-approval disabled or delayed.
+        """
+        if version.channel == amo.CHANNEL_ENTERPRISE:
+            return False
+        addon = version.addon
+        flag_suffix = '_unlisted' if version.channel == amo.CHANNEL_UNLISTED else ''
+        auto_approval_disabled = bool(
+            getattr(addon, f'auto_approval_disabled{flag_suffix}')
+        )
+        auto_approval_disabled_until_next_approval = bool(
+            getattr(addon, f'auto_approval_disabled_until_next_approval{flag_suffix}')
+        )
+        auto_approval_delayed_until = getattr(
+            addon, f'auto_approval_delayed_until{flag_suffix}'
+        )
+        return bool(
+            auto_approval_disabled
+            or auto_approval_disabled_until_next_approval
+            or (
+                auto_approval_delayed_until
+                and datetime.now() < auto_approval_delayed_until
+            )
+        )
+
+    @classmethod
+    def check_is_promoted_prereview(cls, version):
+        """Check whether the add-on is a promoted addon group that requires
+        pre-review."""
+        promotions = version.addon.promoted_groups(currently_approved=False)
+
+        return bool(
+            promotions.exists()
+            and (
+                (
+                    version.channel == amo.CHANNEL_LISTED
+                    and any(promotions.listed_pre_review)
+                )
+                or (
+                    version.channel == amo.CHANNEL_UNLISTED
+                    and any(promotions.unlisted_pre_review)
+                )
+            )
+        )
+
+    @classmethod
+    def check_should_be_delayed(cls, version):
+        """Check whether the add-on is new enough that the auto-approval of the
+        version should be delayed for 24 hours to catch spam.
+
+        Doesn't apply to langpacks, which are submitted as part of Firefox
+        release process and should always be auto-approved.
+        Only applies to listed versions.
+        """
+        addon = version.addon
+        is_langpack = addon.type == amo.ADDON_LPAPP
+        now = datetime.now()
+        content_review = addon.content_review_status
+        INITIAL_AUTO_APPROVAL_DELAY_FOR_LISTED = get_config(
+            amo.config_keys.INITIAL_AUTO_APPROVAL_DELAY_FOR_LISTED
+        )
+        return (
+            not is_langpack
+            and version.channel == amo.CHANNEL_LISTED
+            and version.addon.status == amo.STATUS_NOMINATED
+            and now - version.created
+            < timedelta(seconds=INITIAL_AUTO_APPROVAL_DELAY_FOR_LISTED)
+            and content_review != AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PASS
+        )
+
+    @classmethod
+    def check_is_blocked(cls, version):
+        """Check if the version matches a Block in the blocklist.  Such uploads
+        would have been prevented, but if it was uploaded before the Block was
+        created, it's possible it'll still be pending."""
+        return version.is_blocked
+
+    @classmethod
+    def check_is_pending_rejection(cls, version):
+        """Check whether the version is pending rejection. We don't
+        auto-approve those versions, since it would just be confusing as they
+        are eventually going to be rejected automatically anyway."""
+        return bool(version.pending_rejection)
+
+    @classmethod
+    def check_is_waiting_on_scanners(cls, version):
+        """Check whether the version is still waiting on scanner results.
+
+        We wait for each active scanner webhook configured to fire on a
+        blocking auto-approval event. See `is_waiting_on_scanner_webhook_events()`
+        for what "waiting" means exactly.
+        """
+        from olympia.scanners.tasks import is_waiting_on_scanner_webhook_events
+
+        # This switch would only be used in case of an emergency.
+        if waffle.switch_is_active('disable-check-is-waiting-on-scanners'):
+            return False
+
+        # Prevent langpacks from getting stuck on waiting.
+        if version.addon.type == amo.ADDON_LPAPP:
+            return False
+
+        return is_waiting_on_scanner_webhook_events(
+            version=version,
+            event_ids=WEBHOOK_EVENTS_BLOCKING_AUTO_APPROVAL,
+        )
 
     @classmethod
     def create_summary_for_version(cls, version, dry_run=False):
@@ -1081,16 +716,11 @@ class AutoApprovalSummary(ModelBase):
         If not using dry_run it's the caller responsability to approve the
         version to make sure the AutoApprovalSummary is not overwritten later
         when the auto-approval process fires again."""
-        if len(version.all_files) == 0:
-            raise AutoApprovalNotEnoughFilesError()
-
         data = {
-            'version': version,
-            'is_locked': cls.check_is_locked(version),
-            'has_auto_approval_disabled': cls.check_has_auto_approval_disabled(
-                version)
+            field: getattr(cls, f'check_{field}')(version)
+            for field in cls.auto_approval_verdict_fields
         }
-        instance = cls(**data)
+        instance = cls(version=version, **data)
         verdict_info = instance.calculate_verdict(dry_run=dry_run)
         instance.calculate_weight()
         # We can't do instance.save(), because we want to handle the case where
@@ -1098,127 +728,419 @@ class AutoApprovalSummary(ModelBase):
         # calculated in data and use update_or_create().
         data['verdict'] = instance.verdict
         data['weight'] = instance.weight
-        instance, _ = cls.objects.update_or_create(
-            version=version, defaults=data)
+        data['metadata_weight'] = instance.metadata_weight
+        data['code_weight'] = instance.code_weight
+        data['weight_info'] = instance.weight_info
+        instance, _ = cls.objects.update_or_create(version=version, defaults=data)
         return instance, verdict_info
 
-    @classmethod
-    def get_auto_approved_queue(cls, admin_reviewer=False):
-        """Return a queryset of Addon objects that have been auto-approved but
-        not confirmed by a human yet."""
-        success_verdict = amo.AUTO_APPROVED
-        qs = (
-            Addon.objects.public()
-            .filter(
-                _current_version__autoapprovalsummary__verdict=success_verdict)
-            .exclude(
-                _current_version__autoapprovalsummary__confirmed=True)
-        )
-        if not admin_reviewer:
-            qs = qs.exclude(addonreviewerflags__needs_admin_code_review=True)
-        return qs
 
-    @classmethod
-    def get_content_review_queue(cls, admin_reviewer=False):
-        """Return a queryset of Addon objects that have been auto-approved and
-        need content review."""
-        success_verdict = amo.AUTO_APPROVED
-        qs = (
-            Addon.objects.public()
-            .filter(
-                _current_version__autoapprovalsummary__verdict=success_verdict,
-                addonapprovalscounter__last_content_review=None)
-        )
-        if not admin_reviewer:
-            qs = qs.exclude(
-                addonreviewerflags__needs_admin_content_review=True)
-        return qs
-
-
-class RereviewQueueThemeManager(ManagerBase):
-
-    def __init__(self, include_deleted=False):
-        # DO NOT change the default value of include_deleted unless you've read
-        # through the comment just above the Addon managers
-        # declaration/instantiation and understand the consequences.
-        ManagerBase.__init__(self)
-        self.include_deleted = include_deleted
-
-    def get_queryset(self):
-        qs = super(RereviewQueueThemeManager, self).get_queryset()
-        if self.include_deleted:
-            return qs
-        else:
-            return qs.exclude(theme__addon__status=amo.STATUS_DELETED)
-
-
-@python_2_unicode_compatible
-class RereviewQueueTheme(ModelBase):
-    id = PositiveAutoField(primary_key=True)
-    theme = models.ForeignKey(Persona)
-    header = models.CharField(max_length=72, blank=True, default='')
-
-    # Holds whether this reuploaded theme is a duplicate.
-    dupe_persona = models.ForeignKey(Persona, null=True,
-                                     related_name='dupepersona')
-
-    # The order of those managers is very important: please read the lengthy
-    # comment above the Addon managers declaration/instantiation.
-    unfiltered = RereviewQueueThemeManager(include_deleted=True)
-    objects = RereviewQueueThemeManager()
-
-    class Meta:
-        db_table = 'rereview_queue_theme'
-        # This is very important: please read the lengthy comment in Addon.Meta
-        # description
-        base_manager_name = 'unfiltered'
-
-    def __str__(self):
-        return str(self.id)
-
-    @property
-    def header_path(self):
-        """Return the path to the header image."""
-        return self.theme._image_path(self.header or self.theme.header)
-
-    @property
-    def footer_path(self):
-        """Return the path to the optional footer image."""
-        footer = self.footer or self.theme.footer
-        return footer and self.theme._image_path(footer) or ''
-
-    @property
-    def header_url(self):
-        """Return the url of the header imager."""
-        return self.theme._image_url(self.header or self.theme.header)
-
-    @property
-    def footer_url(self):
-        """Return the url of the optional footer image."""
-        footer = self.footer or self.theme.footer
-        return footer and self.theme._image_url(footer) or ''
-
-
-class ThemeLock(ModelBase):
-    id = PositiveAutoField(primary_key=True)
-    theme = models.OneToOneField('addons.Persona')
-    reviewer = UserForeignKey()
-    expiry = models.DateTimeField()
-
-    class Meta:
-        db_table = 'theme_locks'
-
-
-@python_2_unicode_compatible
 class Whiteboard(ModelBase):
-    addon = models.OneToOneField(
-        Addon, on_delete=models.CASCADE, primary_key=True)
-    private = models.TextField(blank=True)
-    public = models.TextField(blank=True)
+    addon = models.OneToOneField(Addon, on_delete=models.CASCADE, primary_key=True)
+    private = models.TextField(blank=True, max_length=100000)
+    public = models.TextField(blank=True, max_length=100000)
 
     class Meta:
         db_table = 'review_whiteboard'
 
     def __str__(self):
-        return u'[%s] private: |%s| public: |%s|' % (
-            self.addon.name, self.private, self.public)
+        return f'[{self.addon.name}] private: |{self.private}| public: |{self.public}|'
+
+
+class ReviewActionReason(ModelBase):
+    is_active = models.BooleanField(
+        default=True, help_text='Is available to be used in reviews'
+    )
+    name = models.CharField(max_length=255)
+    canned_response = models.TextField(blank=True)
+    canned_block_reason = models.TextField(blank=True)
+    addon_type = models.PositiveIntegerField(
+        choices=amo.REASON_ADDON_TYPE_CHOICES.items(),
+        default=amo.ADDON_ANY,
+    )
+    cinder_policy = models.ForeignKey(
+        CinderPolicy, blank=True, null=True, on_delete=models.SET_NULL
+    )
+
+    def labelled_name(self):
+        return '(** inactive **) ' + self.name if not self.is_active else self.name
+
+    class Meta:
+        ordering = ('name',)
+        constraints = [
+            models.CheckConstraint(
+                name='either_canned_response_or_canned_block_reason_must_be_set',
+                condition=(
+                    ~models.Q(canned_response='') | ~models.Q(canned_block_reason='')
+                ),
+            )
+        ]
+
+    def __str__(self):
+        return str(self.name)
+
+
+class UsageTier(ModelBase):
+    slug = models.CharField(
+        max_length=255,
+        help_text='Slug to help retrieve the UsageTier instance in our code.',
+        unique=True,
+        null=True,
+    )
+    name = models.CharField(max_length=255)
+    lower_adu_threshold = models.IntegerField(default=None, null=True, blank=True)
+    upper_adu_threshold = models.IntegerField(default=None, null=True, blank=True)
+    growth_threshold_before_flagging = models.IntegerField(
+        blank=True,
+        default=None,
+        null=True,
+        help_text='Percentage point increase in growth over the average in that tier '
+        'before we start automatically flagging the add-on for human review. For '
+        'example, if set to 50 and the average hotness in that tier is 0.01, '
+        'add-ons over 0.51 hotness get flagged.',
+    )
+    abuse_reports_ratio_threshold_before_flagging = models.IntegerField(
+        blank=True,
+        default=None,
+        null=True,
+        help_text='Percentage threshold of ratio between non individually actionable '
+        'abuse reports over the past 2 weeks to add-on usage before we start '
+        'automatically flagging the add-on for human review. For example, if set to 2 '
+        'and an add-on in that tier has 10,000 users, it will be flagged after 200 '
+        'reports.',
+    )
+    ratings_ratio_threshold_before_flagging = models.IntegerField(
+        blank=True,
+        default=None,
+        null=True,
+        help_text='Percentage threshold of ratio between ratings over the past 2 weeks'
+        'to add-on usage before we start automatically flagging the add-on for human '
+        'review. '
+        'For example, if set to 5 and an add-on in that tier has 10,000 users, '
+        'it will be flagged after 500 ratings.',
+    )
+    abuse_reports_ratio_threshold_before_blocking = models.IntegerField(
+        blank=True,
+        default=None,
+        null=True,
+        help_text='Percentage threshold of ratio between non individually actionable '
+        'abuse reports over the past 2 weeks to add-on usage before we automatically '
+        'disable and soft-block the add-on. '
+        'For example, if set to 4 and an add-on in that tier has 10,000 users, it will '
+        'be blocked after 400 reports.',
+    )
+    ratings_ratio_threshold_before_blocking = models.IntegerField(
+        blank=True,
+        default=None,
+        null=True,
+        help_text='Percentage threshold of ratio between ratings over the past 2 weeks'
+        'to add-on usage before we automatically disable and soft-block the add-on. '
+        'For example, if set to 5 and an add-on in that tier has 10,000 users, '
+        'it will be blocked after 500 ratings.',
+    )
+    disable_and_block_action_available = models.BooleanField(
+        default=False,
+        help_text='Whether or not the "Force-disable and block" scanner action should'
+        'be available for add-ons belonging to that usage tier.',
+    )
+
+    class Meta:
+        ordering = ('upper_adu_threshold',)
+
+    def __str__(self):
+        return self.name
+
+    @classmethod
+    def get_base_addons(cls):
+        """Return base queryset of add-ons we consider for functionality tied
+        to Usage Tiers.
+
+        This is a classmethod, it is not specific to a particular tier."""
+        return Addon.unfiltered.exclude(status=amo.STATUS_DISABLED).filter(
+            type=amo.ADDON_EXTENSION
+        )
+
+    def get_tier_boundaries(self):
+        """Return boundaries used to filter add-ons for that tier instance."""
+        # We always have a lower bound, but not necessarily a higher one, e.g.
+        # notable doesn't have a ceiling.
+        filters = {'average_daily_users__gte': self.lower_adu_threshold or 0}
+        if self.upper_adu_threshold is not None:
+            filters['average_daily_users__lt'] = self.upper_adu_threshold
+        return filters
+
+    def get_addons(self):
+        """Return add-ons considered as being part of that specific tier.
+
+        See get_base_addon() for additional filters being applied."""
+        return self.get_base_addons().filter(**self.get_tier_boundaries())
+
+    @cached_property
+    def average_growth(self):
+        return (
+            self.get_addons()
+            .aggregate(Avg('hotness', default=0))
+            .get('hotness__avg', 0)
+        )
+
+    def get_growth_threshold(self):
+        """Return the growth threshold for that tier.
+
+        The value is computed from the average growth (hotness) of add-ons in
+        that tier plus the growth_threshold_before_flagging converted to
+        decimal.
+
+        It has a floor of 0."""
+        return max(
+            0, self.average_growth + (self.growth_threshold_before_flagging or 0) / 100
+        )
+
+    def get_growth_threshold_q_object(self):
+        """Return Q object containing filters to apply to find add-ons over the
+        computed growth threshold for that tier."""
+        return Q(
+            hotness__gt=self.get_growth_threshold(),
+            **self.get_tier_boundaries(),
+        )
+
+    def get_abuse_threshold_q_object(self, *, block=False):
+        """Return Q object containing filters to apply to find add-ons over the
+        abuse threshold for that tier.
+
+        `block` is a boolean - False for flagging threshold; True for blocking
+        threshold.
+
+        Depends on the queryset being annotated with
+        `abuse_reports_count=UsageTier.get_abuse_count_subquery()` first."""
+        threshold = (
+            self.abuse_reports_ratio_threshold_before_flagging
+            if not block
+            else self.abuse_reports_ratio_threshold_before_blocking
+        ) or 0
+        return Q(
+            abuse_reports_count__gte=Greatest('average_daily_users', 1)
+            * threshold
+            / 100,
+            **self.get_tier_boundaries(),
+        )
+
+    @classmethod
+    def get_abuse_count_subquery(cls):
+        """Return the Subquery used to annotate `abuse_reports_count`. Needed
+        to use get_abuse_threshold_q_object(block=False)."""
+        abuse_reports_count_qs = (
+            AbuseReport.objects.values('guid')
+            .filter(
+                ~AbuseReport.objects.__class__.is_individually_actionable_q(),
+                guid=OuterRef('guid'),
+                created__gte=datetime.now().date() - timedelta(days=14),
+            )
+            .annotate(guid_abuse_reports_count=Count('*'))
+            .values('guid_abuse_reports_count')
+            .order_by()
+        )
+        return abuse_reports_count_qs
+
+    def get_rating_threshold_q_object(self, *, block=False):
+        """Return Q object containing filters to apply to find add-ons over the
+        rating threshold for that tier.
+
+         `block` is a boolean - False for flagging threshold; True for blocking
+        threshold.
+
+        Depends on the queryset being annotated with
+        `ratings_count=UsageTier.get_rating_count_subquery()` first."""
+        threshold = (
+            self.ratings_ratio_threshold_before_flagging
+            if not block
+            else self.ratings_ratio_threshold_before_blocking
+        ) or 0
+        return Q(
+            ratings_count__gte=Greatest('average_daily_users', 1) * threshold / 100,
+            **self.get_tier_boundaries(),
+        )
+
+    @classmethod
+    def get_rating_count_subquery(cls):
+        """Return the Subquery used to annotate `ratings_count`. Needed
+        to use get_rating_threshold_q_object()."""
+        ratings_count_qs = (
+            Rating.without_replies.values('addon_id')
+            .filter(
+                addon_id=OuterRef('id'),
+                created__gte=datetime.now().date() - timedelta(days=14),
+            )
+            .annotate(_ratings_count=Count('*'))
+            .values('_ratings_count')
+            .order_by()
+        )
+        return ratings_count_qs
+
+
+class _EnumChoicesWithAnnotation(EnumChoices):
+    @DynamicClassAttribute
+    def annotation(self):
+        """Annotation that querysets will use when returning the queue."""
+        # This needs to match the classes in the CSS to show the right flag
+        # for the right reason, and it's also used in the queue filter form,
+        # and therefore in URLs that reviewers might have bookmarked - don't
+        # change it lightly!
+        return f'needs_human_review_{self.name.lower()}'
+
+
+class NeedsHumanReview(ModelBase):
+    """Model holding information about why a version was flagged for human
+    review."""
+
+    class REASONS(_EnumChoicesWithAnnotation):
+        BELONGS_TO_PROMOTED_GROUP = 14, 'Belongs to a promoted group'
+        ADDED_TO_PROMOTED_GROUP = 2, 'Was added to a promoted group'
+        DEVELOPER_REPLY = 6, 'Developer replied'
+        CINDER_ESCALATION = 10, 'Escalated for an abuse report, via cinder'
+        ABUSE_ADDON_VIOLATION = 11, 'Reported for abuse within the add-on'
+        ADDON_REVIEW_APPEAL = (
+            12,
+            "Appeal of a reviewer's decision about a policy violation",
+        )
+        CINDER_APPEAL_ESCALATION = 15, 'Escalated appeal via cinder'
+        SECOND_LEVEL_REQUEUE = (
+            16,
+            'Re-enqueued in reviewer tools from 2nd level approval',
+        )
+        ABUSE_REPORTS_THRESHOLD = 9, 'Over abuse reports threshold for usage tier'
+        RATINGS_THRESHOLD = 17, 'Over ratings threshold for usage tier'
+        PENDING_REJECTION_SOURCES_PROVIDED = (
+            5,
+            'Sources provided while pending rejection',
+        )
+        AUTO_APPROVAL_DISABLED = 13, 'Has auto-approval disabled'
+        SCANNER_ACTION = 1, 'Hit scanner rule'
+        HOTNESS_THRESHOLD = 3, 'Over growth threshold for usage tier'
+        INHERITANCE = 4, 'Previous version in channel had needs human review set'
+        MANUALLY_SET_BY_REVIEWER = (
+            7,
+            'Manually set as needing human review by a reviewer',
+        )
+        AUTO_APPROVED_PAST_APPROVAL_DELAY = (
+            8,
+            'Auto-approved but still had an approval delay set in the past',
+        )
+        VERSION_ROLLBACK = 18, 'Rollback to a previous version that was unreviewed'
+        WAITING_ON_SCANNERS = 19, 'Some scanners have not returned results yet'
+        UNKNOWN = 0, 'Unknown'
+
+    REASONS.add_subset(
+        'ABUSE_OR_APPEAL_RELATED',
+        (
+            'CINDER_ESCALATION',
+            'ABUSE_ADDON_VIOLATION',
+            'ADDON_REVIEW_APPEAL',
+            'CINDER_APPEAL_ESCALATION',
+            'SECOND_LEVEL_REQUEUE',
+        ),
+    )
+    REASONS.add_subset(
+        'NO_DUE_DATE_INHERITANCE',
+        (
+            'ABUSE_ADDON_VIOLATION',
+            'CINDER_ESCALATION',
+        ),
+    )
+
+    reason = models.SmallIntegerField(
+        default=0, choices=REASONS.choices, editable=False
+    )
+    version = models.ForeignKey(on_delete=models.CASCADE, to=Version)
+    is_active = models.BooleanField(default=True)
+
+    def __str__(self):
+        return f'{self.version_id} - {self.get_reason_display()}'
+
+    def save(self, *args, **kwargs):
+        automatic_activity_log = not kwargs.pop('_no_automatic_activity_log', False)
+        user = kwargs.pop('_user', None)
+        if not self.pk and automatic_activity_log:
+            activity.log_create(
+                amo.LOG.NEEDS_HUMAN_REVIEW_AUTOMATIC,
+                self.version,
+                details={'comments': self.get_reason_display()},
+                user=user or core.get_user() or get_task_user(),
+            )
+        return super().save(*args, **kwargs)
+
+    @classmethod
+    def set_on_addons_latest_signed_versions(cls, addons, reason):
+        """Set needs human review on latest signed version in every channel for
+        each addon in `addons`, if that version hasn't been reviewed or flagged
+        for human review already, using `reason`. Due dates are
+        staggered using get_staggered_review_due_date_generator().
+        """
+        due_date_generator = get_staggered_review_due_date_generator()
+        used_generator_last_iteration = None
+        due_date = None
+        for addon in addons:
+            if used_generator_last_iteration != []:
+                # Only advance the generator if we used the previous due date or
+                # it's the first iteration.
+                due_date = next(due_date_generator)
+            used_generator_last_iteration = (
+                addon.set_needs_human_review_on_latest_versions(
+                    due_date=due_date, reason=reason
+                )
+            )
+
+
+class ReviewQueueHistory(ModelBase):
+    # Note: a given Version can enter & leave the queue multiple times, and we
+    # want to track each occurence, so it's not a OneToOneField.
+    version = models.ForeignKey(Version, on_delete=models.CASCADE)
+    original_due_date = models.DateTimeField(
+        help_text='Original due date when the version entered the queue',
+    )
+    exit_date = models.DateTimeField(
+        default=None,
+        null=True,
+        blank=True,
+        help_text='When the version left the queue (regardless of reason)',
+    )
+    review_decision_log = models.ForeignKey(
+        'activity.ActivityLog',
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        help_text=(
+            'Activity Log associated with the reviewer decision that caused '
+            'the version to leave the queue'
+        ),
+    )
+
+    class Meta:
+        verbose_name_plural = 'Review Queue Histories'
+
+
+@receiver(
+    models.signals.post_save,
+    sender=NeedsHumanReview,
+    dispatch_uid='needshumanreview',
+)
+def update_due_date_for_needs_human_review_change(
+    sender, instance=None, update_fields=None, **kwargs
+):
+    if update_fields is None or 'is_active' in update_fields:
+        instance.version.reset_due_date()
+
+
+class QueueCount(models.Model):
+    date = models.DateField(auto_now_add=True)
+    name = models.CharField(max_length=255)
+    value = models.IntegerField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=('name', 'date'), name='queue_count_unique_name_date'
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.name} for {self.date}: {self.value}'

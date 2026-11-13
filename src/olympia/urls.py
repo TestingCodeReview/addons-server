@@ -1,15 +1,18 @@
 from django.conf import settings
-from django.conf.urls import include, url
 from django.contrib import admin
 from django.shortcuts import redirect
-from django.views.decorators.cache import cache_page
-from django.views.i18n import javascript_catalog
+from django.urls import include, re_path, reverse
+from django.utils import translation
+from django.views.i18n import JavaScriptCatalog
 from django.views.static import serve as serve_static
 
-from olympia.addons import views as addons_views
-from olympia.amo.urlresolvers import reverse
 from olympia.amo.utils import urlparams
+from olympia.amo.views import frontend_view
+from olympia.api.views import serve_swagger_ui_js
+from olympia.devhub import views as devhub_views
+from olympia.files.urls import upload_patterns
 from olympia.versions import views as version_views
+from olympia.versions.update import update
 from olympia.versions.urls import download_patterns
 
 
@@ -19,141 +22,162 @@ handler403 = 'olympia.amo.views.handler403'
 handler404 = 'olympia.amo.views.handler404'
 handler500 = 'olympia.amo.views.handler500'
 
-
-urlpatterns = [
+base_urlpatterns = [
     # Legacy Discovery pane is first for undetectable efficiency wins.
-    url(r'^discovery/', include('olympia.legacy_discovery.urls')),
-
+    re_path(
+        r'^discovery/.*',
+        lambda request: redirect(
+            'https://www.mozilla.org/firefox/new/', permanent=True
+        ),
+    ),
     # Home.
-    url(r'^$', addons_views.home, name='home'),
-
+    re_path(r'^$', frontend_view, name='home'),
+    # Abuse.
+    re_path(r'abuse/', include('olympia.abuse.urls')),
     # Add-ons.
-    url(r'', include('olympia.addons.urls')),
-
+    re_path(r'', include('olympia.addons.urls')),
     # Browse pages.
-    url(r'', include('olympia.browse.urls')),
-
+    re_path(r'', include('olympia.browse.urls')),
     # Tags.
-    url(r'', include('olympia.tags.urls')),
-
+    re_path(r'', include('olympia.tags.urls')),
     # Collections.
-    url(r'', include('olympia.bandwagon.urls')),
-
-    # Files
-    url(r'^files/', include('olympia.files.urls')),
-
+    re_path(r'', include('olympia.bandwagon.urls')),
+    # Do not expose the `upload_patterns` under `files/` because of this issue:
+    # https://github.com/mozilla/addons-server/issues/12322
+    re_path(r'^uploads/', include(upload_patterns)),
     # Downloads.
-    url(r'^downloads/', include(download_patterns)),
-
+    re_path(r'^downloads/', include(download_patterns)),
+    # Activity.
+    re_path(r'activity/', include('olympia.activity.urls')),
     # Users
-    url(r'', include('olympia.users.urls')),
-
-    # Developer Hub.
-    url(r'^developers/', include('olympia.devhub.urls')),
-
+    re_path(r'', include('olympia.users.urls')),
+    # old devhub/pinguino switch
+    re_path(
+        r'^developers/switch-pinguino$',
+        devhub_views.switch_pinguino,
+        name='devhub.switch-pinguino',
+    ),
     # Reviewers Hub.
-    url(r'^reviewers/', include('olympia.reviewers.urls')),
-
+    re_path(r'^reviewers/', include('olympia.reviewers.urls')),
     # Redirect everything under editors/ (old reviewer urls) to reviewers/.
-    url(r'^editors/(.*)',
-        lambda r, path: redirect('/reviewers/%s' % path, permanent=True)),
-
+    re_path(
+        r'^editors/(.*)',
+        lambda r, path: redirect('/reviewers/%s' % path, permanent=True),
+    ),
     # AMO admin (not django admin).
-    url(r'^admin/', include('olympia.zadmin.urls')),
-
+    re_path(r'^admin/', include('olympia.zadmin.urls')),
     # Localizable pages.
-    url(r'', include('olympia.pages.urls')),
-
+    re_path(r'', include('olympia.pages.urls')),
     # App versions.
-    url(r'pages/appversions/', include('olympia.applications.urls')),
-
+    re_path(
+        r'pages/appversions/',
+        lambda r: redirect(
+            'v5:appversions-list', application='firefox', permanent=True
+        ),
+    ),
     # Services
-    url(r'', include('olympia.amo.urls')),
-
+    re_path(r'', include('olympia.amo.urls')),
     # Search
-    url(r'^search/', include('olympia.search.urls')),
-
-    # Javascript translations.
-    # Should always be called with a cache-busting querystring.
-    # Still served for the moment, but superseded by a fully static version we
-    # generate at deploy-time through our generate_jsi18n_files command.
-    url(r'^jsi18n\.js$', cache_page(60 * 60 * 24 * 365)(javascript_catalog),
-        {'domain': 'djangojs', 'packages': []}, name='jsi18n'),
-
-    # SAMO (Legacy API)
-    url(r'^api/', include('olympia.legacy_api.urls')),
-
+    re_path(r'^search/', include('olympia.search.urls')),
     # API v3+.
-    url(r'^api/', include('olympia.api.urls')),
-
-    # Site statistics that we are going to catch, the rest will fall through.
-    url(r'^statistics/', include('olympia.stats.urls')),
-
-    # Fall through for any URLs not matched above stats dashboard.
-    url(r'^statistics/', lambda r: redirect('/'), name='statistics.dashboard'),
-
+    re_path(r'^api/', include('olympia.api.urls')),
+    # Redirect for all global stats URLs.
+    re_path(r'^statistics/', lambda r: redirect('/'), name='statistics.dashboard'),
     # Redirect patterns.
-    url(r'^bookmarks/?$',
-        lambda r: redirect('browse.extensions', 'bookmarks', permanent=True)),
-
-    url(r'^reviews/display/(\d+)',
-        lambda r, id: redirect('addons.ratings.list', id, permanent=True)),
-
-    url(r'^reviews/add/(\d+)',
-        lambda r, id: redirect('addons.ratings.add', id, permanent=True)),
-
-    url(r'^users/info/(\d+)',
-        lambda r, id: redirect('users.profile', id, permanent=True)),
-
-    url(r'^pages/about$',
-        lambda r: redirect('pages.about', permanent=True)),
-
-    # Redirect persona/xxx
-    url(r'^getpersonas$',
-        lambda r: redirect('http://www.getpersonas.com/gallery/All/Popular',
-                           permanent=True)),
-
-    url(r'^persona/(?P<persona_id>\d+)',
-        addons_views.persona_redirect, name='persona'),
-
-    url(r'^personas/film and tv/?$',
-        lambda r: redirect('browse.personas', 'film-and-tv', permanent=True)),
-
-    url(r'^addons/versions/(\d+)/?$',
-        lambda r, id: redirect('addons.versions', id, permanent=True)),
-
-    url(r'^addons/versions/(\d+)/format:rss$',
-        lambda r, id: redirect('addons.versions.rss', id, permanent=True)),
-
-    # Legacy redirect. Requires a view to get extra data not provided in URL.
-    url(r'^versions/updateInfo/(?P<version_id>\d+)',
-        version_views.update_info_redirect),
-
-    url(r'^addons/reviews/(\d+)/format:rss$',
-        lambda r, id: redirect('addons.ratings.list.rss', id, permanent=True)),
-
-    url(r'^search-engines.*$',
-        lambda r: redirect(urlparams(reverse('search.search'), atype=4),
-                           permanent=True)),
-
-    url(r'^addons/contribute/(\d+)/?$',
-        lambda r, id: redirect('addons.contribute', id, permanent=True)),
-
-    url(r'^recommended$',
-        lambda r: redirect(reverse('browse.extensions') + '?sort=featured',
-                           permanent=True)),
-
-    url(r'^recommended/format:rss$',
-        lambda r: redirect('browse.featured.rss', permanent=True)),
+    re_path(
+        r'^bookmarks/?$',
+        lambda r: redirect('browse.extensions', 'bookmarks', permanent=True),
+    ),
+    re_path(r'^pages/about$', lambda r: redirect('pages.about', permanent=True)),
+    re_path(
+        r'^addons/versions/(\d+)/?$',
+        lambda r, id: redirect('addons.versions', id, permanent=True),
+    ),
+    re_path(
+        r'^update/(?:VersionCheck\.php)?$',
+        update,
+        name='addons.versions.update',
+    ),
+    # Legacy redirect. Doesn't receive the addon id/slug so it can't live with
+    # the other version views that do.
+    re_path(
+        r'^versions/updateInfo/(?P<version_id>\d+)',
+        version_views.update_info_redirect,
+        name='addons.versions.update_info_redirect',
+    ),
+    re_path(
+        r'^search-engines.*$',
+        lambda r: redirect(
+            urlparams(reverse('search.search'), atype=4), permanent=True
+        ),
+    ),
+    re_path(
+        r'^addons/contribute/(\d+)/?$',
+        lambda r, id: redirect('addons.contribute', id, permanent=True),
+    ),
 ]
 
-if settings.DEBUG:
+if settings.SERVE_STATIC_FILES:
+    from django.contrib.staticfiles.views import serve as static_serve
+
+    def serve_static_files(request, path, **kwargs):
+        if settings.DEV_MODE:
+            return static_serve(
+                request, path, insecure=True, show_indexes=True, **kwargs
+            )
+        else:
+            return serve_static(
+                request, path, document_root=settings.STATIC_ROOT, **kwargs
+            )
+
+    def serve_javascript_catalog(request, locale, **kwargs):
+        with translation.override(locale):
+            return JavaScriptCatalog.as_view()(request, locale, **kwargs)
+
     # Remove leading and trailing slashes so the regex matches.
     media_url = settings.MEDIA_URL.lstrip('/').rstrip('/')
 
-    urlpatterns.append(
-        url(
-            r'^%s/(?P<path>.*)$' % media_url,
-            serve_static,
-            {'document_root': settings.MEDIA_ROOT}),
+    static_url_prefix = settings.STATIC_URL_PREFIX.lstrip('/').rstrip('/')
+
+    base_urlpatterns.extend(
+        [
+            re_path(
+                r'^%s/(?P<path>.*)$' % media_url,
+                serve_static,
+                {'document_root': settings.MEDIA_ROOT},
+            ),
+            # Serve javascript catalog locales bundle directly from django
+            re_path(
+                (
+                    r'^%s/js/i18n/(?P<locale>\w{2,3}(?:-\w{2,6})?)\.js$'
+                    % static_url_prefix
+                ),
+                serve_javascript_catalog,
+                name='javascript-catalog',
+            ),
+            # Serve swagger UI JS directly from django
+            re_path(
+                r'^%s/js/swagger/(?P<version>[^/]+)\.js$' % static_url_prefix,
+                serve_swagger_ui_js,
+            ),
+            # fallback for static files that are not available directly over nginx.
+            # Mostly vendor files from python or npm dependencies that are not available
+            # in the static files directory.
+            re_path(r'^%s/(?P<path>.*)$' % static_url_prefix, serve_static_files),
+        ]
     )
+
+if settings.DEBUG and 'debug_toolbar' in settings.INSTALLED_APPS:
+    import debug_toolbar
+
+    base_urlpatterns.extend(
+        [
+            re_path(r'__debug__/', include(debug_toolbar.urls)),
+        ]
+    )
+
+urlpatterns = [
+    *base_urlpatterns,
+    # (Old, django) Developer Hub.
+    re_path(r'^developers/', include('olympia.devhub.urls')),
+]

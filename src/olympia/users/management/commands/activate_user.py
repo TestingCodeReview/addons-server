@@ -6,6 +6,7 @@ from olympia.users.models import UserProfile
 
 class Command(BaseCommand):
     """Activate a registered user, and optionally set it as admin."""
+
     help = 'Activate a registered user by its email.'
 
     def add_arguments(self, parser):
@@ -16,7 +17,8 @@ class Command(BaseCommand):
             action='store_true',
             dest='set_admin',
             default=False,
-            help='Give superuser/admin rights to the user.')
+            help='Give superuser/admin rights to the user.',
+        )
 
     def handle(self, *args, **options):
         email = options['email']
@@ -24,13 +26,13 @@ class Command(BaseCommand):
 
         try:
             profile = UserProfile.objects.get(email=email)
-        except UserProfile.DoesNotExist:
-            raise CommandError('User with email %s not found' % email)
+        except UserProfile.DoesNotExist as exc:
+            raise CommandError('User with email %s not found' % email) from exc
 
-        admin_msg = ""
+        admin_msg = ''
         if set_admin:
-            admin_msg = "admin "
-            GroupUser.objects.create(user=profile,
-                                     group=Group.objects.get(name='Admins'))
-        self.stdout.write("Done, you can now login with your %suser" %
-                          admin_msg)
+            admin_msg = 'admin '
+            GroupUser.objects.create(
+                user=profile, group=Group.objects.get(name='Admins')
+            )
+        self.stdout.write('Done, you can now login with your %suser' % admin_msg)

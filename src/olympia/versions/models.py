@@ -1,139 +1,345 @@
-# -*- coding: utf-8 -*-
-import datetime
+import functools
+import operator
 import os
-
+import re
 from base64 import b64encode
+from datetime import datetime, timedelta
+from fnmatch import fnmatch
+from urllib.parse import urlparse
 
 import django.dispatch
-
 from django.core.exceptions import ObjectDoesNotExist
 from django.core.files.storage import default_storage as storage
 from django.db import models
-from django.utils.encoding import force_text, python_2_unicode_compatible
+from django.db.models import Case, F, Q, When
+from django.dispatch import receiver
+from django.urls import reverse
+from django.utils.encoding import force_str
 from django.utils.functional import cached_property
-from django.utils.translation import ugettext
+from django.utils.translation import gettext, gettext_lazy as _
 
-import jinja2
-import six
+import markupsafe
 import waffle
-
-from django_extensions.db.fields.json import JSONField
 from django_statsd.clients import statsd
+from publicsuffix2 import get_sld
 
 import olympia.core.logger
-
-from olympia import activity, amo
+from olympia import activity, amo, core
 from olympia.amo.decorators import use_primary_db
 from olympia.amo.fields import PositiveAutoField
 from olympia.amo.models import (
-    BasePreview, ManagerBase, ModelBase, OnChangeMixin)
-from olympia.amo.urlresolvers import reverse
-from olympia.amo.utils import sorted_groupby, utc_millesecs_from_epoch
+    BasePreview,
+    BaseQuerySet,
+    LongNameIndex,
+    ManagerBase,
+    ModelBase,
+    OnChangeMixin,
+)
+from olympia.amo.utils import (
+    SafeStorage,
+    id_to_path,
+    sorted_groupby,
+    utc_millesecs_from_epoch,
+)
 from olympia.applications.models import AppVersion
-from olympia.constants.licenses import LICENSES_BY_BUILTIN
+from olympia.constants.applications import APP_IDS
+from olympia.constants.blocklist import BlockReason, BlockType
+from olympia.constants.licenses import CC_LICENSES, FORM_LICENSES, LICENSES_BY_BUILTIN
 from olympia.files import utils
 from olympia.files.models import File, cleanup_file
+from olympia.scanners.models import ScannerResult
 from olympia.translations.fields import (
-    LinkifiedField, PurifiedField, TranslatedField, save_signal)
+    LinkifiedField,
+    PurifiedMarkdownField,
+    TranslatedField,
+    save_signal,
+)
+from olympia.users.models import UserProfile, UserRestrictionHistory
+from olympia.users.utils import RestrictionChecker, get_task_user
+from olympia.versions.compare import version_int
+from olympia.zadmin.models import get_config
 
-from .compare import version_dict, version_int
+from .fields import VersionStringField
+from .utils import get_review_due_date
 
 
 log = olympia.core.logger.getLogger('z.versions')
 
 
-# Valid source extensions. Used in error messages to the user and to skip
-# early in source_upload_path() if necessary, but the actual validation is
-# more complex and done in olympia.devhub.WithSourceMixin.clean_source
-VALID_SOURCE_EXTENSIONS = ('.zip', '.tar.gz', '.tar.bz2',)
+# Valid source extensions. Actual validation lives in
+# devhub.forms.WithSourceMixin and is slightly more complex (the file
+# contents are checked to see if it matches the extension).
+# If changing this, make sure devhub.forms.WithSourceMixin.clean_source() and
+# source_upload_path() are updated accordingly if needed, and that source
+# submission still works both at add-on and version upload time.
+VALID_SOURCE_EXTENSIONS = (
+    '.zip',
+    '.tar.gz',
+    '.tgz',
+    '.tar.bz2',
+)
+
+
+class VersionQuerySet(BaseQuerySet):
+    def not_rejected(self):
+        return self.exclude(
+            file__status=amo.STATUS_DISABLED,
+            file__status_disabled_reason=File.STATUS_DISABLED_REASONS.NONE,
+        )
 
 
 class VersionManager(ManagerBase):
+    _queryset_class = VersionQuerySet
 
     def __init__(self, include_deleted=False):
         ManagerBase.__init__(self)
         self.include_deleted = include_deleted
 
     def get_queryset(self):
-        qs = super(VersionManager, self).get_queryset()
+        qs = super().get_queryset()
         if not self.include_deleted:
             qs = qs.exclude(deleted=True)
-        return qs.transform(Version.transformer)
+        return qs.select_related('file').transform(Version.transformer)
 
     def valid(self):
-        return self.filter(
-            files__status__in=amo.VALID_FILE_STATUSES).distinct()
+        return self.filter(file__status__in=amo.VALID_FILE_STATUSES)
 
-    def latest_public_compatible_with(self, application, appversions):
+    def approved(self):
+        return self.filter(file__status__in=amo.APPROVED_STATUSES)
+
+    def latest_public_compatible_with(
+        self, application, appversions, *, strict_compat_mode=False
+    ):
         """Return a queryset filtering the versions so that they are public,
         listed, and compatible with the application and appversions parameters
         passed. The queryset is ordered by creation date descending, allowing
         the caller to get the latest compatible version available.
 
-        application is an application id
-        appversions is a dict containing min and max values, as version ints.
+        `application` is an application id
+        `appversions` is a dict containing min and max values, as version ints.
+
+        By default, `appversions['max']` is only considered for versions that
+        have strict compatibility enabled, unless the `strict_compat_mode`
+        parameter is also True.
+
+        Regardless of whether appversions are passed or not, the queryset will
+        be annotated with min_compatible_version and max_compatible_version
+        values, corresponding to the min and max application version each
+        Version is compatible with.
         """
-        return Version.objects.filter(
-            apps__application=application,
-            apps__min__version_int__lte=appversions['min'],
-            apps__max__version_int__gte=appversions['max'],
-            channel=amo.RELEASE_CHANNEL_LISTED,
-            files__status=amo.STATUS_PUBLIC,
-        ).order_by('-created')
+        filters = {
+            'channel': amo.CHANNEL_LISTED,
+            'file__status': amo.STATUS_APPROVED,
+        }
+        filters = {
+            'channel': amo.CHANNEL_LISTED,
+            'file__status': amo.STATUS_APPROVED,
+            'apps__application': application,
+        }
+        annotations = {
+            'min_compatible_version': F('apps__min__version'),
+            'max_compatible_version': F('apps__max__version'),
+        }
+        if 'min' in appversions:
+            filters['apps__min__version_int__lte'] = appversions['min']
+
+        if 'max' in appversions:
+            if strict_compat_mode:
+                filters['apps__max__version_int__gte'] = appversions['max']
+            else:
+                filters['apps__max__version_int__gte'] = Case(
+                    When(file__strict_compatibility=True, then=appversions['max']),
+                    default=0,
+                )
+
+        # Note: the filter() needs to happen before the annotate(), otherwise
+        # it would create extra joins!
+        return self.filter(**filters).annotate(**annotations).order_by('-created')
+
+    def auto_approvable(self):
+        """Returns a queryset filtered with just the versions that should
+        attempted for auto-approval by the cron job."""
+        qs = self.filter(file__status=amo.STATUS_AWAITING_REVIEW).filter(
+            # For listed, add-on can't be incomplete, deleted or disabled.
+            # It also cannot be disabled by user ("invisible"), and can not
+            # be a theme either.
+            Q(
+                channel=amo.CHANNEL_LISTED,
+                addon__status__in=amo.VALID_ADDON_STATUSES,
+                addon__disabled_by_user=False,
+                addon__type__in=(amo.ADDON_EXTENSION, amo.ADDON_LPAPP, amo.ADDON_DICT),
+            )
+            # For unlisted, add-on can't be deleted or disabled.
+            | Q(
+                channel=amo.CHANNEL_UNLISTED,
+                addon__status__in=amo.VALID_ADDON_STATUSES + (amo.STATUS_NULL,),
+            )
+            | Q(
+                channel=amo.CHANNEL_ENTERPRISE,
+                addon__status__in=amo.VALID_ADDON_STATUSES + (amo.STATUS_NULL,),
+            )
+        )
+        return qs
+
+    def should_have_due_date(self, negate=False):
+        """Returns a queryset filtered to versions that should have a due date set.
+        If `negate=True` the queryset will contain versions that should not have a
+        due date instead."""
+        method = getattr(self, 'exclude' if negate else 'filter')
+        return (
+            method(
+                functools.reduce(
+                    operator.or_, self.get_due_date_reason_q_objects().values()
+                )
+            )
+            .using('default')
+            .distinct()
+        )
+
+    @classmethod
+    def get_due_date_reason_q_objects(cls):
+        """Class method that returns a dict with all the Q objects needed to determine
+        if a version should_have_due_date is true as values, and the annotation names
+        for each reason as values."""
+        from olympia.reviewers.models import NeedsHumanReview
+
+        reasons = {}
+
+        # Versions of themes not yet reviewed should have a due date.
+        reasons['is_from_theme_awaiting_review'] = (
+            Q(
+                Q(
+                    channel=amo.CHANNEL_LISTED,
+                    addon__status__in=amo.VALID_ADDON_STATUSES,
+                )
+                | Q(channel=amo.CHANNEL_UNLISTED)
+            )
+            & Q(
+                file__status=amo.STATUS_AWAITING_REVIEW,
+                reviewerflags__pending_rejection__isnull=True,
+                addon__type=amo.ADDON_STATICTHEME,
+            )
+            & ~Q(addon__status=amo.STATUS_DELETED)
+        )
+
+        # Abuse-related reasons & developer replies always trigger a due
+        # date even if the version has been disabled / not signed.
+        abuse_related_or_developer_reply = list(
+            NeedsHumanReview.REASONS.ABUSE_OR_APPEAL_RELATED
+        ) + [NeedsHumanReview.REASONS.DEVELOPER_REPLY]
+        for entry in abuse_related_or_developer_reply:
+            reasons[entry.annotation] = Q(
+                needshumanreview__is_active=True,
+                needshumanreview__reason=entry.value,
+            )
+
+        # Versions that haven't been disabled or have ever been signed and have
+        # the explicit needs human review flag should have a due date (it gets
+        # dropped on various reviewer actions).
+        is_other_needs_human_review = Q(
+            ~Q(file__status=amo.STATUS_DISABLED) | Q(file__is_signed=True),
+            needshumanreview__is_active=True,
+        )
+        for entry in set(NeedsHumanReview.REASONS).difference(
+            abuse_related_or_developer_reply
+        ):
+            reasons[entry.annotation] = Q(
+                is_other_needs_human_review,
+                needshumanreview__reason=entry.value,
+            )
+        return reasons
+
+
+class UnfilteredVersionManagerForRelations(VersionManager):
+    """Like VersionManager, but defaults to include deleted objects.
+
+    Designed to be used in reverse relations of Versions like this:
+    <Addon>.versions(manager='unfiltered_for_relations').all(), for when you
+    want to use the related manager but need to include deleted versions.
+
+    unfiltered_for_relations = UnfilteredVersionManagerForRelations() is
+    defined in Version for this to work.
+    """
+
+    def __init__(self, include_deleted=True):
+        super().__init__(include_deleted=include_deleted)
 
 
 def source_upload_path(instance, filename):
     # At this point we already know that ext is one of VALID_SOURCE_EXTENSIONS
     # because we already checked for that in
     # /src/olympia/devhub/forms.py#WithSourceMixin.clean_source.
+    ext = ''
     for ext in VALID_SOURCE_EXTENSIONS:
         if filename.endswith(ext):
             break
 
     return os.path.join(
-        u'version_source',
-        utils.id_to_path(instance.pk),
-        u'{0}-{1}-src{2}'.format(
-            instance.addon.slug,
-            instance.version,
-            ext)
+        'version_source',
+        id_to_path(instance.pk),
+        f'{instance.addon.slug}-{instance.version}-src{ext}',
     )
+
+
+def source_upload_storage():
+    return SafeStorage(root_setting='MEDIA_ROOT')
 
 
 class VersionCreateError(ValueError):
     pass
 
 
-@python_2_unicode_compatible
 class Version(OnChangeMixin, ModelBase):
+    """
+    A version is a unique iteration of an add-on.
+    Versions are created for a specific channel and
+    relate to a specific uploaded XPI file.
+    """
+
     id = PositiveAutoField(primary_key=True)
     addon = models.ForeignKey(
-        'addons.Addon', related_name='versions', on_delete=models.CASCADE)
-    license = models.ForeignKey('License', null=True)
-    release_notes = PurifiedField(db_column='releasenotes')
+        'addons.Addon', related_name='versions', on_delete=models.CASCADE
+    )
+    license = models.ForeignKey(
+        'License', null=True, blank=True, on_delete=models.SET_NULL
+    )
+    release_notes = PurifiedMarkdownField(
+        db_column='releasenotes', short=False, max_length=3000
+    )
+    # Note that max_length isn't enforced at the database level for TextFields,
+    # but the API serializer & form are set to obey it.
     approval_notes = models.TextField(
-        db_column='approvalnotes', default='', null=True)
-    version = models.CharField(max_length=255, default='0.1')
-    version_int = models.BigIntegerField(null=True, editable=False)
+        db_column='approvalnotes', default='', blank=True, max_length=3000
+    )
+    version = VersionStringField(max_length=255, default='0.1')
 
-    nomination = models.DateTimeField(null=True)
-    reviewed = models.DateTimeField(null=True)
+    due_date = models.DateTimeField(null=True, blank=True)
+    human_review_date = models.DateTimeField(null=True)
 
     deleted = models.BooleanField(default=False)
 
     source = models.FileField(
-        upload_to=source_upload_path, null=True, blank=True)
+        upload_to=source_upload_path,
+        storage=source_upload_storage,
+        null=True,
+        blank=True,
+        max_length=255,
+    )
 
-    channel = models.IntegerField(choices=amo.RELEASE_CHANNEL_CHOICES,
-                                  default=amo.RELEASE_CHANNEL_LISTED)
+    channel = models.IntegerField(
+        choices=amo.CHANNEL_CHOICES.items(), default=amo.CHANNEL_LISTED
+    )
 
     git_hash = models.CharField(max_length=40, blank=True)
-    source_git_hash = models.CharField(max_length=40, blank=True)
 
     # The order of those managers is very important: please read the lengthy
     # comment above the Addon managers declaration/instantiation.
     unfiltered = VersionManager(include_deleted=True)
     objects = VersionManager()
+
+    # See UnfilteredVersionManagerForRelations() docstring for usage of this
+    # special manager.
+    unfiltered_for_relations = UnfilteredVersionManagerForRelations()
 
     class Meta(ModelBase.Meta):
         db_table = 'versions'
@@ -141,336 +347,488 @@ class Version(OnChangeMixin, ModelBase):
         # description
         base_manager_name = 'unfiltered'
         ordering = ['-created', '-modified']
-
-    def __init__(self, *args, **kwargs):
-        super(Version, self).__init__(*args, **kwargs)
-        self.__dict__.update(version_dict(self.version or ''))
+        indexes = [
+            models.Index(fields=('addon',), name='addon_id'),
+            models.Index(fields=('license',), name='license_id'),
+            models.Index(fields=('due_date',), name='versions_due_date_b9c73ed7'),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=('addon', 'version'),
+                name='versions_addon_id_version_5a2e75b6_uniq',
+            ),
+        ]
 
     def __str__(self):
-        return jinja2.escape(self.version)
-
-    def save(self, *args, **kw):
-        if not self.version_int and self.version:
-            v_int = version_int(self.version)
-            # Magic number warning, this is the maximum size
-            # of a big int in MySQL to prevent version_int overflow, for
-            # people who have rather crazy version numbers.
-            # http://dev.mysql.com/doc/refman/5.5/en/numeric-types.html
-            if v_int < 9223372036854775807:
-                self.version_int = v_int
-            else:
-                log.error('No version_int written for version %s, %s' %
-                          (self.pk, self.version))
-        super(Version, self).save(*args, **kw)
-        return self
+        return markupsafe.escape(self.version)
 
     @classmethod
-    def from_upload(cls, upload, addon, selected_apps, channel,
-                    parsed_data=None):
+    def from_upload(
+        cls,
+        upload,
+        addon,
+        channel,
+        *,
+        selected_apps=None,
+        compatibility=None,
+        parsed_data=None,
+        client_info=None,
+    ):
         """
         Create a Version instance and corresponding File(s) from a
-        FileUpload, an Addon, a list of compatible app ids, a channel id and
-        the parsed_data generated by parse_addon().
+        FileUpload, an Addon, a channel id and the parsed_data generated by
+        parse_addon(). Additionally, for non-themes: either a list of compatible app ids
+        needs to be provided as `selected_apps`, or a list of `ApplicationsVersions`
+        instances for each compatible app as `compatibility`.
+
+        If `compatibility` is provided: the `version` property of the instances will be
+        set to the new upload and the instances saved. If the min and/or max properties
+        of the `ApplicationsVersions` instance are none then `AppVersion`s parsed from
+        the manifest, or defaults, are used.
 
         Note that it's the caller's responsability to ensure the file is valid.
         We can't check for that here because an admin may have overridden the
         validation results.
         """
+        from olympia.addons.models import AddonReviewerFlags
+        from olympia.devhub.tasks import send_initial_submission_acknowledgement_email
+        from olympia.reviewers.models import NeedsHumanReview
+
+        from .tasks import call_webhooks_on_version_created
+
         assert parsed_data is not None
+
+        if addon.type == amo.ADDON_STATICTHEME:
+            # We don't let developers select apps for static themes
+            compatibility = {
+                app: (compatibility or {}).get(
+                    app, ApplicationsVersions(application=app.id)
+                )
+                for app in amo.APP_USAGE
+            }
+        assert selected_apps or compatibility
+
+        if channel == amo.CHANNEL_ENTERPRISE and not waffle.switch_is_active(
+            'enterprise-channel'
+        ):
+            raise VersionCreateError('The enterprise channel is not enabled.')
+
+        if channel == amo.CHANNEL_ENTERPRISE and addon.type != amo.ADDON_EXTENSION:
+            raise VersionCreateError('Only extensions can be enterprise add-ons.')
 
         if addon.status == amo.STATUS_DISABLED:
             raise VersionCreateError(
-                'Addon is Mozilla Disabled; no new versions are allowed.')
+                'Addon is Mozilla Disabled; no new versions are allowed.'
+            )
 
-        license_id = None
-        if channel == amo.RELEASE_CHANNEL_LISTED:
-            previous_version = addon.find_latest_version(
-                channel=channel, exclude=())
+        if upload.channel and upload.channel != channel:
+            raise VersionCreateError(
+                'The FileUpload channel and upload channel must match.'
+            )
+
+        if upload.addon and upload.addon != addon:
+            raise VersionCreateError('FileUpload was made for a different Addon')
+
+        if (
+            not getattr(upload, 'user', None)
+            or not upload.ip_address
+            or not upload.source
+        ):
+            raise VersionCreateError('FileUpload does not have some required fields')
+
+        if not upload.user.last_login_ip or not upload.user.email:
+            raise VersionCreateError(
+                'FileUpload user does not have some required fields'
+            )
+
+        # This should be guaranteed by the linter, just raise an explicit
+        # exception if somehow it's wrong.
+        if not isinstance(parsed_data.get('install_origins', []), list):
+            raise VersionCreateError('install_origins was not validated properly')
+
+        license_id = parsed_data.get('license_id')
+        if not license_id and channel == amo.CHANNEL_LISTED:
+            previous_version = addon.find_latest_version(channel=channel, exclude=())
             if previous_version and previous_version.license_id:
                 license_id = previous_version.license_id
-        approval_notes = None
+        approval_notes = parsed_data.get('approval_notes', '')
         if parsed_data.get('is_mozilla_signed_extension'):
-            approval_notes = (u'This version has been signed with '
-                              u'Mozilla internal certificate.')
+            approval_notes = (
+                'This version has been signed with Mozilla internal certificate.'
+            )
+
+        previous_version_had_needs_human_review = (
+            addon.versions_triggering_needs_human_review_inheritance(channel).exists()
+        )
+
         version = cls.objects.create(
             addon=addon,
             approval_notes=approval_notes,
             version=parsed_data['version'],
             license_id=license_id,
             channel=channel,
+            release_notes=parsed_data.get('release_notes'),
         )
-        log.info(
-            'New version: %r (%s) from %r' % (version, version.id, upload))
-        activity.log_create(amo.LOG.ADD_VERSION, version, addon)
+        with core.override_remote_addr_or_metadata(
+            ip_address=upload.ip_address, metadata=upload.request_metadata
+        ):
+            # The following log statement is used by foxsec-pipeline.
+            # We override the IP because it might be called from a task and we
+            # want the original IP from the submitter.
+            log.info(
+                'New version: %r (%s) from %r',
+                version,
+                version.pk,
+                upload,
+                extra={
+                    'email': upload.user.email,
+                    'guid': addon.guid,
+                    'upload': upload.uuid.hex,
+                    'user_id': upload.user_id,
+                    'from_api': upload.source
+                    in (amo.UPLOAD_SOURCE_SIGNING_API, amo.UPLOAD_SOURCE_ADDON_API),
+                },
+            )
+            activity.log_create(amo.LOG.ADD_VERSION, version, addon, user=upload.user)
+            if previous_version_had_needs_human_review:
+                NeedsHumanReview(
+                    version=version, reason=NeedsHumanReview.REASONS.INHERITANCE
+                ).save(_user=get_task_user())
 
-        if addon.type == amo.ADDON_STATICTHEME:
-            # We don't let developers select apps for static themes
-            selected_apps = [app.id for app in amo.APP_USAGE]
+        # Record declared install origins. base_domain is set automatically.
+        if waffle.switch_is_active('record-install-origins'):
+            for origin in set(parsed_data.get('install_origins', [])):
+                version.installorigin_set.create(origin=origin)
+
+        # Create relevant file.
+        File.from_upload(
+            upload=upload,
+            version=version,
+            parsed_data=parsed_data,
+        )
+
+        version.reset_due_date()
+        version.disable_old_files()
+
+        # After the upload has been copied to its permanent location, delete it
+        # from storage. Keep the FileUpload instance (it gets cleaned up by a
+        # cron eventually some time after its creation, in amo.cron.gc()),
+        # making sure it's associated with the add-on instance.
+        storage.delete(upload.path)
+        upload.path = ''
+        if upload.addon is None:
+            upload.addon = addon
+        upload.save()
+
+        if not compatibility:
+            compatibility = {
+                amo.APP_IDS[app_id]: ApplicationsVersions(application=app_id)
+                for app_id in selected_apps
+            }
 
         compatible_apps = {}
-        for app in parsed_data.get('apps', []):
-            if app.id not in selected_apps:
-                # If the user chose to explicitly deselect Firefox for Android
-                # we're not creating the respective `ApplicationsVersions`
-                # which will have this add-on then be listed only for
-                # Firefox specifically.
+        for avs_from_parsed_data in parsed_data.get('apps', []):
+            application = APP_IDS.get(avs_from_parsed_data.application)
+            if avs_from_parsed_data.locked_from_manifest:
+                # In that case, the manifest takes precedence.
+                avs = avs_from_parsed_data
+            elif application not in compatibility:
+                # In that case, the developer didn't include compatibility
+                # information we have to follow, and they didn't select this
+                # app at upload time, so we ignore that app.
                 continue
+            else:
+                # They selected the app we're currently dealing with, so let's
+                # try to build some compatibility info from what we have.
+                avs = compatibility[application]
+                # Start by considering the data is coming from the manifest,
+                # but override if min or max were provided.
+                avs.originated_from = avs_from_parsed_data.originated_from
+                if avs.min_id is None:
+                    avs.min = avs_from_parsed_data.min
+                    avs.originated_from = amo.APPVERSIONS_ORIGINATED_FROM_DEVELOPER
+                if avs.max_id is None:
+                    avs.max = avs_from_parsed_data.max
+                    avs.originated_from = amo.APPVERSIONS_ORIGINATED_FROM_DEVELOPER
+            avs.pk = None  # Make sure to create new ApplicationsVersions in any case.
+            avs.version = version
+            avs.save()
+            compatible_apps[application] = avs
 
-            compatible_apps[app.appdata] = ApplicationsVersions(
-                version=version, min=app.min, max=app.max, application=app.id)
-            compatible_apps[app.appdata].save()
+        # Pre-generate compatible_apps property to avoid accidentally
+        # triggering queries with that instance later.
+        version.compatible_apps = compatible_apps
 
-        # See #2828: sometimes when we generate the filename(s) below, in
-        # File.from_upload(), cache-machine is confused and has trouble
-        # fetching the ApplicationsVersions that were just created. To work
-        # around this we pre-generate version.compatible_apps and avoid the
-        # queries completely.
-        version._compatible_apps = compatible_apps
+        version_uploaded.send(instance=version, sender=Version)
 
-        # For backwards compatibility. We removed specific platform
-        # support during submission but we don't handle it any different
-        # beyond that yet. That means, we're going to simply set it
-        # to `PLATFORM_ALL` and also have the backend create separate
-        # files for each platform. Cleaning that up is another step.
-        # Given the timing on this, we don't care about updates to legacy
-        # add-ons as well.
-        # Create relevant file and update the all_files cached property on the
-        # Version, because we might need it afterwards.
-        version.all_files = [File.from_upload(
-            upload=upload, version=version, platform=amo.PLATFORM_ALL.id,
-            parsed_data=parsed_data
-        )]
-
-        version.inherit_nomination(from_statuses=[amo.STATUS_AWAITING_REVIEW])
-        version.disable_old_files()
-        # After the upload has been copied to all platforms, remove the upload.
-        storage.delete(upload.path)
-        version_uploaded.send(sender=version)
-
-        # Extract this version into git repository
-        extract_version_to_git_repository(version, upload)
+        ScannerResult.objects.filter(upload_id=upload.id).update(version=version)
 
         # Generate a preview and icon for listed static themes
-        if (addon.type == amo.ADDON_STATICTHEME and
-                channel == amo.RELEASE_CHANNEL_LISTED):
+        if addon.type == amo.ADDON_STATICTHEME and channel == amo.CHANNEL_LISTED:
             theme_data = parsed_data.get('theme', {})
             generate_static_theme_preview(theme_data, version.pk)
+
+        # Reset add-on reviewer flags to disable auto-approval and require
+        # admin code review if the package has already been signed by mozilla.
+        reviewer_flags_defaults = {}
+        is_mozilla_signed = parsed_data.get('is_mozilla_signed_extension')
+        if is_mozilla_signed and addon.type != amo.ADDON_LPAPP:
+            reviewer_flags_defaults['auto_approval_disabled'] = True
+
+        # Check if the approval should be restricted. Enterprise versions are
+        # exempt: their auto-approval can never be disabled (see
+        # AutoApprovalSummary.check_has_auto_approval_disabled()), so the flag
+        # is not set and nothing is recorded for them.
+        checker = RestrictionChecker(upload=upload)
+        if channel != amo.CHANNEL_ENTERPRISE and not checker.is_auto_approval_allowed():
+            flag = (
+                'auto_approval_disabled'
+                if channel == amo.CHANNEL_LISTED
+                else 'auto_approval_disabled_unlisted'
+            )
+            reviewer_flags_defaults[flag] = True
+            failed_names = [cls.__name__ for cls in checker.failed_restrictions]
+            history_ids = [entry.pk for entry in checker.history_entries]
+            # The checker ran before the version existed, so it could not
+            # record it on the history rows itself; backfill it now.
+            if history_ids:
+                UserRestrictionHistory.objects.filter(pk__in=history_ids).update(
+                    version=version
+                )
+            activity.log_create(
+                amo.LOG.DISABLE_AUTO_APPROVAL,
+                addon,
+                details={
+                    'channel': version.channel,
+                    'comments': (
+                        f'{version.get_channel_display()} auto-approval automatically '
+                        'disabled because of a restriction'
+                        f' ({", ".join(failed_names)})'
+                    ),
+                    'restrictions': failed_names,
+                    'restriction_history_ids': history_ids,
+                },
+                user=get_task_user(),
+            )
+
+        if reviewer_flags_defaults:
+            AddonReviewerFlags.objects.update_or_create(
+                addon=addon, defaults=reviewer_flags_defaults
+            )
+
+        # First submission of every add-on should trigger an initial
+        # submission acknowledgement email regardless of channel.
+        if (
+            not addon.versions(manager='unfiltered_for_relations')
+            .exclude(pk=version.pk)
+            .exists()
+        ):
+            send_initial_submission_acknowledgement_email.delay(
+                addon.pk, version.channel, upload.user.email
+            )
+
+        # Unlisted versions approval is delayed depending on how far we are
+        # from creation of the add-on. This is applied only once, during the
+        # first unlisted version creation of an extension (so the flag can be
+        # dropped by admins or reviewers, not affecting subsequent versions).
+        if (
+            channel == amo.CHANNEL_UNLISTED
+            and addon.type == amo.ADDON_EXTENSION
+            and not addon.versions(manager='unfiltered_for_relations')
+            .filter(channel=amo.CHANNEL_UNLISTED)
+            .exclude(pk=version.pk)
+            .exists()
+        ):
+            initial_delay = get_config(amo.config_keys.INITIAL_DELAY_FOR_UNLISTED)
+            auto_approval_delay_for_unlisted = addon.created + timedelta(
+                seconds=initial_delay
+            )
+            if datetime.now() < auto_approval_delay_for_unlisted:
+                addon.set_auto_approval_delay_if_higher_than_existing(
+                    auto_approval_delay_for_unlisted, unlisted_only=True
+                )
+
+        # Reload the flags for the add-on in case some code is using it after
+        # creating the version - the related field could be out of date.
+        try:
+            version.addon.reviewerflags.reload()
+        except AddonReviewerFlags.DoesNotExist:
+            pass
 
         # Track the time it took from first upload through validation
         # (and whatever else) until a version was created.
         upload_start = utc_millesecs_from_epoch(upload.created)
-        now = datetime.datetime.now()
+        now = datetime.now()
         now_ts = utc_millesecs_from_epoch(now)
         upload_time = now_ts - upload_start
 
-        log.info('Time for version {version} creation from upload: {delta}; '
-                 'created={created}; now={now}'
-                 .format(delta=upload_time, version=version,
-                         created=upload.created, now=now))
+        log.info(
+            f'Time for version {version!r} ({version.pk}) creation from upload '
+            f'{upload!r}: {upload_time}; created={upload.created}; now={now}'
+        )
         statsd.timing('devhub.version_created_from_upload', upload_time)
+        statsd.incr(
+            'devhub.version_created_from_upload.'
+            f'{amo.ADDON_TYPE_CHOICES_API.get(addon.type, "")}'
+        )
+
+        VersionProvenance.from_version(
+            version=version, source=upload.source, client_info=client_info
+        )
+
+        call_webhooks_on_version_created.delay(version_pk=version.pk)
 
         return version
 
-    def license_url(self, impala=False):
-        return reverse('addons.license', args=[self.addon.slug, self.version])
-
     def get_url_path(self):
-        if self.channel == amo.RELEASE_CHANNEL_UNLISTED:
+        if self.channel in (amo.CHANNEL_UNLISTED, amo.CHANNEL_ENTERPRISE):
             return ''
-        return reverse('addons.versions', args=[self.addon.slug, self.version])
+        return reverse('addons.versions', args=[self.addon.slug])
 
     def delete(self, hard=False):
-        # To avoid a circular import
-        from .tasks import delete_preview_files
+        # To avoid a circular imports
+        from .tasks import delete_preview_files, soft_block_versions
 
-        log.info(u'Version deleted: %r (%s)' % (self, self.id))
-        activity.log_create(amo.LOG.DELETE_VERSION, self.addon,
-                            str(self.version))
+        log.info('Version deleted: %r (%s)', self, self.id)
+        activity.log_create(amo.LOG.DELETE_VERSION, self.addon, str(self.version))
 
         if hard:
-            super(Version, self).delete()
+            super().delete()
         else:
             # By default we soft delete so we can keep the files for comparison
             # and a record of the version number.
-            self.files.update(status=amo.STATUS_DISABLED)
+            if hasattr(self, 'file') and self.file.status != amo.STATUS_DISABLED:
+                # .file should always exist but we don't want to break delete regardless
+                self.file.update(
+                    status=amo.STATUS_DISABLED,
+                    original_status=self.file.status,
+                    status_disabled_reason=File.STATUS_DISABLED_REASONS.VERSION_DELETE,
+                )
             self.deleted = True
             self.save()
 
+            # Clear pending rejection flag (we have the activity log for
+            # records purposes, the flag serves no purpose anymore if the
+            # version is deleted).
+            VersionReviewerFlags.objects.filter(version=self).update(
+                pending_rejection=None,
+                pending_rejection_by=None,
+                pending_content_rejection=None,
+            )
+
             previews_pks = list(
-                VersionPreview.objects.filter(version__id=self.id)
-                              .values_list('id', flat=True))
+                VersionPreview.objects.filter(version__id=self.id).values_list(
+                    'id', flat=True
+                )
+            )
 
             for preview_pk in previews_pks:
                 delete_preview_files.delay(preview_pk)
 
+            soft_block_versions.delay(
+                version_ids=[self.id], auto_block_reason=BlockReason.VERSION_DELETED
+            )
+
     @property
     def is_user_disabled(self):
-        return self.files.filter(status=amo.STATUS_DISABLED).exclude(
-            original_status=amo.STATUS_NULL).exists()
+        return (
+            self.file.status == amo.STATUS_DISABLED
+            and self.file.status_disabled_reason
+            == File.STATUS_DISABLED_REASONS.DEVELOPER
+        )
 
     @is_user_disabled.setter
     def is_user_disabled(self, disable):
         # User wants to disable (and the File isn't already).
         if disable:
-            activity.log_create(amo.LOG.DISABLE_VERSION, self.addon, self)
-            for file in self.files.exclude(status=amo.STATUS_DISABLED).all():
-                file.update(original_status=file.status,
-                            status=amo.STATUS_DISABLED)
+            if (file_ := self.file) and file_.status != amo.STATUS_DISABLED:
+                activity.log_create(amo.LOG.DISABLE_VERSION, self.addon, self)
+                file_.update(
+                    original_status=file_.status,
+                    status=amo.STATUS_DISABLED,
+                    status_disabled_reason=File.STATUS_DISABLED_REASONS.DEVELOPER,
+                )
         # User wants to re-enable (and user did the disable, not Mozilla).
         else:
-            activity.log_create(amo.LOG.ENABLE_VERSION, self.addon, self)
-            for file in self.files.exclude(
-                    original_status=amo.STATUS_NULL).all():
-                file.update(status=file.original_status,
-                            original_status=amo.STATUS_NULL)
-
-    @property
-    def current_queue(self):
-        """Return the current queue, or None if not in a queue."""
-        from olympia.reviewers.models import (
-            ViewFullReviewQueue, ViewPendingQueue)
-
-        if self.channel == amo.RELEASE_CHANNEL_UNLISTED:
-            # Unlisted add-ons and their updates are automatically approved so
-            # they don't get a queue.
-            # TODO: when we've finished with unlisted/listed versions the
-            # status of an all-unlisted addon will be STATUS_NULL so we won't
-            # need this check.
-            return None
-
-        if self.addon.status == amo.STATUS_NOMINATED:
-            return ViewFullReviewQueue
-        elif self.addon.status == amo.STATUS_PUBLIC:
-            return ViewPendingQueue
-
-        return None
+            if (
+                (file_ := self.file)
+                and file_.status_disabled_reason
+                == File.STATUS_DISABLED_REASONS.DEVELOPER
+            ):
+                activity.log_create(amo.LOG.ENABLE_VERSION, self.addon, self)
+                file_.update(
+                    status=file_.original_status,
+                    original_status=amo.STATUS_NULL,
+                    status_disabled_reason=File.STATUS_DISABLED_REASONS.NONE,
+                )
 
     @cached_property
     def all_activity(self):
-        from olympia.activity.models import VersionLog  # yucky
-        al = (VersionLog.objects.filter(version=self.id).order_by('created')
-              .select_related('activity_log', 'version'))
-        return al
+        # prefetch_related() and not select_related() the ActivityLog to make
+        # sure its transformer is called.
+        return self.versionlog_set.prefetch_related('activity_log').order_by('created')
+
+    def _create_compatible_apps(self, avs):
+        apps = {}
+        for av in avs:
+            av.version = self
+            app_id = av.application
+            if app_id in amo.APP_IDS:
+                apps[amo.APP_IDS[app_id]] = av
+        return apps
 
     @property
     def compatible_apps(self):
-        # Dicts, search providers and personas don't have compatibility info.
-        # Fake one for them.
-        if self.addon and self.addon.type in amo.NO_COMPAT:
-            return {app: None for app in amo.APP_TYPE_SUPPORT[self.addon.type]}
-        # Otherwise, return _compatible_apps which is a cached property that
-        # is filled by the transformer, or simply calculated from the related
-        # compat instances.
+        """Returns a mapping of {APP: ApplicationsVersions}.  This may have been filled
+        by the transformer already."""
+        if not hasattr(self, '_compatible_apps'):
+            # Calculate from the related compat instances.
+            self._compatible_apps = self._create_compatible_apps(
+                self.apps.all().select_related('min', 'max')
+            )
         return self._compatible_apps
 
-    @cached_property
-    def _compatible_apps(self):
-        """Get a mapping of {APP: ApplicationsVersions}."""
-        avs = self.apps.select_related('version')
-        return self._compat_map(avs)
+    @compatible_apps.setter
+    def compatible_apps(self, value):
+        self._compatible_apps = value
 
-    @cached_property
-    def compatible_apps_ordered(self):
-        apps = self.compatible_apps.items()
-        return sorted(apps, key=lambda v: v[0].short)
+    def set_compatible_apps(self, apps):
+        from olympia.addons.tasks import index_addons  # circular import
 
-    def compatible_platforms(self):
-        """Returns a dict of compatible file platforms for this version.
+        # We shouldn't be trying to set compatiblity on addons don't allow it.
+        if self.addon and not self.addon.can_set_compatibility:
+            return
 
-        The result is based on which app(s) the version targets.
-        """
-        app_ids = [a.application for a in self.apps.all()]
-        targets_mobile = amo.ANDROID.id in app_ids
-        targets_other = any((id_ != amo.ANDROID.id) for id_ in app_ids)
-        all_plats = {}
-        if targets_other:
-            all_plats.update(amo.DESKTOP_PLATFORMS)
-        if targets_mobile:
-            all_plats.update(amo.MOBILE_PLATFORMS)
-        return all_plats
+        # clear any removed applications
+        self.apps.exclude(application__in=(app.id for app in apps)).delete()
+        # then save the instances
+        for applications_versions in apps.values():
+            if not applications_versions.id:
+                # set version if we have it, for new instances
+                applications_versions.version = self
+            applications_versions.save()
+        # Update cache on the model.
+        self.compatible_apps = apps
+        # Make sure the add-on is properly re-indexed
+        index_addons.delay([self.addon.id])
 
     @cached_property
     def is_compatible_by_default(self):
         """Returns whether or not the add-on is considered compatible by
         default."""
-        # Use self.all_files directly since that's cached and more potentially
-        # prefetched through a transformer already
-        return not any([
-            file for file in self.all_files
-            if file.binary_components or file.strict_compatibility])
-
-    def is_compatible_app(self, app):
-        """Returns True if the provided app passes compatibility conditions."""
-        if self.addon.type in amo.NO_COMPAT:
-            return True
-        appversion = self.compatible_apps.get(app)
-        if appversion and app.id in amo.D2C_MIN_VERSIONS:
-            return (version_int(appversion.max.version) >=
-                    version_int(amo.D2C_MIN_VERSIONS.get(app.id, '*')))
-        return False
-
-    def compat_override_app_versions(self):
-        """Returns the incompatible app versions range(s).
-
-        If not ranges, returns empty list.  Otherwise, this will return all
-        the app version ranges that this particular version is incompatible
-        with.
-        """
-        overrides = list(self.addon.compatoverride_set.all())
-
-        if not overrides:
-            return []
-
-        app_versions = []
-        for co in overrides:
-            for range in co.collapsed_ranges():
-                if (version_int(range.min) <= version_int(self.version) <=
-                        version_int(range.max)):
-                    app_versions.extend([(a.min, a.max) for a in range.apps])
-        return app_versions
-
-    @cached_property
-    def all_files(self):
-        """Shortcut for list(self.files.all()). Cached."""
-        return list(self.files.all())
-
-    @property
-    def current_file(self):
-        """Shortcut for selecting the first file from self.all_files"""
-        return self.all_files[0]
-
-    @cached_property
-    def supported_platforms(self):
-        """Get a list of supported platform names."""
-        return list(set(amo.PLATFORMS[f.platform] for f in self.all_files))
-
-    @property
-    def status(self):
-        return [
-            f.STATUS_CHOICES.get(f.status, ugettext('[status:%s]') % f.status)
-            for f in self.all_files]
-
-    @property
-    def statuses(self):
-        """Unadulterated statuses, good for an API."""
-        return [(f.id, f.status) for f in self.all_files]
+        return not self.file.strict_compatibility
 
     def is_public(self):
         # To be public, a version must not be deleted, must belong to a public
-        # addon, and all its attached files must have public status.
+        # addon, and its attached file must have a public status.
         try:
-            return (not self.deleted and self.addon.is_public() and
-                    all(f.status == amo.STATUS_PUBLIC for f in self.all_files))
+            return (
+                not self.deleted
+                and self.addon.is_public()
+                and self.file.status == amo.STATUS_APPROVED
+            )
         except ObjectDoesNotExist:
             return False
-
-    @property
-    def is_restart_required(self):
-        return any(file_.is_restart_required for file_ in self.all_files)
-
-    @property
-    def is_webextension(self):
-        return any(file_.is_webextension for file_ in self.all_files)
 
     @property
     def is_mozilla_signed(self):
@@ -483,76 +841,79 @@ class Version(OnChangeMixin, ModelBase):
 
         See https://github.com/mozilla/addons-server/issues/6424
         """
-        return all(
-            file_.is_mozilla_signed_extension for file_ in self.all_files)
-
-    @property
-    def has_files(self):
-        return bool(self.all_files)
+        return self.file.is_mozilla_signed_extension
 
     @property
     def is_unreviewed(self):
-        return bool(list(filter(
-            lambda f: f.status in amo.UNREVIEWED_FILE_STATUSES, self.all_files
-        )))
-
-    @property
-    def is_all_unreviewed(self):
-        return not bool([f for f in self.all_files if f.status not in
-                         amo.UNREVIEWED_FILE_STATUSES])
-
-    @property
-    def is_jetpack(self):
-        return all(f.jetpack_version for f in self.all_files)
+        return self.file.status in amo.UNREVIEWED_FILE_STATUSES
 
     @property
     def sources_provided(self):
         return bool(self.source)
 
-    @classmethod
-    def _compat_map(cls, avs):
-        apps = {}
-        for av in avs:
-            app_id = av.application
-            if app_id in amo.APP_IDS:
-                apps[amo.APP_IDS[app_id]] = av
-        return apps
+    def flag_if_sources_were_provided(self, user):
+        from olympia.activity.utils import log_and_notify
+        from olympia.reviewers.models import NeedsHumanReview
+
+        from .tasks import call_webhooks_on_source_code_uploaded
+
+        if self.source:
+            # Add Activity Log, notifying staff, relevant reviewers and
+            # other authors of the add-on.
+            note = log_and_notify(amo.LOG.SOURCE_CODE_UPLOADED, None, user, self)
+
+            if self.pending_rejection:
+                reason = NeedsHumanReview.REASONS.PENDING_REJECTION_SOURCES_PROVIDED
+                NeedsHumanReview.objects.create(version=self, reason=reason)
+
+            call_webhooks_on_source_code_uploaded.delay(
+                version_pk=self.pk, activity_log_id=note.id
+            )
 
     @classmethod
     def transformer(cls, versions):
-        """Attach all the compatible apps and files to the versions."""
+        """Attach all the compatible apps and the file to the versions."""
         if not versions:
             return
 
-        ids = set(v.id for v in versions)
-        avs = (ApplicationsVersions.objects.filter(version__in=ids)
-               .select_related('min', 'max'))
-        files = File.objects.filter(version__in=ids)
+        ids = {v.id for v in versions}
+        avs = ApplicationsVersions.objects.filter(version__in=ids).select_related(
+            'min', 'max'
+        )
 
         def rollup(xs):
             groups = sorted_groupby(xs, 'version_id')
-            return dict((k, list(vs)) for k, vs in groups)
+            return {k: list(vs) for k, vs in groups}
 
-        av_dict, file_dict = rollup(avs), rollup(files)
+        av_dict = rollup(avs)
 
         for version in versions:
-            v_id = version.id
-            version._compatible_apps = cls._compat_map(av_dict.get(v_id, []))
-            version.all_files = file_dict.get(v_id, [])
-            for f in version.all_files:
-                f.version = version
+            version.compatible_apps = version._create_compatible_apps(
+                av_dict.get(version.id, [])
+            )
 
     @classmethod
     def transformer_activity(cls, versions):
         """Attach all the activity to the versions."""
-        from olympia.activity.models import VersionLog  # yucky
+        from olympia.activity.models import VersionLog
 
-        ids = set(v.id for v in versions)
+        ids = {v.id for v in versions}
         if not versions:
             return
 
-        al = (VersionLog.objects.filter(version__in=ids).order_by('created')
-              .select_related('activity_log', 'version'))
+        # Ideally, we'd start from the ActivityLog, but because VersionLog
+        # to ActivityLog isn't a OneToOneField, we wouldn't be able to find
+        # the version easily afterwards - we can't even do a
+        # select_related('versionlog') and try to traverse the relation to find
+        # the version. So, instead, start from VersionLog, but make sure to use
+        # prefetch_related() (and not select_related() - yes, it's one extra
+        # query, but it's worth it to benefit from the default transformer) so
+        # that the ActivityLog default transformer is called.
+        al = (
+            VersionLog.objects.prefetch_related('activity_log')
+            .filter(version__in=ids)
+            .order_by('created')
+        )
 
         def rollup(xs):
             groups = sorted_groupby(xs, 'version_id')
@@ -564,45 +925,134 @@ class Version(OnChangeMixin, ModelBase):
             v_id = version.id
             version.all_activity = al_dict.get(v_id, [])
 
+    @classmethod
+    def transformer_license(cls, versions):
+        """Attach all the licenses to the versions.
+
+        Do not use if you need the license text: it's explicitly deferred in
+        this transformer, because it should only be used when listing multiple
+        versions, where returning license text is not supposed to be needed.
+
+        The translations app doesn't fully handle evaluating a deferred field,
+        so the callers need to make sure the license text will never be needed
+        on instances returned by a queryset transformed by this method."""
+        if not versions:
+            return
+        license_ids = {ver.license_id for ver in versions}
+        licenses = License.objects.filter(id__in=license_ids).defer('text')
+        license_dict = {lic.id: lic for lic in licenses}
+
+        for version in versions:
+            license = license_dict.get(version.license_id)
+            if license:
+                version.license = license
+
+    @classmethod
+    def transformer_auto_approvable(cls, versions):
+        """Attach  auto-approvability information to the versions."""
+        ids = {v.id for v in versions}
+        if not ids:
+            return
+
+        auto_approvable = (
+            Version.objects.auto_approvable()
+            .filter(pk__in=ids)
+            .values_list('pk', flat=True)
+        )
+
+        for version in versions:
+            version.is_ready_for_auto_approval = version.pk in auto_approvable
+
     def disable_old_files(self):
         """
-        Disable files from versions older than the current one and awaiting
-        review. Used when uploading a new version.
+        Disable files from versions older than the current one in the same
+        channel and awaiting review. Used when uploading a new version.
 
-        Does nothing if the current instance is unlisted.
+        Does nothing if the add-on is a langpack or if the current instance is
+        unlisted.
         """
-        if self.channel == amo.RELEASE_CHANNEL_LISTED:
-            qs = File.objects.filter(version__addon=self.addon_id,
-                                     version__lt=self.id,
-                                     version__deleted=False,
-                                     status__in=[amo.STATUS_AWAITING_REVIEW,
-                                                 amo.STATUS_PENDING])
+        if self.channel == amo.CHANNEL_LISTED and self.addon.type != amo.ADDON_LPAPP:
+            qs = File.objects.filter(
+                version__addon=self.addon_id,
+                version__lt=self.id,
+                version__deleted=False,
+                version__channel=self.channel,
+                status=amo.STATUS_AWAITING_REVIEW,
+            )
             # Use File.update so signals are triggered.
             for f in qs:
                 f.update(status=amo.STATUS_DISABLED)
 
-    def reset_nomination_time(self, nomination=None):
-        if not self.nomination or nomination:
-            nomination = nomination or datetime.datetime.now()
-            # We need signal=False not to call update_status (which calls us).
-            self.update(nomination=nomination, _signal=False)
+    def reset_due_date(self, due_date=None, should_have_due_date=None):
+        """Sets a due date on this version, if it is eligible for one, or
+        clears it if the version should not have a due date (see
+        VersionManager.should_have_due_date for logic).
 
-    def inherit_nomination(self, from_statuses=None):
-        last_ver = (Version.objects.filter(addon=self.addon,
-                                           channel=amo.RELEASE_CHANNEL_LISTED)
-                    .exclude(nomination=None).exclude(id=self.pk)
-                    .order_by('-nomination'))
-        if from_statuses:
-            last_ver = last_ver.filter(files__status__in=from_statuses)
-        if last_ver.exists():
-            self.reset_nomination_time(nomination=last_ver[0].nomination)
+        If due_date is None then a new due date will only be set if the version
+        doesn't already have one; otherwise the provided due_date will be be
+        used to overwrite any value.
 
-    @property
-    def unreviewed_files(self):
-        """A File is unreviewed if its status is amo.STATUS_AWAITING_REVIEW."""
-        return self.files.filter(status=amo.STATUS_AWAITING_REVIEW)
+        If should_have_due_date is not None its value will be used instead of
+        actually checking if the version should have a due date or not.
 
-    @property
+        Doesn't trigger post_save signal to avoid infinite loops
+        since it can be triggered from Version.post_save callback.
+        """
+
+        if should_have_due_date is None:
+            should_have_due_date = self.should_have_due_date
+
+        if should_have_due_date:
+            # if the version should have a due date and it doesn't, set one
+            if not self.due_date or due_date:
+                due_date = due_date or self.generate_due_date()
+                log.info('Version %r (%s) due_date set to %s', self, self.id, due_date)
+                self.update(due_date=due_date, _signal=False)
+                if not self.reviewqueuehistory_set.filter(exit_date=None).exists():
+                    from .tasks import call_webhooks_on_version_entered_review_queue
+
+                    self.reviewqueuehistory_set.create(
+                        exit_date=None, original_due_date=due_date
+                    )
+                    call_webhooks_on_version_entered_review_queue.delay(
+                        version_pk=self.pk
+                    )
+        elif self.due_date:
+            # otherwise it shouldn't have a due_date so clear it.
+            log.info(
+                'Version %r (%s) due_date of %s cleared', self, self.id, self.due_date
+            )
+            self.update(due_date=None, _signal=False)
+            # The version left the queue - whether it was a reviewer action or
+            # not, we record that here. Reviewer tools will update
+            # review_decision_log separately if relevant.
+            self.reviewqueuehistory_set.filter(exit_date=None).update(
+                exit_date=datetime.now()
+            )
+
+    @use_primary_db
+    def generate_due_date(self):
+        """
+        (Re)Generate a due date for this version, inheriting from the earliest
+        due date possible from any other version with reasons that can trigger
+        inheritance in the same channel if one exists, but only if the result
+        would be at at earlier date than the default/existing one on the
+        instance.
+        """
+        qs = (
+            self.addon.versions_triggering_needs_human_review_inheritance(self.channel)
+            .exclude(due_date=None)
+            .exclude(id=self.pk)
+            .values_list('due_date', flat=True)
+            .order_by('-due_date')
+        )
+        due_date = qs.first()
+        standard_or_existing_due_date = self.due_date or get_review_due_date()
+        if not due_date or due_date > standard_or_existing_due_date:
+            due_date = standard_or_existing_due_date
+        return due_date
+
+    @cached_property
     def is_ready_for_auto_approval(self):
         """Return whether or not this version could be *considered* for
         auto-approval.
@@ -610,33 +1060,235 @@ class Version(OnChangeMixin, ModelBase):
         Does not necessarily mean that it would be auto-approved, just that it
         passes the most basic criteria to be considered a candidate by the
         auto_approve command."""
-        return (
-            self.addon.status in (amo.STATUS_PUBLIC, amo.STATUS_NOMINATED) and
-            self.addon.type in (
-                amo.ADDON_EXTENSION, amo.ADDON_LPAPP, amo.ADDON_DICT) and
-            self.is_webextension and
-            self.is_unreviewed and
-            self.channel == amo.RELEASE_CHANNEL_LISTED)
+        return Version.objects.auto_approvable().filter(id=self.id).exists()
+
+    @property
+    def should_have_due_date(self):
+        """Should this version have a due_date set, meaning it needs a manual review.
+
+        See VersionManager.should_have_due_date for logic."""
+        return Version.unfiltered.should_have_due_date().filter(id=self.id).exists()
 
     @property
     def was_auto_approved(self):
         """Return whether or not this version was auto-approved."""
-        from olympia.reviewers.models import AutoApprovalSummary
         try:
-            return self.is_public() and AutoApprovalSummary.objects.filter(
-                version=self).get().verdict == amo.AUTO_APPROVED
-        except AutoApprovalSummary.DoesNotExist:
+            return self.autoapprovalsummary.verdict == amo.AUTO_APPROVED
+        except Version.autoapprovalsummary.RelatedObjectDoesNotExist:
             pass
         return False
 
     def get_background_images_encoded(self, header_only=False):
-        if not self.has_files:
-            return {}
-        file_obj = self.all_files[0]
+        file_obj = self.file
         return {
-            name: force_text(b64encode(background))
+            name: force_str(b64encode(background))
             for name, background in utils.get_background_images(
-                file_obj, theme_data=None, header_only=header_only).items()}
+                file_obj, theme_data=None, header_only=header_only
+            ).items()
+        }
+
+    def can_be_disabled_and_deleted(self):
+        # see https://github.com/mozilla/addons-server/issues/15121#issuecomment-667226959
+        # "It should apply to the <groups> that require a review to be badged"
+        from olympia.promoted.models import PromotedApproval
+
+        promotions = self.addon.promoted_groups()
+
+        if self != self.addon.current_version or (
+            not promotions.exists()
+            or not any(promotions.badged)
+            or not any(promotions.listed_pre_review)
+        ):
+            return True
+
+        # We're trying to check if the current version of a promoted add-on can
+        # be disabled/deleted. We'll allow if if the previous valid version
+        # already had the promotion approval, so that we don't end up with a
+        # promoted add-on w/ a current version that hasn't had a manual review.
+        previous_version = (
+            self.addon.versions.valid()
+            .filter(channel=self.channel)
+            .exclude(id=self.id)
+            .no_transforms()
+            # .distinct() forces a nested subquery making the whole thing
+            # possible in a single query
+            .distinct()[:1]
+        )
+        previous_approval = PromotedApproval.objects.filter(
+            promoted_group__in=promotions,
+            version__in=previous_version,
+        )
+        return previous_approval.exists()
+
+    @property
+    def is_blocked(self):
+        return hasattr(self, 'blockversion')
+
+    @property
+    def is_hard_blocked(self):
+        return self.is_blocked and self.blockversion.block_type == BlockType.BLOCKED
+
+    @property
+    def is_soft_blocked(self):
+        return (
+            self.is_blocked and self.blockversion.block_type == BlockType.SOFT_BLOCKED
+        )
+
+    @property
+    def pending_rejection(self):
+        try:
+            return self.reviewerflags.pending_rejection
+        except VersionReviewerFlags.DoesNotExist:
+            return None
+
+    @property
+    def pending_content_rejection(self):
+        try:
+            return self.reviewerflags.pending_content_rejection
+        except VersionReviewerFlags.DoesNotExist:
+            return None
+
+    @property
+    def pending_rejection_by(self):
+        try:
+            return self.reviewerflags.pending_rejection_by
+        except VersionReviewerFlags.DoesNotExist:
+            return None
+
+    def get_review_status_for_auto_approval_and_delay_reject(self):
+        status = None
+        if (reviewer_flags := getattr(self, 'reviewerflags', None)) and (
+            rejection_date := reviewer_flags.pending_rejection
+        ):
+            status = gettext('Delay-rejected, scheduled for %s') % rejection_date
+        elif self.file.status == amo.STATUS_APPROVED:
+            summary = getattr(self, 'autoapprovalsummary', None)
+            if summary and summary.verdict == amo.AUTO_APPROVED:
+                status = (
+                    gettext('Auto-approved, Confirmed')
+                    if summary.confirmed is True
+                    else gettext('Auto-approved, not Confirmed')
+                )
+            else:
+                status = gettext('Approved, Manual')
+        return status
+
+    def get_review_status_display(self, show_auto_approval_and_delay_reject=False):
+        if self.deleted:
+            return gettext('Deleted')
+        if self.is_user_disabled:
+            return gettext('Disabled by Developer')
+
+        # This is the default status
+        status = self.file.get_review_status_display()
+        # But optionally, we override with more a specific status if available
+        return (
+            show_auto_approval_and_delay_reject
+            and self.get_review_status_for_auto_approval_and_delay_reject()
+            or status
+        )
+
+
+class VersionReviewerFlags(ModelBase):
+    version = models.OneToOneField(
+        Version,
+        primary_key=True,
+        on_delete=models.CASCADE,
+        related_name='reviewerflags',
+    )
+    pending_rejection = models.DateTimeField(
+        default=None, null=True, blank=True, db_index=True
+    )
+    pending_rejection_by = models.ForeignKey(
+        UserProfile, null=True, on_delete=models.CASCADE
+    )
+    pending_content_rejection = models.BooleanField(null=True)
+    # Note, this is unused when 'enable-policy-review-selection' is enabled
+    # Remove this field when the switch is removed.
+    pending_resolution_cinder_jobs = models.ManyToManyField(
+        to='abuse.CinderJob', related_name='pending_rejections'
+    )
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                name='pending_rejection_all_none',
+                condition=(
+                    models.Q(
+                        pending_rejection__isnull=True,
+                        pending_rejection_by__isnull=True,
+                        pending_content_rejection__isnull=True,
+                    )
+                    | models.Q(
+                        pending_rejection__isnull=False,
+                        pending_rejection_by__isnull=False,
+                        pending_content_rejection__isnull=False,
+                    )
+                ),
+            ),
+        ]
+
+
+class VersionProvenance(models.Model):
+    version = models.ForeignKey(Version, primary_key=True, on_delete=models.CASCADE)
+    source = models.PositiveSmallIntegerField(choices=amo.UPLOAD_SOURCE_CHOICES)
+    client_info = models.CharField(max_length=255, null=True, default=None)
+
+    @classmethod
+    def from_version(cls, *, version, source, client_info):
+        """Create a VersionProvenance from a Version and provenance info."""
+        if client_info:
+            # Truncate client_info if it was passed so that we can store it,
+            # and extract web-ext version number if present to send a ping
+            # about it.
+            client_info_maxlength = cls._meta.get_field('client_info').max_length
+            client_info = client_info[:client_info_maxlength]
+            webext_version_match = re.match(r'web-ext/([\d\.]+)$', client_info or '')
+            webext_version = (
+                webext_version_match.group(1).replace('.', '_')
+                if webext_version_match
+                else None
+            )
+            if webext_version:
+                if source == amo.UPLOAD_SOURCE_SIGNING_API:
+                    formatted_source = 'signing.submission'
+                elif source == amo.UPLOAD_SOURCE_ADDON_API:
+                    formatted_source = 'addons.submission'
+                else:
+                    formatted_source = 'other'
+                log.info(
+                    'Version created from %s with webext_version %s:',
+                    formatted_source,
+                    webext_version,
+                )
+                statsd.incr(f'{formatted_source}.webext_version.{webext_version}')
+        # Create the instance no matter what (client_info may be empty, that's
+        # fine).
+        return cls.objects.create(
+            version=version, source=source, client_info=client_info
+        )
+
+
+def version_review_flags_save_signal(sender, instance, **kw):
+    if not instance.pending_rejection:
+        instance.pending_rejection_by = None
+        instance.pending_content_rejection = None
+
+
+models.signals.pre_save.connect(
+    version_review_flags_save_signal,
+    sender=VersionReviewerFlags,
+    dispatch_uid='version_review_flags',
+)
+
+
+@receiver(
+    models.signals.post_save,
+    sender=VersionReviewerFlags,
+    dispatch_uid='version_review_flags',
+)
+def update_due_date_for_pending_rejection_changes(sender, instance=None, **kwargs):
+    instance.version.reset_due_date()
 
 
 def generate_static_theme_preview(theme_data, version_pk):
@@ -644,40 +1296,45 @@ def generate_static_theme_preview(theme_data, version_pk):
     needed, in tests."""
     # To avoid a circular import
     from . import tasks
+
     tasks.generate_static_theme_preview.delay(theme_data, version_pk)
 
 
-def extract_version_to_git_repository(version, upload):
-    """Extract and commit ``version`` into our git-storage backend."""
-    from . import tasks
-    if waffle.switch_is_active('enable-uploads-commit-to-git-storage'):
-        tasks.extract_version_to_git.delay(
-            version_id=version.pk,
-            author_id=upload.user.pk if upload.user else None)
-
-
 class VersionPreview(BasePreview, ModelBase):
-    version = models.ForeignKey(Version, related_name='previews')
+    version = models.ForeignKey(
+        Version, related_name='previews', on_delete=models.CASCADE
+    )
     position = models.IntegerField(default=0)
-    sizes = JSONField(default={})
-    colors = JSONField(default=None, null=True)
+    sizes = models.JSONField(default=dict)
+    colors = models.JSONField(default=None, null=True)
     media_folder = 'version-previews'
 
     class Meta:
         db_table = 'version_previews'
         ordering = ('position', 'created')
+        indexes = [
+            LongNameIndex(
+                fields=('version',), name='version_previews_version_id_fk_versions_id'
+            ),
+            models.Index(
+                fields=('version', 'position', 'created'),
+                name='version_position_created_idx',
+            ),
+        ]
 
     @cached_property
     def caption(self):
         """We only don't support defining a caption for previews because
         they're auto-generated.  This is for compatibility with Addon Preview
         objects. (it's a cached_property so it can be set transparently)"""
-        return None
+        return
 
 
-models.signals.post_delete.connect(VersionPreview.delete_preview_files,
-                                   sender=VersionPreview,
-                                   dispatch_uid='delete_preview_files')
+models.signals.post_delete.connect(
+    VersionPreview.delete_preview_files,
+    sender=VersionPreview,
+    dispatch_uid='delete_preview_files',
+)
 
 
 @use_primary_db
@@ -687,175 +1344,361 @@ def update_status(sender, instance, **kw):
             instance.addon.reload()
             instance.addon.update_status()
         except models.ObjectDoesNotExist:
-            log.info('Got ObjectDoesNotExist processing Version change signal',
-                     exc_info=True)
-            pass
+            log.info(
+                'Got ObjectDoesNotExist processing Version change signal', exc_info=True
+            )
 
 
-def inherit_nomination(sender, instance, **kw):
+def inherit_due_date_if_nominated(sender, instance, **kw):
     """
-    For new versions pending review, ensure nomination date
-    is inherited from last nominated version.
+    Ensure due date is inherited when the add-on is nominated for initial
+    listed review.
     """
     if kw.get('raw'):
         return
-    addon = instance.addon
-    if (instance.nomination is None and
-            addon.status in amo.UNREVIEWED_ADDON_STATUSES):
-        instance.inherit_nomination()
-
-
-def update_incompatible_versions(sender, instance, **kw):
-    """
-    When a new version is added or deleted, send to task to update if it
-    matches any compat overrides.
-    """
-    try:
-        if not instance.addon.type == amo.ADDON_EXTENSION:
-            return
-    except ObjectDoesNotExist:
-        return
-
-    from olympia.addons import tasks
-    tasks.update_incompatible_appversions.delay([instance.id])
+    if instance.due_date is None and instance.addon.status == amo.STATUS_NOMINATED:
+        instance.reset_due_date()
 
 
 def cleanup_version(sender, instance, **kw):
     """On delete of the version object call the file delete and signals."""
     if kw.get('raw'):
         return
-    for file_ in instance.files.all():
-        cleanup_file(file_.__class__, file_)
-
-
-def clear_compatversion_cache_on_save(sender, instance, created, **kw):
-    """Clears compatversion cache if new Version created."""
-    try:
-        if not instance.addon.type == amo.ADDON_EXTENSION:
-            return
-    except ObjectDoesNotExist:
-        return
-
-    if not kw.get('raw') and (created or instance.deleted):
-        instance.addon.invalidate_d2c_versions()
-
-
-def clear_compatversion_cache_on_delete(sender, instance, **kw):
-    """Clears compatversion cache when Version deleted."""
-    try:
-        if not instance.addon.type == amo.ADDON_EXTENSION:
-            return
-    except ObjectDoesNotExist:
-        return
-
-    if not kw.get('raw'):
-        instance.addon.invalidate_d2c_versions()
+    if hasattr(instance, 'file'):
+        cleanup_file(instance.file.__class__, instance.file)
 
 
 version_uploaded = django.dispatch.Signal()
 models.signals.pre_save.connect(
-    save_signal, sender=Version, dispatch_uid='version_translations')
+    save_signal, sender=Version, dispatch_uid='version_translations'
+)
 models.signals.post_save.connect(
-    update_status, sender=Version, dispatch_uid='version_update_status')
+    update_status, sender=Version, dispatch_uid='version_update_status'
+)
 models.signals.post_save.connect(
-    inherit_nomination, sender=Version,
-    dispatch_uid='version_inherit_nomination')
-models.signals.post_save.connect(
-    update_incompatible_versions, sender=Version,
-    dispatch_uid='version_update_incompat')
-models.signals.post_save.connect(
-    clear_compatversion_cache_on_save, sender=Version,
-    dispatch_uid='clear_compatversion_cache_save')
-
+    inherit_due_date_if_nominated,
+    sender=Version,
+    dispatch_uid='inherit_due_date_if_nominated',
+)
 models.signals.pre_delete.connect(
-    cleanup_version, sender=Version, dispatch_uid='cleanup_version')
+    cleanup_version, sender=Version, dispatch_uid='cleanup_version'
+)
 models.signals.post_delete.connect(
-    update_status, sender=Version, dispatch_uid='version_update_status')
-models.signals.post_delete.connect(
-    update_incompatible_versions, sender=Version,
-    dispatch_uid='version_update_incompat')
-models.signals.post_delete.connect(
-    clear_compatversion_cache_on_delete, sender=Version,
-    dispatch_uid='clear_compatversion_cache_del')
+    update_status, sender=Version, dispatch_uid='version_update_status'
+)
 
 
 class LicenseManager(ManagerBase):
-    def builtins(self, cc=False):
-        return self.filter(
-            builtin__gt=0, creative_commons=cc).order_by('builtin')
+    def builtins(self, cc=False, on_form=True):
+        cc_q = Q(builtin__in=CC_LICENSES.keys())
+        if not cc:
+            cc_q = ~cc_q
+        on_form_q = Q(builtin__in=FORM_LICENSES.keys()) if on_form else Q()
+        return self.filter(on_form_q, cc_q, builtin__gt=0).order_by('builtin')
 
 
-@python_2_unicode_compatible
 class License(ModelBase):
     OTHER = 0
 
     id = PositiveAutoField(primary_key=True)
-    name = TranslatedField()
-    url = models.URLField(null=True)
+    name = TranslatedField(max_length=200)
     builtin = models.PositiveIntegerField(default=OTHER)
-    text = LinkifiedField()
-    on_form = models.BooleanField(
-        default=False, help_text='Is this a license choice in the devhub?')
-    some_rights = models.BooleanField(
-        default=False,
-        help_text='Show "Some Rights Reserved" instead of the license name?')
-    icons = models.CharField(
-        max_length=255, null=True,
-        help_text='Space-separated list of icon identifiers.')
-    creative_commons = models.BooleanField(default=False)
+    text = LinkifiedField(max_length=75000)
 
     objects = LicenseManager()
 
     class Meta:
         db_table = 'licenses'
+        indexes = [models.Index(fields=('builtin',), name='builtin_idx')]
 
     def __str__(self):
         license = self._constant or self
-        return six.text_type(license.name)
+        return str(license.name)
 
     @property
     def _constant(self):
         return LICENSES_BY_BUILTIN.get(self.builtin)
 
+    @property
+    def creative_commons(self):
+        return bool((constant := self._constant) and constant.creative_commons)
+
+    @property
+    def icons(self):
+        return ((constant := self._constant) and constant.icons) or ''
+
+    @property
+    def slug(self):
+        return ((constant := self._constant) and constant.slug) or None
+
+    @property
+    def url(self):
+        return ((constant := self._constant) and constant.url) or None
+
 
 models.signals.pre_save.connect(
-    save_signal, sender=License, dispatch_uid='license_translations')
+    save_signal, sender=License, dispatch_uid='license_translations'
+)
 
 
-@python_2_unicode_compatible
 class ApplicationsVersions(models.Model):
     id = PositiveAutoField(primary_key=True)
-    application = models.PositiveIntegerField(choices=amo.APPS_CHOICES,
-                                              db_column='application_id')
-    version = models.ForeignKey(
-        Version, related_name='apps', on_delete=models.CASCADE)
-    min = models.ForeignKey(AppVersion, db_column='min',
-                            related_name='min_set')
-    max = models.ForeignKey(AppVersion, db_column='max',
-                            related_name='max_set')
+    application = models.PositiveIntegerField(
+        choices=amo.APPS_CHOICES, db_column='application_id'
+    )
+    version = models.ForeignKey(Version, related_name='apps', on_delete=models.CASCADE)
+    min = models.ForeignKey(
+        AppVersion, db_column='min', related_name='min_set', on_delete=models.CASCADE
+    )
+    max = models.ForeignKey(
+        AppVersion, db_column='max', related_name='max_set', on_delete=models.CASCADE
+    )
+    originated_from = models.PositiveSmallIntegerField(
+        choices=(
+            (amo.APPVERSIONS_ORIGINATED_FROM_UNKNOWN, 'Unknown'),
+            (amo.APPVERSIONS_ORIGINATED_FROM_AUTOMATIC, 'Automatically determined'),
+            (
+                amo.APPVERSIONS_ORIGINATED_FROM_MIGRATION,
+                'Automatically set by a migration',
+            ),
+            (
+                amo.APPVERSIONS_ORIGINATED_FROM_DEVELOPER,
+                'Set by developer through devhub or API',
+            ),
+            (
+                amo.APPVERSIONS_ORIGINATED_FROM_MANIFEST,
+                'Set in the manifest (gecko key)',
+            ),
+            # Special case for Android, where compatibility information in the
+            # manifest can come from the `gecko_android` key (with `gecko` as a
+            # fallback).
+            (
+                amo.APPVERSIONS_ORIGINATED_FROM_MANIFEST_GECKO_ANDROID,
+                'Set in the manifest (gecko_android key)',
+            ),
+        ),
+        default=amo.APPVERSIONS_ORIGINATED_FROM_UNKNOWN,
+        null=True,
+    )
+
+    # Range of Firefox for Android versions where compatibility should be
+    # limited to add-ons with a promoted group that can be compatible with
+    # Fenix (i.e. Line, Recommended).
+    ANDROID_LIMITED_COMPATIBILITY_RANGE = (
+        amo.MIN_VERSION_FENIX,
+        amo.MIN_VERSION_FENIX_GENERAL_AVAILABILITY,
+    )
 
     class Meta:
-        db_table = u'applications_versions'
-        unique_together = (("application", "version"),)
+        db_table = 'applications_versions'
+        constraints = [
+            models.UniqueConstraint(
+                fields=('application', 'version'), name='application_id'
+            ),
+        ]
 
     def get_application_display(self):
-        return six.text_type(amo.APPS_ALL[self.application].pretty)
+        return str(amo.APPS_ALL[self.application].pretty)
 
     def get_latest_application_version(self):
         return (
-            AppVersion.objects
-            .filter(
-                ~models.Q(version__contains='*'),
-                application=self.application)
+            AppVersion.objects.filter(
+                ~models.Q(version__contains='*'), application=self.application
+            )
             .order_by('-version_int')
-            .first())
+            .first()
+        )
+
+    def get_default_minimum_appversion(self):
+        return AppVersion.objects.filter(application=self.application).get(
+            version=amo.DEFAULT_WEBEXT_MIN_VERSIONS[amo.APPS_ALL[self.application]]
+        )
+
+    def get_default_maximum_appversion(self):
+        return AppVersion.objects.filter(application=self.application).get(
+            version=amo.DEFAULT_WEBEXT_MAX_VERSION
+        )
+
+    @property
+    def locked_from_manifest(self):
+        """Whether the manifest is the source of truth for this ApplicationsVersions or
+        not.
+
+        Currently only True if `gecko_android` is present in manifest.
+        """
+        return (
+            self.originated_from
+            == amo.APPVERSIONS_ORIGINATED_FROM_MANIFEST_GECKO_ANDROID
+        )
 
     def __str__(self):
-        if (self.version.is_compatible_by_default and
-                self.version.is_compatible_app(amo.APP_IDS[self.application])):
-            return ugettext(u'{app} {min} and later').format(
-                app=self.get_application_display(),
-                min=self.min
-            )
-        return u'%s %s - %s' % (self.get_application_display(),
-                                self.min, self.max)
+        pretty_application = self.get_application_display() if self.application else '?'
+        try:
+            if self.version.is_compatible_by_default:
+                return gettext('{app} {min} and later').format(
+                    app=pretty_application, min=self.min
+                )
+            return f'{pretty_application} {self.min} - {self.max}'
+        except ObjectDoesNotExist:
+            return pretty_application
+
+    def version_range_contains_forbidden_compatibility(self):
+        """
+        Return whether the instance contains forbidden ranges.
+
+        Used for Android to disallow non line/recommended to be compatible with
+        Fenix before General Availability.
+        """
+        if self.application != amo.ANDROID.id:
+            return False
+
+        addon = self.version.addon
+
+        if addon.type != amo.ADDON_EXTENSION:
+            # We don't care about non-extension compatibility for this.
+            return False
+
+        # Recommended/line for Android are allowed to set compatibility in the
+        # limited range.
+        if addon.can_be_compatible_with_all_fenix_versions:
+            return False
+
+        # Range is expressed as a [closed, open) interval.
+        limited_range_start = version_int(self.ANDROID_LIMITED_COMPATIBILITY_RANGE[0])
+        limited_range_end = version_int(self.ANDROID_LIMITED_COMPATIBILITY_RANGE[1])
+
+        # Min or max could be absent if it's a partial instance we'll be
+        # completing later. Use default values in that case (increases the
+        # chance that the range would be considered forbbiden, forcing caller
+        # to provide a complete instance).
+        min_ = getattr(self, 'min', None) or self.get_default_minimum_appversion()
+        max_ = getattr(self, 'max', None) or self.get_default_maximum_appversion()
+
+        return (
+            min_.version_int < limited_range_end
+            and max_.version_int >= limited_range_start
+        )
+
+    def save(self, *args, **kwargs):
+        if (
+            self.application == amo.ANDROID.id
+            and self.version.addon.type == amo.ADDON_EXTENSION
+        ):
+            # Regardless of whether the compat information came from the
+            # manifest, on Android we currently only allow non-promoted/line
+            # extensions to be compatible with Fennec or Fenix that has general
+            # availability, so we might need to override the compat data before
+            # saving it.
+            if self.version_range_contains_forbidden_compatibility():
+                # Arbitrarily pick a range that makes sense and is valid.
+                self.min = AppVersion.objects.filter(
+                    application=amo.ANDROID.id,
+                    version=amo.MIN_VERSION_FENIX_GENERAL_AVAILABILITY,
+                ).first()
+                self.max = AppVersion.objects.filter(
+                    application=amo.ANDROID.id,
+                    version=amo.DEFAULT_WEBEXT_MAX_VERSION,
+                ).first()
+
+            # In addition we need to set/clear strict compatibility.
+            # If the range max is below the first Fenix version, then we need
+            # to set strict_compatibility to True on the File to prevent that
+            # version from being installed in Fenix. If it's not, then we need
+            # to clear it if it was set.
+            #
+            # Strict compatibility also affects Desktop, so there is a slight
+            # edge case if the developer had also set a max on desktop without
+            # expecting it to be obeyed, but that should be fairly rare.
+            if self.max.version_int < version_int(amo.MIN_VERSION_FENIX):
+                strict_compatibility = True
+            else:
+                strict_compatibility = False
+            if self.version.file.strict_compatibility != strict_compatibility:
+                self.version.file.update(strict_compatibility=strict_compatibility)
+
+        rval = super().save(*args, **kwargs)
+        if hasattr(self.version, '_compatible_apps'):
+            del self.version._compatible_apps
+        return rval
+
+    def delete(self, *args, **kwargs):
+        if (
+            self.application == amo.ANDROID.id
+            and self.version.addon.type == amo.ADDON_EXTENSION
+            and self.version.file.strict_compatibility
+        ):
+            self.version.file.update(strict_compatibility=False)
+        return super().delete(*args, **kwargs)
+
+
+class InstallOrigin(ModelBase):
+    version = models.ForeignKey(Version, on_delete=models.CASCADE)
+    origin = models.CharField(max_length=255)
+    base_domain = models.CharField(max_length=255)
+
+    @staticmethod
+    def punycode(hostname):
+        return hostname.encode('idna').decode('utf-8').lower()
+
+    def _extract_base_domain_from_origin(self, origin):
+        """Extract base domain from an origin according to publicsuffix list.
+        Handles IDNs in both unicode and punycode form, but always return the
+        base domain in punycode."""
+        hostname = urlparse(origin).hostname or ''
+        # If the domain is an Internationalized Domain Name (IDN), we want to
+        # return the punycode version. This follows publicsuffix2's default
+        # behavior - idna=True is the default and that means it expects input
+        # to be idna-encoded. That's the format we'd like to return anyway, to
+        # make it obvious to reviewers/admins when the base domain is an IDN.
+        hostname = self.punycode(hostname)
+        return get_sld(hostname)
+
+    def save(self, *args, **kwargs):
+        self.base_domain = self._extract_base_domain_from_origin(self.origin)
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f'{self.version.version} : {self.origin} ({self.base_domain})'
+
+
+class DeniedInstallOrigin(ModelBase):
+    ERROR_MESSAGE = _('The install origin {origin} is not permitted.')
+
+    hostname_pattern = models.CharField(
+        max_length=255,
+        unique=True,
+        help_text='Hostname unix-style pattern to deny.',
+    )
+    include_subdomains = models.BooleanField(
+        default=False,
+        help_text=(
+            'Automatically check for subdomains of hostname pattern '
+            '(Additional check with `*.` prepended to the original pattern).'
+        ),
+    )
+
+    def save(self, *args, **kwargs):
+        # Transform pattern so that we always compare things in punycode.
+        self.hostname_pattern = InstallOrigin.punycode(self.hostname_pattern)
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.hostname_pattern
+
+    @classmethod
+    def find_denied_origins(cls, install_origins):
+        """
+        Filter input list of origins to only return denied origins (Empty set
+        returned means all the install origins passed in argument are allowed).
+        """
+        denied = set()
+        denied_install_origins = cls.objects.all()
+        for origin in install_origins:
+            hostname = InstallOrigin.punycode(urlparse(origin).hostname or '')
+            for denied_origin in denied_install_origins:
+                if fnmatch(hostname, denied_origin.hostname_pattern) or (
+                    denied_origin.include_subdomains
+                    and fnmatch(hostname, f'*.{denied_origin.hostname_pattern}')
+                ):
+                    denied.add(origin)
+        return denied

@@ -1,16 +1,15 @@
 """Testing the pytest fixtures themselves which are declared in conftest.py."""
-import pytest
-import responses
-import requests
 
+import pytest
+import requests
+import responses
 from requests.exceptions import ConnectionError
 
 from olympia.access.models import Group
 
 
 def test_admin_group(admin_group):
-    assert Group.objects.count() == 1
-    admin_group = Group.objects.get()
+    admin_group = Group.objects.get(name='Admins')
     assert admin_group.name == 'Admins'
     assert admin_group.rules == '*:*'
 

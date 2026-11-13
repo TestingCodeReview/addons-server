@@ -18,12 +18,14 @@
     {% block rss_feed %}{% endblock %}
 
     {# L10n: {0} is an application, like Firefox. #}
-    <link title="{{ _('{0} Add-ons')|format_html(APP.pretty) }}"
+    <link title="{{ _('{0} Add-ons')|format_html(amo.FIREFOX.pretty) }}"
           rel="search" type="application/opensearchdescription+xml"
           href="{{ url('amo.opensearch') }}" />
 
     {% block site_css %}
-      {{ css('devhub/new-landing/css') }}
+      {{ vite_asset('css/fonts.less') }}
+      {{ vite_asset('css/devhub-new-landing.less') }}
+      {{ vite_asset('css/footer.less') }}
     {% endblock %}
 
     {% block extrahead %}{% endblock %}
@@ -32,48 +34,50 @@
       <meta name="csrf" content="{{ csrf_token }}">
     {% endif %}
 
-    {% if settings.DEBUG %}
-      {% if settings.LESS_LIVE_REFRESH %}
-        <meta id="live_refresh" name="live_refresh" value="1">
-      {% endif %}
-      {{ js('debug') }}
+    {% if settings.DEV_MODE %}
+      {{ vite_hmr_client() }}
     {% endif %}
 
-    {{ js('preload') }}
+    {{ vite_asset('js/preload.js') }}
   </head>
   {% set user_authenticated = request.user.is_authenticated %}
 
-  <body class="html-{{ DIR }} {{ request.APP.short }} {% if user_authenticated %}user-signedin{% endif %} {% block bodyclass %}{% endblock %}"
+  <body class="html-{{ DIR }} {{ amo.FIREFOX.short }} {% if user_authenticated %}user-signedin{% endif %} {% block bodyclass %}{% endblock %}"
         {% block bodyattrs %}{% endblock %}>
 
-
+    {% block site_notice %}
+      {% set admin_message = get_config(amo.config_keys.SITE_NOTICE) %}
+      {% if admin_message or settings.READ_ONLY %}
+        <div id="site-notice">
+          {% if admin_message %}
+            <p>{{ admin_message|safe }}</p>
+          {% endif %}
+          {% if settings.READ_ONLY %}
+            <p>{{ _("Some features are temporarily disabled while we perform website maintenance. We'll be back to full capacity shortly.") }}</p>
+          {% endif %}
+        </div>
+      {% endif %}
+    {% endblock %}
     {% include 'devhub/new-landing/components/navigation.html' %}
 
     {% if not user_authenticated %}
       {% include 'devhub/new-landing/components/overview.html' %}
-      {% include 'devhub/new-landing/components/port_chrome_ext.html' %}
-      {% include 'devhub/new-landing/components/publish_your_addon.html' %}
-      {% include 'devhub/new-landing/components/manage_your_addon.html' %}
-    {% endif %}
-
-    {% if not user_authenticated %}
-      <div class="DevHub-MoreInformation scheme-dark content">
-        <div>
-          {% include 'devhub/new-landing/components/blog_posts.html' %}
-          {% include 'devhub/new-landing/components/tools.html' %}
-        </div>
-      </div>
+      {% include 'devhub/new-landing/components/submit_or_manage_extension.html' %}
+      {% include 'devhub/new-landing/components/get_involved.html' %}
     {% else %}
+      {% include 'devhub/new-landing/components/banner.html' %}
       {% include 'devhub/new-landing/components/my-addons.html' %}
+      {% include 'devhub/new-landing/components/dev_footer.html' %}
     {% endif %}
+    {% include 'devhub/new-landing/components/connect.html' %}
+    {% include 'photon-footer.html' %}
 
-    {% include 'devhub/new-landing/components/footer.html' %}
     <div id="tooltip">
         <span></span>
     </div>
     {% block site_js %}
       <script src="{{ static('js/i18n/%s.js'|format(LANG)) }}"></script>
-      {{ js('common') }}
+      {{ vite_asset('js/devhub-new-landing.js') }}
     {% endblock %}
   </body>
 </html>

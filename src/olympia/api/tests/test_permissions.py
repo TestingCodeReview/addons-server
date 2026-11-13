@@ -1,8 +1,9 @@
+from unittest.mock import Mock
+
 from django.contrib.auth.models import AnonymousUser
 from django.test import RequestFactory
 from django.urls import reverse
 
-from mock import Mock
 from rest_framework.exceptions import MethodNotAllowed
 from rest_framework.permissions import AllowAny, BasePermission
 from rest_framework.response import Response
@@ -11,16 +12,34 @@ from rest_framework.views import APIView
 from olympia import amo
 from olympia.access.models import GroupUser
 from olympia.amo.tests import (
-    APITestClient, TestCase, WithDynamicEndpoints, addon_factory, user_factory)
+    APITestClientSessionID,
+    TestCase,
+    WithDynamicEndpoints,
+    addon_factory,
+    user_factory,
+)
 from olympia.api.permissions import (
-    AllowAddonAuthor, AllowAnyKindOfReviewer, AllowIfPublic, AllowNone,
-    AllowOwner, AllowReadOnlyIfPublic, AllowRelatedObjectPermissions,
-    AllowReviewer, AllowReviewerUnlisted, AnyOf, ByHttpMethod, GroupPermission)
+    AllowAddonAuthor,
+    AllowAddonOwner,
+    AllowAnyKindOfReviewer,
+    AllowForVersionChannel,
+    AllowHasListedVersions,
+    AllowIfNotMozillaDisabled,
+    AllowIfPublic,
+    AllowListedViewerOrReviewer,
+    AllowNone,
+    AllowOwner,
+    AllowReadOnly,
+    AllowRelatedObjectPermissions,
+    AllowUnlistedViewerOrReviewer,
+    AnyOf,
+    ByHttpMethod,
+    GroupPermission,
+)
 
 
 class ProtectedView(APIView):
-    permission_classes = [GroupPermission(
-        amo.permissions.NONE)]
+    permission_classes = [GroupPermission(amo.permissions.NONE)]
 
     def get(self, request):
         return Response('ok')
@@ -30,18 +49,22 @@ def myview(*args, **kwargs):
     pass
 
 
+def mock_has_version_in_channel(*channels):
+    return lambda channel, include_deleted=False: channel in channels
+
+
 class TestGroupPermissionOnView(WithDynamicEndpoints):
-    client_class = APITestClient
+    client_class = APITestClientSessionID
 
     # Note: be careful when testing, under the hood we're using a method that
     # relies on UserProfile.groups_list, which is cached on the UserProfile
     # instance.
     def setUp(self):
-        super(TestGroupPermissionOnView, self).setUp()
+        super().setUp()
         self.endpoint(ProtectedView)
         self.url = reverse('test-dynamic-endpoint')
         self.user = user_factory(email='regular@mozilla.com')
-        self.grant_permission(self.user, 'None:None')
+        self.grant_permission(self.user, amo.permissions.NONE)
         self.client.login_api(self.user)
 
     def test_user_must_be_in_required_group(self):
@@ -49,7 +72,8 @@ class TestGroupPermissionOnView(WithDynamicEndpoints):
         response = self.client.get(self.url)
         assert response.status_code == 403, response.content
         assert response.data['detail'] == (
-            'You do not have permission to perform this action.')
+            'You do not have permission to perform this action.'
+        )
 
     def test_view_is_executed(self):
         response = self.client.get(self.url)
@@ -58,7 +82,6 @@ class TestGroupPermissionOnView(WithDynamicEndpoints):
 
 
 class TestGroupPermission(TestCase):
-
     def test_user_cannot_be_anonymous(self):
         request = RequestFactory().get('/')
         request.user = AnonymousUser()
@@ -85,20 +108,18 @@ class TestAnyOf(TestCase):
 
     def test_has_permission_fail(self):
         request = RequestFactory().get('/')
-        assert not AnyOf(AllowNone, AllowNone)().has_permission(
-            request, myview)
+        assert not AnyOf(AllowNone, AllowNone)().has_permission(request, myview)
 
     def test_has_object_permission(self):
         request = RequestFactory().get('/')
-        assert AnyOf(AllowNone, AllowAny)().has_object_permission(
-            request, myview, None)
-        assert AnyOf(AllowAny, AllowNone)().has_object_permission(
-            request, myview, None)
+        assert AnyOf(AllowNone, AllowAny)().has_object_permission(request, myview, None)
+        assert AnyOf(AllowAny, AllowNone)().has_object_permission(request, myview, None)
 
     def test_has_object_permission_fail(self):
         request = RequestFactory().get('/')
         assert not AnyOf(AllowNone, AllowNone)().has_object_permission(
-            request, myview, None)
+            request, myview, None
+        )
 
     def test_has_object_permission_partial_fail(self):
         """Test that AnyOf.has_object_permission() does not allow access when
@@ -119,15 +140,18 @@ class TestAnyOf(TestCase):
 
         request = RequestFactory().get('/')
         assert not AnyOf(NoObjectPerm, NoPerm)().has_object_permission(
-            request, myview, None)
+            request, myview, None
+        )
 
 
 class TestAllowAddonAuthor(TestCase):
+    permission_class = AllowAddonAuthor
+
     def setUp(self):
         self.addon = addon_factory()
-        self.permission = AllowAddonAuthor()
+        self.permission = self.permission_class()
         self.owner = user_factory()
-        self.addon.addonuser_set.create(user=self.owner)
+        self.addonuser = self.addon.addonuser_set.create(user=self.owner)
         self.request = RequestFactory().get('/')
         self.request.user = AnonymousUser()
 
@@ -141,18 +165,64 @@ class TestAllowAddonAuthor(TestCase):
 
     def test_has_object_permission_owner(self):
         self.request.user = self.owner
-        assert self.permission.has_object_permission(
-            self.request, myview, self.addon)
+        assert self.permission.has_object_permission(self.request, myview, self.addon)
 
     def test_has_object_permission_different_user(self):
         self.request.user = user_factory()
         assert self.request.user not in self.addon.authors.all()
         assert not self.permission.has_object_permission(
-            self.request, myview, self.addon)
+            self.request, myview, self.addon
+        )
 
     def test_has_object_permission_anonymous(self):
         assert not self.permission.has_object_permission(
-            self.request, myview, self.addon)
+            self.request, myview, self.addon
+        )
+
+
+class TestAllowAddonOwner(TestAllowAddonAuthor):
+    permission_class = AllowAddonOwner
+
+    def test_has_object_permission_developer_user(self):
+        self.request.user = self.owner
+        self.addonuser.update(role=amo.AUTHOR_ROLE_DEV)
+        assert self.request.user in self.addon.authors.all()
+        assert not self.permission.has_object_permission(
+            self.request, myview, self.addon
+        )
+
+    def test_has_object_permission_developer_who_is_owner_of_different_addon(self):
+        addon_factory(users=(self.owner,))
+        self.test_has_object_permission_developer_user()
+
+
+class TestAllowIfNotMozillaDisabled(TestCase):
+    def setUp(self):
+        self.permission = AllowIfNotMozillaDisabled()
+        self.owner = user_factory()
+        self.addon = addon_factory()
+        self.addon.addonuser_set.create(user=self.owner)
+        self.addon.update(status=amo.STATUS_DISABLED)
+        self.request = RequestFactory().get('/')
+        self.request.user = AnonymousUser()
+
+    def test_has_permission(self):
+        assert self.permission.has_permission(self.request, myview)
+
+    def test_has_object_permission_disabled(self):
+        assert not self.permission.has_object_permission(
+            self.request, myview, self.addon
+        )
+
+    def test_has_object_permission_disabled_owner(self):
+        self.request.user = self.owner
+        assert not self.permission.has_object_permission(
+            self.request, myview, self.addon
+        )
+
+    def test_has_object_permission_non_disabled(self):
+        self.addon.update(status=amo.STATUS_NULL)
+        assert self.permission.has_object_permission(self.request, myview, self.addon)
 
 
 class TestAllowOwner(TestCase):
@@ -174,29 +244,26 @@ class TestAllowOwner(TestCase):
         self.request.user = self.user
         obj = Mock(spec=[])
         obj.user = self.user
-        assert self.permission.has_object_permission(
-            self.request, 'myview', obj)
+        assert self.permission.has_object_permission(self.request, 'myview', obj)
 
     def test_has_object_permission_no_user_on_obj(self):
         self.request.user = self.user
         obj = Mock(spec=[])
-        assert not self.permission.has_object_permission(
-            self.request, 'myview', obj)
+        assert not self.permission.has_object_permission(self.request, 'myview', obj)
 
     def test_has_object_permission_different_user(self):
         self.request.user = self.user
         obj = Mock(spec=[])
         obj.user = user_factory()
-        assert not self.permission.has_object_permission(
-            self.request, 'myview', obj)
+        assert not self.permission.has_object_permission(self.request, 'myview', obj)
 
 
-class TestAllowReviewer(TestCase):
+class TestAllowListedViewerOrReviewer(TestCase):
     # Note: be careful when testing, under the hood we're using a method that
     # relies on UserProfile.groups_list, which is cached on the UserProfile
     # instance.
     def setUp(self):
-        self.permission = AllowReviewer()
+        self.permission = AllowListedViewerOrReviewer()
         self.request_factory = RequestFactory()
         self.unsafe_methods = ('patch', 'post', 'put', 'delete')
         self.safe_methods = ('get', 'options', 'head')
@@ -206,49 +273,45 @@ class TestAllowReviewer(TestCase):
         request.user = AnonymousUser()
         obj = Mock(spec=[])
         obj.type = amo.ADDON_EXTENSION
-        obj.has_listed_versions = lambda: True
+        obj.has_version_in_channel = mock_has_version_in_channel(amo.CHANNEL_LISTED)
 
         assert not self.permission.has_permission(request, myview)
-        assert not self.permission.has_object_permission(
-            request, myview, obj)
+        assert not self.permission.has_object_permission(request, myview, obj)
 
     def test_authenticated_but_not_reviewer(self):
         request = self.request_factory.get('/')
         request.user = user_factory()
         obj = Mock(spec=[])
         obj.type = amo.ADDON_EXTENSION
-        obj.has_listed_versions = lambda: True
+        obj.has_version_in_channel = mock_has_version_in_channel(amo.CHANNEL_LISTED)
         assert self.permission.has_permission(request, myview)
-        assert not self.permission.has_object_permission(
-            request, myview, obj)
+        assert not self.permission.has_object_permission(request, myview, obj)
 
     def test_admin(self):
         user = user_factory()
-        self.grant_permission(user, '*:*')
+        self.grant_permission(user, amo.permissions.SUPERPOWERS)
 
         for method in self.safe_methods + self.unsafe_methods:
             request = getattr(self.request_factory, method)('/')
             request.user = user
             obj = Mock(spec=[])
             obj.type = amo.ADDON_EXTENSION
-            obj.has_listed_versions = lambda: True
+            obj.has_version_in_channel = mock_has_version_in_channel(amo.CHANNEL_LISTED)
             assert self.permission.has_permission(request, myview)
-            assert self.permission.has_object_permission(
-                request, myview, obj)
+            assert self.permission.has_object_permission(request, myview, obj)
 
     def test_reviewer_tools_access_read_only(self):
         user = user_factory()
-        self.grant_permission(user, 'ReviewerTools:View')
+        self.grant_permission(user, amo.permissions.REVIEWER_TOOLS_VIEW)
         obj = Mock(spec=[])
         obj.type = amo.ADDON_EXTENSION
-        obj.has_listed_versions = lambda: True
+        obj.has_version_in_channel = mock_has_version_in_channel(amo.CHANNEL_LISTED)
 
         for method in self.safe_methods:
             request = getattr(self.request_factory, method)('/')
             request.user = user
             assert self.permission.has_permission(request, myview)
-            assert self.permission.has_object_permission(
-                request, myview, obj)
+            assert self.permission.has_object_permission(request, myview, obj)
 
         for method in self.unsafe_methods:
             request = getattr(self.request_factory, method)('/')
@@ -256,22 +319,42 @@ class TestAllowReviewer(TestCase):
             # When not checking the object, we have permission because we're
             # authenticated.
             assert self.permission.has_permission(request, myview)
-            assert not self.permission.has_object_permission(
-                request, myview, obj)
+            assert not self.permission.has_object_permission(request, myview, obj)
 
-    def test_legacy_reviewer(self):
+    def test_reviewer_tools_unlisted_access_read_only(self):
+        self.permission = AllowUnlistedViewerOrReviewer()
         user = user_factory()
-        self.grant_permission(user, 'Addons:Review')
+        self.grant_permission(user, amo.permissions.REVIEWER_TOOLS_UNLISTED_VIEW)
         obj = Mock(spec=[])
         obj.type = amo.ADDON_EXTENSION
-        obj.has_listed_versions = lambda: True
+        obj.has_version_in_channel = mock_has_version_in_channel(amo.CHANNEL_UNLISTED)
+
+        for method in self.safe_methods:
+            request = getattr(self.request_factory, method)('/')
+            request.user = user
+            assert self.permission.has_permission(request, myview)
+            assert self.permission.has_object_permission(request, myview, obj)
+
+        for method in self.unsafe_methods:
+            request = getattr(self.request_factory, method)('/')
+            request.user = user
+            # When not checking the object, we have permission because we're
+            # authenticated.
+            assert self.permission.has_permission(request, myview)
+            assert not self.permission.has_object_permission(request, myview, obj)
+
+    def test_addon_reviewer(self):
+        user = user_factory()
+        self.grant_permission(user, amo.permissions.ADDONS_REVIEW)
+        obj = Mock(spec=[])
+        obj.type = amo.ADDON_EXTENSION
+        obj.has_version_in_channel = mock_has_version_in_channel(amo.CHANNEL_LISTED)
 
         for method in self.safe_methods + self.unsafe_methods:
             request = getattr(self.request_factory, method)('/')
             request.user = user
             assert self.permission.has_permission(request, myview)
-            assert self.permission.has_object_permission(
-                request, myview, obj)
+            assert self.permission.has_object_permission(request, myview, obj)
 
         # Does not have access to static themes.
         obj.type = amo.ADDON_STATICTHEME
@@ -281,47 +364,20 @@ class TestAllowReviewer(TestCase):
             # When not checking the object, we have permission because we're
             # authenticated.
             assert self.permission.has_permission(request, myview)
-            assert not self.permission.has_object_permission(
-                request, myview, obj)
-
-    def test_post_reviewer(self):
-        user = user_factory()
-        self.grant_permission(user, 'Addons:PostReview')
-        obj = Mock(spec=[])
-        obj.type = amo.ADDON_EXTENSION
-        obj.has_listed_versions = lambda: True
-
-        for method in self.safe_methods + self.unsafe_methods:
-            request = getattr(self.request_factory, method)('/')
-            request.user = user
-            assert self.permission.has_permission(request, myview)
-            assert self.permission.has_object_permission(
-                request, myview, obj)
-
-        # Does not have access to static themes.
-        obj.type = amo.ADDON_STATICTHEME
-        for method in self.safe_methods + self.unsafe_methods:
-            request = getattr(self.request_factory, method)('/')
-            request.user = user
-            # When not checking the object, we have permission because we're
-            # authenticated.
-            assert self.permission.has_permission(request, myview)
-            assert not self.permission.has_object_permission(
-                request, myview, obj)
+            assert not self.permission.has_object_permission(request, myview, obj)
 
     def test_theme_reviewer(self):
         user = user_factory()
-        self.grant_permission(user, 'Addons:ThemeReview')
+        self.grant_permission(user, amo.permissions.STATIC_THEMES_REVIEW)
         obj = Mock(spec=[])
         obj.type = amo.ADDON_STATICTHEME
-        obj.has_listed_versions = lambda: True
+        obj.has_version_in_channel = mock_has_version_in_channel(amo.CHANNEL_LISTED)
 
         for method in self.safe_methods + self.unsafe_methods:
             request = getattr(self.request_factory, method)('/')
             request.user = user
             assert self.permission.has_permission(request, myview)
-            assert self.permission.has_object_permission(
-                request, myview, obj)
+            assert self.permission.has_object_permission(request, myview, obj)
 
         # Does not have access to other extensions.
         obj.type = amo.ADDON_EXTENSION
@@ -331,15 +387,14 @@ class TestAllowReviewer(TestCase):
             # When not checking the object, we have permission because we're
             # authenticated.
             assert self.permission.has_permission(request, myview)
-            assert not self.permission.has_object_permission(
-                request, myview, obj)
+            assert not self.permission.has_object_permission(request, myview, obj)
 
     def test_no_listed_version_reviewer(self):
         user = user_factory()
-        self.grant_permission(user, 'Addons:Review')
+        self.grant_permission(user, amo.permissions.ADDONS_REVIEW)
         obj = Mock(spec=[])
         obj.type = amo.ADDON_EXTENSION
-        obj.has_listed_versions = lambda: False
+        obj.has_version_in_channel = mock_has_version_in_channel()
 
         for method in self.safe_methods:
             request = getattr(self.request_factory, method)('/')
@@ -352,8 +407,7 @@ class TestAllowReviewer(TestCase):
             # It doesn't work with the object though, since
             # has_listed_versions() is returning False, we don't have enough
             # permissions, being a "simple" reviewer.
-            assert not self.permission.has_object_permission(
-                request, myview, obj)
+            assert not self.permission.has_object_permission(request, myview, obj)
 
         for method in self.unsafe_methods:
             request = getattr(self.request_factory, method)('/')
@@ -364,8 +418,7 @@ class TestAllowReviewer(TestCase):
             assert self.permission.has_permission(request, myview)
 
             # As above it doesn't work with the object though.
-            assert not self.permission.has_object_permission(
-                request, myview, obj)
+            assert not self.permission.has_object_permission(request, myview, obj)
 
 
 class TestAllowAnyKindOfReviewer(TestCase):
@@ -380,19 +433,17 @@ class TestAllowAnyKindOfReviewer(TestCase):
         self.request.user = AnonymousUser()
         obj = Mock(spec=[])
         assert not self.permission.has_permission(self.request, myview)
-        assert not self.permission.has_object_permission(
-            self.request, myview, obj)
+        assert not self.permission.has_object_permission(self.request, myview, obj)
 
     def test_authenticated_but_not_reviewer(self):
         self.request.user = user_factory()
         obj = Mock(spec=[])
         assert not self.permission.has_permission(self.request, myview)
-        assert not self.permission.has_object_permission(
-            self.request, myview, obj)
+        assert not self.permission.has_object_permission(self.request, myview, obj)
 
     def test_admin(self):
         self.request.user = user_factory()
-        self.grant_permission(self.request.user, '*:*')
+        self.grant_permission(self.request.user, amo.permissions.SUPERPOWERS)
         obj = Mock(spec=[])
 
         assert self.permission.has_permission(self.request, myview)
@@ -400,7 +451,7 @@ class TestAllowAnyKindOfReviewer(TestCase):
 
     def test_regular_reviewer(self):
         self.request.user = user_factory()
-        self.grant_permission(self.request.user, 'Addons:Review')
+        self.grant_permission(self.request.user, amo.permissions.ADDONS_REVIEW)
         obj = Mock(spec=[])
 
         assert self.permission.has_permission(self.request, myview)
@@ -408,95 +459,168 @@ class TestAllowAnyKindOfReviewer(TestCase):
 
     def test_unlisted_reviewer(self):
         self.request.user = user_factory()
-        self.grant_permission(self.request.user, 'Addons:ReviewUnlisted')
+        self.grant_permission(self.request.user, amo.permissions.ADDONS_REVIEW_UNLISTED)
         obj = Mock(spec=[])
-        obj.has_unlisted_versions = lambda: True
+        obj.has_version_in_channel = mock_has_version_in_channel(amo.CHANNEL_UNLISTED)
 
         assert self.permission.has_permission(self.request, myview)
         assert self.permission.has_object_permission(self.request, myview, obj)
 
-    def test_post_reviewer(self):
+    def test_unlisted_viewer(self):
         self.request.user = user_factory()
-        self.grant_permission(self.request.user, 'Addons:PostReview')
+        self.grant_permission(
+            self.request.user, amo.permissions.REVIEWER_TOOLS_UNLISTED_VIEW
+        )
         obj = Mock(spec=[])
+        obj.has_version_in_channel = mock_has_version_in_channel(amo.CHANNEL_UNLISTED)
 
+        # self.request is a POST, viewers should not have access to that.
+        assert not self.permission.has_permission(self.request, myview)
+        assert not self.permission.has_object_permission(self.request, myview, obj)
+
+        # GET requests should be allowed.
+        self.request.method = 'GET'
         assert self.permission.has_permission(self.request, myview)
         assert self.permission.has_object_permission(self.request, myview, obj)
 
 
-class TestAllowUnlistedReviewer(TestCase):
+class TestAllowUnlistedViewerOrReviewer(TestCase):
     # Note: be careful when testing, under the hood we're using a method that
     # relies on UserProfile.groups_list, which is cached on the UserProfile
     # instance.
     def setUp(self):
-        self.permission = AllowReviewerUnlisted()
+        self.permission = AllowUnlistedViewerOrReviewer()
         self.request = RequestFactory().post('/')
 
     def test_user_cannot_be_anonymous(self):
         self.request.user = AnonymousUser()
         obj = Mock(spec=[])
-        obj.has_unlisted_versions = lambda: True
+        obj.has_version_in_channel = mock_has_version_in_channel(amo.CHANNEL_UNLISTED)
         assert not self.permission.has_permission(self.request, myview)
-        assert not self.permission.has_object_permission(
-            self.request, myview, obj)
+        assert not self.permission.has_object_permission(self.request, myview, obj)
 
     def test_authenticated_but_not_reviewer(self):
         self.request.user = user_factory()
         obj = Mock(spec=[])
-        obj.has_unlisted_versions = lambda: True
+        obj.has_version_in_channel = mock_has_version_in_channel(amo.CHANNEL_UNLISTED)
         assert not self.permission.has_permission(self.request, myview)
-        assert not self.permission.has_object_permission(
-            self.request, myview, obj)
+        assert not self.permission.has_object_permission(self.request, myview, obj)
 
     def test_admin(self):
         self.request.user = user_factory()
-        self.grant_permission(self.request.user, '*:*')
+        self.grant_permission(self.request.user, amo.permissions.SUPERPOWERS)
         obj = Mock(spec=[])
-        obj.has_unlisted_versions = lambda: True
+        obj.has_version_in_channel = mock_has_version_in_channel(amo.CHANNEL_UNLISTED)
 
         assert self.permission.has_permission(self.request, myview)
         assert self.permission.has_object_permission(self.request, myview, obj)
 
     def test_regular_reviewer(self):
         self.request.user = user_factory()
-        self.grant_permission(self.request.user, 'Addons:Review')
+        self.grant_permission(self.request.user, amo.permissions.ADDONS_REVIEW)
         obj = Mock(spec=[])
-        obj.has_unlisted_versions = lambda: True
+        obj.has_version_in_channel = mock_has_version_in_channel(amo.CHANNEL_UNLISTED)
 
         assert not self.permission.has_permission(self.request, myview)
-        assert not self.permission.has_object_permission(
-            self.request, myview, obj)
+        assert not self.permission.has_object_permission(self.request, myview, obj)
 
     def test_unlisted_reviewer(self):
         self.request.user = user_factory()
-        self.grant_permission(self.request.user, 'Addons:ReviewUnlisted')
+        self.grant_permission(self.request.user, amo.permissions.ADDONS_REVIEW_UNLISTED)
         obj = Mock(spec=[])
-        obj.has_unlisted_versions = lambda: True
+        obj.has_version_in_channel = mock_has_version_in_channel(amo.CHANNEL_UNLISTED)
 
         assert self.permission.has_permission(self.request, myview)
         assert self.permission.has_object_permission(self.request, myview, obj)
 
-    def test_object_with_listed_versions_but_no_unlisted_versions(self):
+    def test_unlisted_viewer(self):
         self.request.user = user_factory()
-        self.grant_permission(self.request.user, 'Addons:ReviewUnlisted')
+        self.grant_permission(
+            self.request.user, amo.permissions.REVIEWER_TOOLS_UNLISTED_VIEW
+        )
         obj = Mock(spec=[])
-        obj.has_unlisted_versions = lambda: False
-        obj.has_listed_versions = lambda: True
+        obj.has_version_in_channel = mock_has_version_in_channel(amo.CHANNEL_UNLISTED)
 
         assert self.permission.has_permission(self.request, myview)
-        assert not self.permission.has_object_permission(
-            self.request, myview, obj)
+
+        # self.request is a POST, viewers should not have access to that.
+        assert not self.permission.has_object_permission(self.request, myview, obj)
+
+        # GET requests should be allowed.
+        self.request.method = 'GET'
+        assert self.permission.has_object_permission(self.request, myview, obj)
+
+    def test_enterprise_reviewer(self):
+        self.request.user = user_factory()
+        self.grant_permission(self.request.user, amo.permissions.ADDONS_REVIEW_UNLISTED)
+        obj = Mock(spec=[])
+        obj.has_version_in_channel = mock_has_version_in_channel(amo.CHANNEL_ENTERPRISE)
+        # Enterprise is restricted in similar manner to unlisted.
+        assert self.permission.has_permission(self.request, myview)
+        assert self.permission.has_object_permission(self.request, myview, obj)
+
+    def test_enterprise_viewer(self):
+        self.request.user = user_factory()
+        self.grant_permission(
+            self.request.user, amo.permissions.REVIEWER_TOOLS_UNLISTED_VIEW
+        )
+        obj = Mock(spec=[])
+        obj.has_version_in_channel = mock_has_version_in_channel(amo.CHANNEL_ENTERPRISE)
+        # Enterprise is restricted in similar manner to unlisted.
+        assert self.permission.has_permission(self.request, myview)
+
+        # self.request is a POST, viewers should not have access to that.
+        assert not self.permission.has_object_permission(self.request, myview, obj)
+
+        # GET requests should be allowed.
+        self.request.method = 'GET'
+        assert self.permission.has_object_permission(self.request, myview, obj)
+
+    def test_object_with_listed_versions_but_no_unlisted_versions(self):
+        self.request.user = user_factory()
+        self.grant_permission(self.request.user, amo.permissions.ADDONS_REVIEW_UNLISTED)
+        obj = Mock(spec=[])
+        obj.has_version_in_channel = mock_has_version_in_channel(amo.CHANNEL_LISTED)
+
+        assert self.permission.has_permission(self.request, myview)
+        assert not self.permission.has_object_permission(self.request, myview, obj)
+
+    def test_object_with_listed_versions_but_no_unlisted_versions_viewer(self):
+        self.request.user = user_factory()
+        self.grant_permission(
+            self.request.user, amo.permissions.REVIEWER_TOOLS_UNLISTED_VIEW
+        )
+        obj = Mock(spec=[])
+        obj.has_version_in_channel = mock_has_version_in_channel(amo.CHANNEL_LISTED)
+
+        assert self.permission.has_permission(self.request, myview)
+        assert not self.permission.has_object_permission(self.request, myview, obj)
 
     def test_object_with_no_unlisted_versions_and_no_listed_versions(self):
         self.request.user = user_factory()
-        self.grant_permission(self.request.user, 'Addons:ReviewUnlisted')
+        self.grant_permission(self.request.user, amo.permissions.ADDONS_REVIEW_UNLISTED)
         obj = Mock(spec=[])
-        obj.has_unlisted_versions = lambda: False
-        obj.has_listed_versions = lambda: False
+        obj.has_version_in_channel = mock_has_version_in_channel()
 
         assert self.permission.has_permission(self.request, myview)
-        assert self.permission.has_object_permission(
-            self.request, myview, obj)
+        assert self.permission.has_object_permission(self.request, myview, obj)
+
+    def test_object_with_no_unlisted_versions_and_no_listed_versions_viewer(self):
+        self.request.user = user_factory()
+        self.grant_permission(
+            self.request.user, amo.permissions.REVIEWER_TOOLS_UNLISTED_VIEW
+        )
+        obj = Mock(spec=[])
+        obj.has_version_in_channel = mock_has_version_in_channel()
+
+        assert self.permission.has_permission(self.request, myview)
+
+        # self.request is a POST, viewers should not have access to that.
+        assert not self.permission.has_object_permission(self.request, myview, obj)
+
+        # GET requests should be allowed.
+        self.request.method = 'GET'
+        assert self.permission.has_object_permission(self.request, myview, obj)
 
 
 class TestAllowIfPublic(TestCase):
@@ -515,8 +639,7 @@ class TestAllowIfPublic(TestCase):
         for verb in self.safe_methods:
             assert self.permission.has_permission(self.request(verb), myview)
         for verb in self.unsafe_methods:
-            assert self.permission.has_permission(
-                self.request(verb), myview)
+            assert self.permission.has_permission(self.request(verb), myview)
 
     def test_has_object_permission_public(self):
         obj = Mock(spec=['is_public'])
@@ -524,11 +647,13 @@ class TestAllowIfPublic(TestCase):
 
         for verb in self.safe_methods:
             assert self.permission.has_object_permission(
-                self.request(verb), myview, obj)
+                self.request(verb), myview, obj
+            )
 
         for verb in self.unsafe_methods:
             assert self.permission.has_object_permission(
-                self.request(verb), myview, obj)
+                self.request(verb), myview, obj
+            )
 
     def test_has_object_permission_not_public(self):
         obj = Mock(spec=['is_public'])
@@ -536,12 +661,67 @@ class TestAllowIfPublic(TestCase):
 
         for verb in self.unsafe_methods + self.safe_methods:
             assert not self.permission.has_object_permission(
-                self.request(verb), myview, obj)
+                self.request(verb), myview, obj
+            )
 
 
-class TestAllowReadOnlyIfPublic(TestCase):
+class TestAllowHasListedVersions(TestCase):
     def setUp(self):
-        self.permission = AllowReadOnlyIfPublic()
+        self.permission = AllowHasListedVersions()
+        self.request = RequestFactory().get('/')
+
+    def request(self, verb):
+        request = getattr(self.request_factory, verb)('/')
+        request.user = AnonymousUser()
+        return request
+
+    def test_has_permission(self):
+        assert self.permission.has_permission(self.request, myview)
+
+    def test_has_object_permission(self):
+        obj = Mock(spec=['has_version_in_channel'])
+
+        obj.has_version_in_channel.return_value = True
+        assert self.permission.has_object_permission(self.request, myview, obj)
+
+        obj.has_version_in_channel.return_value = False
+        assert not self.permission.has_object_permission(self.request, myview, obj)
+
+
+class TestAllowForVersionChannel(TestCase):
+    def setUp(self):
+        self.request = RequestFactory().get('/')
+
+    def test_has_permission(self):
+        assert AllowForVersionChannel(amo.CHANNEL_LISTED).has_permission(
+            self.request, myview
+        )
+        assert AllowForVersionChannel(amo.CHANNEL_UNLISTED).has_permission(
+            self.request, myview
+        )
+
+    def test_has_object_permission_with_listed_channel(self):
+        version = addon_factory().current_version  # defaults to CHANNEL_LISTED
+        permission = AllowForVersionChannel(amo.CHANNEL_LISTED)
+
+        assert permission.has_object_permission(self.request, myview, version)
+        version.update(channel=amo.CHANNEL_UNLISTED)
+        assert not permission.has_object_permission(self.request, myview, version)
+        assert not permission.has_object_permission(self.request, myview, None)
+
+    def test_has_object_permission_with_unlisted_channel(self):
+        version = addon_factory().current_version  # defaults to CHANNEL_LISTED
+        permission = AllowForVersionChannel(amo.CHANNEL_UNLISTED)
+
+        assert not permission.has_object_permission(self.request, myview, version)
+        version.update(channel=amo.CHANNEL_UNLISTED)
+        assert permission.has_object_permission(self.request, myview, version)
+        assert not permission.has_object_permission(self.request, myview, None)
+
+
+class TestAllowReadOnly(TestCase):
+    def setUp(self):
+        self.permission = AllowReadOnly()
         self.request_factory = RequestFactory()
         self.unsafe_methods = ('patch', 'post', 'put', 'delete')
         self.safe_methods = ('get', 'options', 'head')
@@ -555,28 +735,7 @@ class TestAllowReadOnlyIfPublic(TestCase):
         for verb in self.safe_methods:
             assert self.permission.has_permission(self.request(verb), myview)
         for verb in self.unsafe_methods:
-            assert not self.permission.has_permission(
-                self.request(verb), myview)
-
-    def test_has_object_permission_public(self):
-        obj = Mock(spec=['is_public'])
-        obj.is_public.return_value = True
-
-        for verb in self.safe_methods:
-            assert self.permission.has_object_permission(
-                self.request(verb), myview, obj)
-
-        for verb in self.unsafe_methods:
-            assert not self.permission.has_object_permission(
-                self.request(verb), myview, obj)
-
-    def test_has_object_permission_not_public(self):
-        obj = Mock(spec=['is_public'])
-        obj.is_public.return_value = False
-
-        for verb in self.unsafe_methods + self.safe_methods:
-            assert not self.permission.has_object_permission(
-                self.request(verb), myview, obj)
+            assert not self.permission.has_permission(self.request(verb), myview)
 
 
 class TestByHttpMethod(TestCase):
@@ -585,9 +744,11 @@ class TestByHttpMethod(TestCase):
         self.patch_permission = Mock
         self.post_permission = Mock
         self.put_permission = Mock
-        self.permission = ByHttpMethod({
-            'get': self.get_permission,
-        })
+        self.permission = ByHttpMethod(
+            {
+                'get': self.get_permission,
+            }
+        )
         self.set_permission_mock('get', True)
 
     def set_permission_mock(self, method, value):
@@ -608,12 +769,14 @@ class TestByHttpMethod(TestCase):
         obj = Mock(spec=[])
         self.request = RequestFactory().get('/')
         self.set_object_permission_mock('get', True)
-        assert self.permission.has_object_permission(
-            self.request, 'myview', obj) is True
+        assert (
+            self.permission.has_object_permission(self.request, 'myview', obj) is True
+        )
 
         self.set_object_permission_mock('get', False)
-        assert self.permission.has_object_permission(
-            self.request, 'myview', obj) is False
+        assert (
+            self.permission.has_object_permission(self.request, 'myview', obj) is False
+        )
 
     def test_missing_method(self):
         self.request = RequestFactory().post('/')
@@ -633,7 +796,8 @@ class TestByHttpMethod(TestCase):
 class TestAllowRelatedObjectPermissions(TestCase):
     def setUp(self):
         self.permission = AllowRelatedObjectPermissions(
-            'test_property', [AllowOwner, AllowAny])
+            'test_property', [AllowOwner, AllowAny]
+        )
         self.allowed_user = user_factory()
         self.related_obj = Mock(user=self.allowed_user)
         self.obj = Mock(test_property=self.related_obj)
@@ -641,17 +805,16 @@ class TestAllowRelatedObjectPermissions(TestCase):
         self.request.user = self.allowed_user
 
     def test_all_must_pass(self):
-        assert self.permission.has_permission(
-            self.request, 'myview') is True
+        assert self.permission.has_permission(self.request, 'myview') is True
 
         self.request.user = AnonymousUser()
-        assert self.permission.has_permission(
-            self.request, 'myview') is False
+        assert self.permission.has_permission(self.request, 'myview') is False
 
     def test_all_must_pass_object(self):
-        assert self.permission.has_object_permission(
-            self.request, 'myview', self.obj) is True
+        assert (
+            self.permission.has_object_permission(self.request, 'myview', self.obj)
+            is True
+        )
 
         self.request.user = AnonymousUser()
-        assert self.permission.has_permission(
-            self.request, 'myview') is False
+        assert self.permission.has_permission(self.request, 'myview') is False

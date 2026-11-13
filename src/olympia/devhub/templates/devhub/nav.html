@@ -6,6 +6,7 @@
     {% endtrans %}
   </a>
 </h1>
+{% include 'devhub/suppressed_email.html' %}
 <nav id="site-nav" class="menu-nav no-img c">
   <ul>
     {% if request.user.is_authenticated and request.user.is_developer %}
@@ -13,7 +14,7 @@
         <a href="{{ url('devhub.addons') }}" class="controller">
             {{ _('My Add-ons') }}</a>
         <ul>
-          {% set my_addons = request.user.my_addons() %}
+          {% set my_addons = request.user.my_addons().only_translations() %}
           {% for addon in my_addons %}
             {% if loop.index == 8 %}
               <li><a href="{{ url('devhub.addons') }}">
@@ -25,17 +26,22 @@
           {% endfor %}
           <li><em><a href="{{ url('devhub.submit.agreement') }}">
               {{ _('Submit a New Add-on') }}</a></em></li>
+          <li><em><a href="{{ url('devhub.submit.theme.agreement') }}">
+              {{ _('Submit a New Theme') }}</a></em></li>
         </ul>
       </li>
     {% endif %}
+    <li class="nomenu">
+      <a href="{{ settings.EXTENSION_WORKSHOP_URL }}/?utm_source=addons.mozilla.org&utm_medium=referral&utm_content=devhub-menu-link">
+        {{ _('Extension Workshop') }}</a></li>
     <li>
       <a href="#" class="controller">{{ _('Documentation') }}</a>
       <ul>
-        <li><a href="https://developer.mozilla.org/en-US/Add-ons">
+        <li><a href="https://extensionworkshop.com/documentation/develop/?utm_source=addons.mozilla.org&utm_medium=referral&utm_content=dev-hub-legacy-menu-link">
           {{ _('Extension Development') }}</a></li>
-        <li><a href="https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/Themes">
-          {{ _('Lightweight Themes') }}</a></li>
-        <li><a href="{{ url('devhub.docs', 'policies') }}">
+        <li><a href="https://extensionworkshop.com/documentation/themes/?utm_source=addons.mozilla.org&utm_medium=referral&utm_content=dev-hub-legacy-menu-link">
+          {{ _('Themes') }}</a></li>
+        <li><a href="https://extensionworkshop.com/documentation/publish/add-on-policies/?utm_source=addons.mozilla.org&utm_medium=referral&utm_content=dev-hub-legacy-menu-link">
           {{ _('Developer Policies') }}</a></li>
       </ul>
     </li>
@@ -55,9 +61,17 @@
           {{ _('Add-ons Blog') }}</a></li>
         <li><a href="https://discourse.mozilla-community.org/c/add-ons">
           {{ _('Add-ons Forum') }}</a></li>
-        <li><a href="https://developer.mozilla.org/en-US/Add-ons">
+        <li><a href="{{ settings.EXTENSION_WORKSHOP_URL }}/?utm_source=addons.mozilla.org&utm_medium=referral&utm_content=devhub-menu-link#connect">
           {{ _('More Resources') }}</a></li>
+        {% if request.user.is_authenticated and waffle.switch('enable-devhub-support-form') %}
+        <li><a href="{{ url('devhub.support') }}">{{ _('Contact Support') }}</a></li>
+        {% endif %}
       </ul>
     </li>
+    {% if flag_is_active('pinguino-switch') %}
+    <li>
+      <a href="{{ url('devhub.switch-pinguino') }}?path={{ request.path }}">Try the new Developer Hub!</a>
+    </li>
+    {% endif %}
   </ul>
 </nav>

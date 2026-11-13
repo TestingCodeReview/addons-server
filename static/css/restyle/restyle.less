@@ -1,11 +1,10 @@
-@import (less) '../common/fonts';
 // Needed for hovercards
 @import (less) '../impala/hovercards';
 
 // Colors
 @primary-blue: rgba(12, 153, 213, 1);
 @primary-link: #6ac3e2;
-@primary-font: 'Open Sans', X-LocaleSpecific, sans-serif;
+@primary-font: Inter, sans-serif;
 @link-on-white-bg: #0996F8;
 @link-on-color-bg: #fff;
 @header-font-color: #c63717;
@@ -24,18 +23,20 @@ h3,
 h4,
 h5 {
   line-height: 1.5;
-  font-family: @primary-font !important;
+  font-family: @primary-font;
   font-style: normal !important;
   font-weight: normal;
 }
 
 * {
-  font-family: @primary-font !important;
+  font-family: @primary-font;
 }
 
 // Styles
 html {
   font-size: 13px;
+  background: #051818;
+  color: #fff;
 }
 
 body.restyle {
@@ -46,6 +47,13 @@ body.restyle {
   line-height: 1.5;
   min-width: @containerWidth;
   overflow-x: hidden;
+}
+
+body.restyle.fluid, .fluid .section, .fluid .header-bg {
+  min-width: auto;
+  min-height: auto;
+  max-width: none;
+  width: auto;
 }
 
 h1,
@@ -68,10 +76,10 @@ h2 {
 h1,
 .primary h2,
 hgroup h2.addon,
+hgroup h2.addon_developer,
 hgroup h2.collection,
 .developer-hub header h2,
-.developer-hub #homepage h2,
-.personas-featured h3 {
+.developer-hub #homepage h2 {
   color: @default-font-color;
   font-size: 1.692rem;
   font-style: normal;
@@ -96,8 +104,7 @@ masthead.submit-theme,
   font-size: 1.75rem;
 }
 
-.primary header h2,
-.personas-featured h3 {
+.primary header h2 {
   margin: 0 0 15px;
 }
 
@@ -452,6 +459,10 @@ body:not(.home) .amo-header,
       width: 200px;
       z-index: 62;
     }
+
+    &.nomenu:hover:after {
+      display: none;
+    }
   }
 }
 
@@ -596,12 +607,6 @@ body:not(.home) .amo-header,
 
   p {
     margin-right: 0.5em;
-  }
-
-  * {
-      // This sucks, but there is a font-family: @primary-font !important on
-      // * at the top of this file...
-      font-family: 'Fira Sans', sans-serif !important;
   }
 }
 
@@ -859,17 +864,6 @@ body:not(.home) .amo-header,
   text-overflow: ellipsis;
 }
 
-// Featured themes on home
-.home {
-  .hovercard.persona .persona-preview {
-    width: 150px;
-  }
-}
-
-.listing-grid.personas li {
-  height: 118px;
-}
-
 // Side nav on Home
 .home #side-nav {
   // pushed down to make room for more header
@@ -917,8 +911,7 @@ button.button,
 .button,
 a.button:link,
 a.button:visited,
-input:not(.upvotes):not(.downvotes)[type="submit"],
-.persona-install button {
+input:not(.upvotes):not(.downvotes)[type="submit"] {
   background: #5784bf;
   border: none;
   border-radius: 3px;
@@ -1173,17 +1166,9 @@ body:not(.developer-hub) section.secondary {
 }
 
 #footer {
-  background-color: #fff;
-  background-image: linear-gradient(to bottom,
-    #fff 0,
-    #fff 123px,
-    rgba(12, 153, 213, 1) 123px,
-    rgba(12, 153, 213, 1) 200px,
-    #FFF 200px,
-    rgba(12, 153, 213, 0.0) 400px);
+  background-color: rgba(12, 153, 213, 1);
   color: #666;
-  font-family: inherit;
-  font-style: normal;
+  padding: 60px 0 5px 0;
   width: 100%;
 
   .links-footer a {
@@ -1523,7 +1508,6 @@ h3.author .transfer-ownership {
     &:after {
       color: rgba(0, 0, 0, 0.125);
       content: '\203a';
-      font-family: Georgia;
       font-weight: normal;
       font-size: 18px;
       position: absolute;
@@ -1547,20 +1531,6 @@ h3.author .transfer-ownership {
   h3 a {
     font-family: @primary-font;
   }
-
-  > ul.personas {
-    border: 0;
-  }
-
-  .persona-install {
-    border: 0;
-
-    .add {
-      background-image: none;
-      background-color: #57bd35;
-      text-shadow: none;
-    }
-  }
 }
 
 .secondary .submit-theme {
@@ -1571,18 +1541,9 @@ h3.author .transfer-ownership {
   }
 }
 
-.personas-home .intro {
-  font-size: 1.2em;
-}
-
-#featured-addons.featured.personas-home {
-  display: none;
-}
-
 // Theme Page
 .section > hgroup a,
-.article.prose a,
-#persona-side a {
+.article.prose a {
   color: @link-on-white-bg;
 }
 
@@ -1669,93 +1630,10 @@ h3.author .transfer-ownership {
   }
 }
 
-// Unified theme view
-.personas-featured .persona-list-3col {
-  border: 0;
-  min-height: 125px;
-  padding-bottom: 36px;
-}
-
-.restyle .persona.hovercard {
-  height: 100px;
-
-  &:focus,
-  &:hover {
-    height: 136px;
-    margin-bottom: -36px;
-  }
-
-  h3 {
-    padding-bottom: 0;
-  }
-
-  h4 {
-    clear: both;
-    font-size: 12px;
-
-    .author-names{
-      text-overflow: ellipsis;
-      overflow: hidden;
-      white-space: nowrap;
-    }
-
-  }
-
-  a {
-    display: inline;
-  }
-}
-
-.persona-list-3col {
-  li {
-    border: 0;
-    display: inline;
-    overflow: hidden;
-    padding: 0.6em 0 0;
-    position: relative;
-
-    &:nth-of-type(3n) .persona.hovercard {
-      margin-right: 0;
-
-      .personas-featured {
-        &:hover,
-        &:focus {
-          margin-bottom: -14.5px;
-        }
-      }
-    }
-
-    &:nth-of-type(4n) .persona.hovercard {
-      clear: both;
-    }
-  }
-
-  .persona.hovercard {
-    margin-right: 34px;
-    width: 33.3%;
-
-    a {
-      padding: 0;
-    }
-
-    h3 {
-      max-width: 200px;
-    }
-  }
-}
-
 .category-landing {
   .addons-column {
-    ul.personas {
-      padding: 0;
-    }
-
     ul li {
       overflow: visible;
-
-      .persona a {
-        padding: 0;
-      }
     }
   }
 
@@ -1844,58 +1722,6 @@ h3.author .transfer-ownership {
   .more-versions a {
     color: #0996f8 !important; //need to override .disabled a[href] color: #888!important; rule
   }
-}
-
-.persona.hovercard {
-  max-width: 200px;
-
-  .persona-install {
-    border: 0;
-    display: none;
-    margin-top: 3px;
-    padding-bottom: 5px;
-    position: static;
-
-    button {
-      height: auto;
-      padding: 3px;
-    }
-  }
-
-  &:hover {
-    height: 100px;
-    margin-bottom: -22px;
-
-    .persona-install {
-      display: block;
-    }
-  }
-
-  h3 {
-    clear: none;
-    font-size: 14px;
-    margin: 0;
-    padding: 6px 0 3px;
-  }
-
-  .persona-preview {
-    float: none;
-  }
-}
-
-// This is used to override JS that tries to mess with these styles :'(
-.restyle .persona.hovercard a {
-  background: none !important;
-
-  .persona-preview [data-browsertheme] {
-    background: none;
-    border: 0 !important; // zamboni.css defines this as !important :-/
-  }
-}
-
-.personas-grid li {
-  height: auto;
-  width: auto;
 }
 
 .manage-button {
@@ -1996,15 +1822,6 @@ h3.author .transfer-ownership {
   }
 }
 
-
-.secondary .submit-theme {
-  padding: 0;
-
-  a.button {
-    white-space: normal;
-  }
-}
-
 // Fix theme button alignment
 .theme .choices {
   float: none;
@@ -2041,43 +1858,6 @@ h3.author .transfer-ownership {
   overflow: auto;
 }
 
-#persona-summary {
-
-  .install,
-  .install-wrapper,
-  .install-persona,
-  p.warning,
-  .persona-inner {
-    padding: 0;
-  }
-
-  .widgets,
-  p {
-    clear: left;
-
-    .html-rtl & {
-      clear: right;
-    }
-  }
-
-  .install-wrapper {
-    float: left;
-
-    .html-rtl & {
-      float: right;
-    }
-  }
-
-  table {
-    margin-top: 15px;
-    width: 290px;
-
-    td {
-      width: 100%;
-    }
-  }
-}
-
 #review-box form {
   height: auto;
   min-height: 270px;
@@ -2109,7 +1889,7 @@ h3.author .transfer-ownership {
 
 .contrib-overlay,
 .modal-overlay {
-  background: rgba(0, 0, 0, 0.5);
+  background: rgba(0, 0, 0, 0.7);
 }
 
 .primary.island {
@@ -2124,32 +1904,6 @@ h3.author .transfer-ownership {
 
 .prettyform .listing-footer {
   background: none;
-}
-
-// Theme detail page
-#persona #more-personas .article {
-  padding: 0 10px 40px;
-
-  .persona.hovercard:nth-child(odd) {
-    clear: left;
-  }
-}
-
-#more-artist .persona.hovercard,
-#my-themes .persona.hovercard {
-  .persona-preview {
-    width: auto;
-  }
-}
-
-#more-artist .persona.hovercard {
-  margin-bottom: 0;
-  padding: 8px 9px 18px;
-
-  &:hover,
-  &:focus {
-    margin-bottom: -36px;
-  }
 }
 
 .restyle.statistics {
@@ -2373,10 +2127,6 @@ body.reviewer-tools {
         border-radius: 0;
       }
 
-      .results .files {
-        width: 230px;
-      }
-
       div#review-actions {
         border: @detail-border;
         border-radius: 0;
@@ -2390,20 +2140,21 @@ body.reviewer-tools {
           background: none;
           background-color: #ecf5fe;
 
-          li {
+          #id_action>* {
             text-shadow: none;
             border: none;
             background: none;
             color: @link-on-white-bg;
           }
 
-          li.on-tab {
+          #id_action>*.on-tab {
             color: @default-font-color;
             background-color: #ffffff;
             border-top: none;
           }
 
-          li:first-child, li:last-child {
+          #id_action>*:first-child,
+          #id_action>*:last-child {
             border-radius: 0;
             border-left: none;
 
@@ -2462,79 +2213,6 @@ body.reviewer-tools {
   &.download {
     color: @link-on-color-bg;
     text-shadow: @dark-gray 1px 1px;
-  }
-}
-
-/* Source/Diff viewer */
-body.file-viewer {
-  pre, code, kbd, tt, samp, tt {
-    font-family: @mono-stack !important;
-  }
-
-  div.section {
-    max-width: none;
-    width: 95%
-  }
-
-  /* Notice. */
-  #file-viewer.messages-duplicate #files a.notice-duplicate,
-  #file-viewer.messages-signing #files a.notice-signing,
-  #file-viewer.messages-all #files a.notice,
-  /* Warning. */
-  #file-viewer.messages-duplicate #files a.warning-duplicate,
-  #file-viewer.messages-signing #files a.warning-signing,
-  #file-viewer.messages-all #files a.warning,
-  /* Error. */
-  #file-viewer.messages-duplicate #files a.error-duplicate,
-  #files a.error-signing,
-  #files a.error {
-    > span:after {
-      vertical-align: baseline;
-    }
-  }
-
-  #files {
-    width: 18em;
-
-    #files-tree {
-      a > span {
-        border-radius: 0;
-      }
-
-      .notice {
-        border-top: none;
-      }
-    }
-  }
-
-  #content-wrapper {
-    border-radius: 0;
-    box-shadow: none;
-  }
-
-  #content-wrapper,
-  #messages,
-  #thinking,
-  #validation-options {
-    padding-left: 19em;
-  }
-
-  .syntaxhighlighter .line-code {
-    max-width: none;
-    word-break: break-all;
-  }
-
-  .collapsed-files {
-    #files {
-      width: 5em;
-    }
-
-    #content-wrapper,
-    #messages,
-    #thinking,
-    #validation-options {
-      padding-left: 3em;
-    }
   }
 }
 

@@ -1,21 +1,30 @@
-# -*- coding: utf-8 -*-
+from django.core.files.base import ContentFile
+from django.template.defaultfilters import filesizeformat
+
 from rest_framework.test import APIRequestFactory
 
 from olympia import amo
-from olympia.activity.models import ActivityLog
-from olympia.activity.serializers import ActivityLogSerializer
-from olympia.amo.templatetags.jinja_helpers import absolutify
-from olympia.amo.tests import TestCase, addon_factory, user_factory
+from olympia.activity.models import ActivityLog, AttachmentLog
+from olympia.activity.serializers import (
+    ActivityLogSerializer,
+    FeedActivityLogSerializer,
+)
+from olympia.amo.tests import (
+    TestCase,
+    addon_factory,
+    user_factory,
+    version_factory,
+)
 
 
-class LogMixin(object):
-    def log(self, comments, action, created=None):
-        version = self.addon.find_latest_version(
-            channel=amo.RELEASE_CHANNEL_LISTED)
-        details = {'comments': comments,
-                   'version': version.version}
+class LogMixin:
+    def log(self, comments, action, created=None, policy_texts=None):
+        version = self.addon.find_latest_version(channel=amo.CHANNEL_LISTED)
+        details = {'comments': comments, 'version': version.version}
+        if policy_texts is not None:
+            details['policy_texts'] = policy_texts
         kwargs = {'user': self.user, 'details': details}
-        al = ActivityLog.create(action, self.addon, version, **kwargs)
+        al = ActivityLog.objects.create(action, self.addon, version, **kwargs)
         if created:
             al.update(created=created)
         return al
@@ -27,13 +36,13 @@ class TestReviewNotesSerializerOutput(TestCase, LogMixin):
         self.user = user_factory()
         self.addon = addon_factory()
         self.now = self.days_ago(0)
-        self.entry = self.log(u'Oh nÃ´es!', amo.LOG.REJECT_VERSION, self.now)
+        self.entry = self.log('Oh nøes!', amo.LOG.REJECT_VERSION, self.now)
 
     def serialize(self, context=None):
         if context is None:
             context = {}
         context['request'] = self.request
-        serializer = ActivityLogSerializer(context=context)
+        serializer = ActivityLogSerializer(self.entry, context=context)
         return serializer.to_representation(self.entry)
 
     def test_basic(self):
@@ -43,64 +52,201 @@ class TestReviewNotesSerializerOutput(TestCase, LogMixin):
         assert result['date'] == self.now.isoformat() + 'Z'
         assert result['action'] == 'rejected'
         assert result['action_label'] == 'Rejected'
-        assert result['comments'] == u'Oh nÃ´es!'
+        assert result['comments'] == 'Oh nøes!'
         assert result['user'] == {
-            'id': self.user.pk,
             'name': self.user.name,
-            'url': None,
-            'username': self.user.username,
         }
 
-    def test_url_for_yourself(self):
-        # should include account profile url for your own requests
-        self.request.user = self.user
+    def test_basic_v3(self):
+        self.request.version = 'v3'
         result = self.serialize()
-        assert result['user']['url'] == absolutify(self.user.get_url_path())
 
-    def test_url_for_developers(self):
-        # should include account profile url for a developer
-        addon_factory(users=[self.user])
-        result = self.serialize()
-        assert result['user']['url'] == absolutify(self.user.get_url_path())
-
-    def test_url_for_admins(self):
-        # should include account profile url for admins
-        admin = user_factory()
-        self.grant_permission(admin, 'Users:Edit')
-        self.request.user = admin
-        result = self.serialize()
-        assert result['user']['url'] == absolutify(self.user.get_url_path())
+        assert result['id'] == self.entry.pk
+        assert result['date'] == self.now.isoformat() + 'Z'
+        assert result['action'] == 'rejected'
+        assert result['action_label'] == 'Rejected'
+        assert result['comments'] == 'Oh nøes!'
+        # For backwards-compatibility in API v3 the id, url and username are
+        # present but empty.
+        assert result['user'] == {
+            'id': None,
+            'url': None,
+            'username': None,
+            'name': self.user.name,
+        }
 
     def test_should_highlight(self):
-        result = self.serialize(context={'to_highlight': [self.entry]})
+        result = self.serialize(context={'to_highlight': [self.entry.pk]})
 
         assert result['id'] == self.entry.pk
         assert result['highlight']
 
     def test_should_not_highlight(self):
-        no_highlight = self.log(u'something élse', amo.LOG.REJECT_VERSION)
+        no_highlight = self.log('something élse', amo.LOG.REJECT_VERSION)
 
-        result = self.serialize(context={'to_highlight': [no_highlight]})
+        result = self.serialize(context={'to_highlight': [no_highlight.pk]})
 
         assert result['id'] == self.entry.pk
         assert not result['highlight']
 
     def test_sanitized_activity_detail_not_exposed_to_developer(self):
-        self.entry = self.log(u'ßäď ŞŤųƒƒ', amo.LOG.REQUEST_SUPER_REVIEW)
+        self.entry = self.log(
+            'ßäď ŞŤųƒƒ',
+            amo.LOG.REQUEST_ADMIN_REVIEW_THEME,
+            policy_texts=['Secret policy text.'],
+        )
         result = self.serialize()
 
-        assert result['action_label'] == amo.LOG.REQUEST_SUPER_REVIEW.short
-        # Comments should be the santized text rather than the actual content.
-        assert result['comments'] == amo.LOG.REQUEST_SUPER_REVIEW.sanitize
+        assert result['action_label'] == (amo.LOG.REQUEST_ADMIN_REVIEW_THEME.short)
+        # Comments and policies should be the sanitized text rather than the
+        # actual content.
+        assert result['comments'] == amo.LOG.REQUEST_ADMIN_REVIEW_THEME.sanitize
         assert result['comments'].startswith(
-            'The addon has been flagged for Admin Review.')
+            'The add-on has been flagged for Admin Review.'
+        )
+        assert result['policies'] == [amo.LOG.REQUEST_ADMIN_REVIEW_THEME.sanitize]
+
+    def test_policies(self):
+        self.entry = self.log(
+            'Oh nøes!',
+            amo.LOG.REJECT_VERSION,
+            policy_texts=['Policy one violation.', 'Policy two violation.'],
+        )
+        result = self.serialize()
+        assert result['policies'] == [
+            'Policy one violation.',
+            'Policy two violation.',
+        ]
+
+    def test_policies_missing_from_details(self):
+        # Create a log with a details property but no policies key inside.
+        self.entry = self.log('Oh nøes!', amo.LOG.REJECT_VERSION, self.now)
+        result = self.serialize()
+        assert result['policies'] == []
 
     def test_log_entry_without_details(self):
         # Create a log but without a details property.
-        self.entry = ActivityLog.create(
-            amo.LOG.APPROVAL_NOTES_CHANGED, self.addon,
-            self.addon.find_latest_version(channel=amo.RELEASE_CHANNEL_LISTED),
-            user=self.user)
+        self.entry = ActivityLog.objects.create(
+            amo.LOG.NOTES_FOR_REVIEWERS_CHANGED,
+            self.addon,
+            self.addon.find_latest_version(channel=amo.CHANNEL_LISTED),
+            user=self.user,
+        )
         result = self.serialize()
-        # Should output an empty string.
+        # Should output an empty string/list.
         assert result['comments'] == ''
+        assert result['policies'] == []
+
+    def test_attachment_link(self):
+        self.entry = ActivityLog.objects.create(
+            amo.LOG.REJECT_VERSION,
+            self.addon,
+            self.addon.find_latest_version(channel=amo.CHANNEL_LISTED),
+            user=self.user,
+        )
+        result = self.serialize()
+        assert not result['attachment_url']
+        AttachmentLog.objects.create(
+            activity_log=self.entry,
+            file=ContentFile('Pseudo File', name='attachment.txt'),
+        )
+        result = self.serialize()
+        assert result['attachment_url'] == '/activity/attachment/' + str(self.entry.pk)
+
+    def test_attachment_size(self):
+        self.entry = ActivityLog.objects.create(
+            amo.LOG.REJECT_VERSION,
+            self.addon,
+            self.addon.find_latest_version(channel=amo.CHANNEL_LISTED),
+            user=self.user,
+        )
+        result = self.serialize()
+        assert not result['attachment_size']
+        attachment = AttachmentLog.objects.create(
+            activity_log=self.entry,
+            file=ContentFile('Pseudo File', name='attachment.txt'),
+        )
+        result = self.serialize()
+        assert result['attachment_size'] == filesizeformat(attachment.file.size)
+
+
+class TestFeedActivityLogSerializer(TestCase, LogMixin):
+    def setUp(self):
+        self.user = user_factory()
+        self.addon = addon_factory(users=[self.user])
+        self.version = self.addon.current_version
+        self.now = self.days_ago(0)
+
+    def serialize(self, log):
+        return FeedActivityLogSerializer().to_representation(log)
+
+    def test_basic(self):
+        log = self.log('foobar', amo.LOG.APPROVE_VERSION, self.now)
+        result = self.serialize(log)
+
+        assert result['id'] == log.pk
+        assert result['date'] == self.now.isoformat() + 'Z'
+        assert result['title'] == log.to_string()
+        assert result['comments'] == 'foobar'
+        assert result['addon'] == {
+            'id': self.version.addon.pk,
+            'slug': self.version.addon.slug,
+            'name': {'en-US': str(self.version.addon.name)},
+            'icon_url': 'http://testserver/static/img/addon-icons/default-64.png',
+            'disabled_by_user': self.version.addon.disabled_by_user,
+        }
+
+        assert len(result['versions']) == 1
+        version = result['versions'][0]
+        assert version['id'] == self.version.pk
+        assert version['version'] == self.version.version
+        assert version['channel'] == amo.CHANNEL_CHOICES_API[self.version.channel]
+        assert version['file']['status'] == 'public'
+        assert version['addon']['id'] == self.version.addon.pk
+        assert 'reviewed' in version
+
+    def test_reviewed_distinguishes_rejected_from_unreviewed(self):
+        # Without `reviewed`, a disabled file can't be told from an unreviewed
+        # one, and the feed's status badge needs that distinction.
+        unreviewed = self.log('foobar', amo.LOG.APPROVE_VERSION, self.now)
+        assert self.serialize(unreviewed)['versions'][0]['reviewed'] is None
+
+        self.version.file.update(approval_date=self.now)
+        reviewed = self.log('foobar', amo.LOG.APPROVE_VERSION, self.now)
+        assert (
+            self.serialize(reviewed)['versions'][0]['reviewed']
+            == self.now.isoformat() + 'Z'
+        )
+
+    def test_comments_for_list_shaped_details(self):
+        # EDIT_PROPERTIES records changed fields as a list, and the unfiltered
+        # feed carries it.
+        log = ActivityLog.objects.create(
+            amo.LOG.EDIT_PROPERTIES, self.addon, user=self.user
+        )
+        log.details = ['eula']
+        log.save()
+        assert self.serialize(log)['comments'] == ''
+
+    def test_no_versions(self):
+        log = ActivityLog.objects.create(
+            amo.LOG.USER_DISABLE, self.addon, user=self.user
+        )
+        assert log.versionlog_set.count() == 0
+        assert self.serialize(log)['versions'] == []
+
+    def test_multiple_versions(self):
+        ul_version = version_factory(addon=self.addon, channel=amo.CHANNEL_UNLISTED)
+        log = ActivityLog.objects.create(
+            amo.LOG.APPROVE_VERSION,
+            self.addon,
+            self.version,
+            ul_version,
+            user=self.user,
+        )
+        result = self.serialize(log)
+        assert len(result['versions']) == 2
+        assert {item['id'] for item in result['versions']} == {
+            self.version.pk,
+            ul_version.pk,
+        }

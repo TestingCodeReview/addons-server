@@ -1,26 +1,21 @@
 import hashlib
+import io
+import json
 import os
-import shutil
-import tempfile
 import zipfile
-
 from base64 import b64decode, b64encode
 
 from django.conf import settings
+from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage as storage
-from django.utils.encoding import force_bytes, force_text
+from django.utils.encoding import force_bytes, force_str
 
 import requests
-import six
-import waffle
-
+from asn1crypto import cms
 from django_statsd.clients import statsd
 from requests_hawk import HawkAuth
-from signing_clients.apps import JarExtractor
-from asn1crypto import cms
 
 import olympia.core.logger
-
 from olympia import amo
 
 
@@ -53,182 +48,186 @@ def get_id(addon):
     if len(guid) <= 64:
         # Return guid as original unicode string.
         return addon.guid
-    return force_text(hashlib.sha256(guid).hexdigest())
+    return force_str(hashlib.sha256(guid).hexdigest())
 
 
-def autograph_sign_file(file_obj):
+def use_promoted_signer(file_obj, promo_group):
+    return (
+        file_obj.version.channel == amo.CHANNEL_LISTED
+        and promo_group.autograph_signing_states
+    )
+
+
+def add_guid(file_obj):
+    with storage.open(file_obj.file.path) as fobj:
+        # Get the file data and add the guid to the manifest.
+        with zipfile.ZipFile(fobj, mode='r') as existing_zip:
+            manifest_json = json.loads(existing_zip.read('manifest.json'))
+            if 'browser_specific_settings' not in manifest_json and manifest_json.get(
+                'applications', {}
+            ).get('gecko'):
+                gecko_root = manifest_json['applications']['gecko']
+            else:
+                if 'browser_specific_settings' not in manifest_json:
+                    manifest_json['browser_specific_settings'] = {}
+                if 'gecko' not in manifest_json['browser_specific_settings']:
+                    manifest_json['browser_specific_settings']['gecko'] = {}
+                gecko_root = manifest_json['browser_specific_settings']['gecko']
+
+            if 'id' not in gecko_root:
+                gecko_root['id'] = file_obj.version.addon.guid
+                new_zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(new_zip_buffer, mode='w') as new_zip:
+                    for info in existing_zip.filelist:
+                        if info.filename == 'manifest.json':
+                            new_zip.writestr(
+                                'manifest.json',
+                                json.dumps(manifest_json, indent=2).encode('utf-8'),
+                            )
+                        else:
+                            with new_zip.open(info.filename, mode='w') as new_file:
+                                new_file.write(existing_zip.read(info))
+                return new_zip_buffer.getvalue()
+            else:
+                # we don't need to add a guid, so just return fobj as normal
+                fobj.seek(0)
+
+        return fobj.read()
+
+
+def call_signing(file_obj):
     """Sign `file_obj` via autographs /sign/file endpoint.
 
-    :returns: The certificates serial number.
+    :returns: the signed content (bytes)
     """
     conf = settings.AUTOGRAPH_CONFIG
 
-    with storage.open(file_obj.current_file_path) as fobj:
-        input_data = b64encode(fobj.read())
+    input_data = force_str(b64encode(add_guid(file_obj)))
 
-    signing_request = [{
+    signing_data = {
         'input': input_data,
         'keyid': conf['signer'],
         'options': {
             'id': get_id(file_obj.version.addon),
-            # "Add-on variant A params (PKCS7 SHA1 and COSE ES256) work in
-            # Fx <57, so we can switch to that without breaking backwards
-            # compatibility"
-            # https://github.com/mozilla/addons-server/issues/9308
-            # This means, the pkcs7 sha1 signature is used for backwards
-            # compatibility and cose sha256 will be used for newer
-            # Firefox versions.
-            # The relevant pref in Firefox is
-            # "security.signed_app_signatures.policy"
-            # where it's set to COSEAndPKCS7WithSHA1OrSHA256 to match
-            # these settings.
-            'pkcs7_digest': 'SHA1',
-            'cose_algorithms': ['ES256']
+            # Add-ons are dual-signed with PKCS7 SHA256 and COSE ES256
+            # (requires Fx 58 or greater).
+            'pkcs7_digest': 'SHA256',
+            'cose_algorithms': ['ES256'],
         },
-    }]
+    }
+
+    hawk_auth = HawkAuth(id=conf['user_id'], key=conf['key'])
+
+    # We are using a separate signer that adds the mozilla-recommendation.json
+    # file.
+    promo_group = file_obj.addon.promoted_groups(currently_approved=False)
+    promo_set = {
+        promotion
+        for promotion in promo_group
+        if use_promoted_signer(file_obj, promotion)
+    }
+
+    if promo_set:
+        signing_states = {
+            promo.autograph_signing_states.get(app.short)
+            for app in file_obj.addon.all_applications
+            for promo in promo_set
+        }
+
+        signing_data['keyid'] = conf['recommendation_signer']
+        signing_data['options']['recommendations'] = list(signing_states)
+        hawk_auth = HawkAuth(
+            id=conf['recommendation_signer_user_id'],
+            key=conf['recommendation_signer_key'],
+        )
 
     with statsd.timer('services.sign.addon.autograph'):
         response = requests.post(
             '{server}/sign/file'.format(server=conf['server_url']),
-            json=signing_request,
-            auth=HawkAuth(id=conf['user_id'], key=conf['key']))
+            json=[signing_data],
+            auth=hawk_auth,
+        )
 
     if response.status_code != requests.codes.CREATED:
-        msg = u'Posting to add-on signing failed: {0} {1}'.format(
-            response.reason, response.text)
-        log.error(msg)
+        msg = f'Posting to add-on signing failed ({response.status_code})'
+        log.error(msg, extra={'reason': response.reason, 'text': response.text})
         raise SigningError(msg)
 
-    # Save the returned file in our storage.
-    with storage.open(file_obj.current_file_path, 'wb') as fobj:
-        fobj.write(b64decode(response.json()[0]['signed_file']))
-
-    # Now fetch the certificates serial number. Future versions of
-    # autograph may return this in the response.
-    # https://github.com/mozilla-services/autograph/issues/214
-    # Now extract the file and fetch the pkcs signature
-    with zipfile.ZipFile(file_obj.current_file_path, mode='r') as zip_fobj:
-        return get_signer_serial_number(zip_fobj.read(
-            os.path.join('META-INF', 'mozilla.rsa')))
-
-
-def autograph_sign_data(file_obj):
-    """Sign `file_obj` via autographs /sign/data endpoint.
-
-    .. note::
-
-        This endpoint usage is being replaced by `autograph_sign_file`.
-
-    :returns: The certificates serial number.
-    """
-    conf = settings.AUTOGRAPH_CONFIG
-
-    jar = JarExtractor(path=storage.open(file_obj.current_file_path))
-
-    log.debug(u'File signature contents: {0}'.format(jar.signatures))
-
-    signed_manifest = six.text_type(jar.signatures)
-
-    signing_request = [{
-        'input': b64encode(force_bytes(signed_manifest)),
-        'keyid': conf['signer'],
-        'options': {
-            'id': get_id(file_obj.version.addon),
-        },
-    }]
-
-    with statsd.timer('services.sign.addon.autograph'):
-        response = requests.post(
-            '{server}/sign/data'.format(server=conf['server_url']),
-            json=signing_request,
-            auth=HawkAuth(id=conf['user_id'], key=conf['key']))
-
-    if response.status_code != requests.codes.CREATED:
-        msg = u'Posting to add-on signing failed: {0} {1}'.format(
-            response.reason, response.text)
-        log.error(msg)
-        raise SigningError(msg)
-
-    # convert the base64 encoded pkcs7 signature back to binary
-    pkcs7 = b64decode(force_bytes(response.json()[0]['signature']))
-
-    cert_serial_num = get_signer_serial_number(pkcs7)
-
-    # We only want the (unique) temporary file name.
-    with tempfile.NamedTemporaryFile(dir=settings.TMP_PATH) as temp_file:
-        temp_filename = temp_file.name
-
-    jar.make_signed(
-        signed_manifest=signed_manifest,
-        signature=pkcs7,
-        sigpath=u'mozilla',
-        outpath=temp_filename)
-    shutil.move(temp_filename, file_obj.current_file_path)
-
-    return cert_serial_num
-
-
-def call_signing(file_obj):
-    """Get the jar signature and send it to the signing server to be signed."""
-    log.debug('Calling autograph service: {0}'.format(
-        settings.AUTOGRAPH_CONFIG['server_url']))
-
-    if waffle.sample_is_active('activate-autograph-file-signing'):
-        return autograph_sign_file(file_obj)
-
-    return autograph_sign_data(file_obj)
+    return b64decode(response.json()[0]['signed_file'])
 
 
 def sign_file(file_obj):
-    """Sign a File.
+    """Sign a File if necessary.
+
+    If it's not necessary (file exists but it's a mozilla signed one) then
+    return the file directly.
 
     If there's no endpoint (signing is not enabled) or isn't reviewed yet,
-    or there was an error while signing, log and return nothing.
+    or there was an error while signing, raise an exception - it
+    shouldn't happen.
 
-    Otherwise return the signed file.
+    Otherwise proceed with signing and return the signed file.
     """
     if not settings.ENABLE_ADDON_SIGNING:
-        log.info(u'Not signing file {0}: no active endpoint'.format(
-            file_obj.pk))
-        return
+        raise SigningError(f'Not signing file {file_obj.pk}: no active endpoint')
 
     # No file? No signature.
-    if not os.path.exists(file_obj.current_file_path):
-        log.info(u'File {0} doesn\'t exist on disk'.format(
-            file_obj.current_file_path))
-        return
+    if not os.path.exists(file_obj.file.path):
+        raise SigningError(f"File {file_obj.file.path} doesn't exist on disk")
 
     # Don't sign Mozilla signed extensions (they're already signed).
     if file_obj.is_mozilla_signed_extension:
-        log.info(u'Not signing file {0}: mozilla signed extension is already '
-                 u'signed'.format(file_obj.pk))
-        return
-
-    # Don't sign multi-package XPIs. Their inner add-ons need to be signed.
-    if file_obj.is_multi_package:
-        log.info(u'Not signing file {0}: multi-package XPI'.format(
-            file_obj.pk))
-        return
+        # Don't raise an exception here, just log and return file_obj even
+        # though we didn't sign, it's not an error - we just don't need to do
+        # anything in this case.
+        log.info(
+            f'Not signing file {file_obj.pk}: mozilla signed extension is already '
+            'signed'
+        )
+        return file_obj
 
     # We only sign files that are compatible with Firefox.
     if not supports_firefox(file_obj):
-        log.info(
-            u'Not signing version {0}: not for a Firefox version we support'
-            .format(file_obj.version.pk))
-        return
+        raise SigningError(
+            f'Not signing version {file_obj.version.pk}: not for a Firefox version we '
+            'support'
+        )
+
+    # Get the path before modifying it... We'll delete it after if signing was
+    # successful and we ended up changing it.
+    old_path = file_obj.file.path
 
     # Sign the file. If there's any exception, we skip the rest.
-    cert_serial_num = six.text_type(call_signing(file_obj))
+    signed_contents = call_signing(file_obj)
 
-    size = storage.size(file_obj.current_file_path)
+    # Prepare everything that needs to be saved. Note that the file isn't saved
+    # to disk until the file_obj.save() call.
+    # We need to pass _a_ name to ContentFile() so that the underlying code
+    # to save the file works, but the name passed doesn't actually matter: it
+    # will get overridden by the upload_to callback. Note that it means .name
+    # and .path are not usable before the .save() call.
+    signed_contents_as_file = ContentFile(signed_contents, name='addon.xpi')
+    # Fetch the certificates serial number by extracting the file and
+    # fetching the pkcs signature. Future versions of autograph may return this
+    # in the response: https://github.com/mozilla-services/autograph/issues/214
+    with zipfile.ZipFile(signed_contents_as_file) as zip_fobj:
+        file_obj.cert_serial_num = get_signer_serial_number(
+            zip_fobj.read(os.path.join('META-INF', 'mozilla.rsa'))
+        )
+    file_obj.is_signed = True
+    file_obj.file = signed_contents_as_file
+    file_obj.hash = file_obj.generate_hash()
+    file_obj.size = file_obj.file.size
+    # Django built-in methods seek(0) before reading, but let's add one just in
+    # case something on our end tries a direct read() after.
+    file_obj.file.seek(0)
+    file_obj.save()
+    log.info(f'Signing complete for file {file_obj.pk}')
 
-    # Save the certificate serial number for revocation if needed, and re-hash
-    # the file now that it's been signed.
-    file_obj.update(cert_serial_num=cert_serial_num,
-                    hash=file_obj.generate_hash(),
-                    is_signed=True,
-                    size=size)
-    log.info(u'Signing complete for file {0}'.format(file_obj.pk))
+    # Remove old unsigned path if necessary.
+    if old_path != file_obj.file.path:
+        storage.delete(old_path)
+
     return file_obj
 
 
@@ -248,14 +247,16 @@ def is_signed(file_path):
     try:
         with zipfile.ZipFile(file_path, mode='r') as zf:
             filenames = set(zf.namelist())
-    except (zipfile.BadZipfile, IOError):
+    except (zipfile.BadZipFile, OSError):
         filenames = set()
-    return set([u'META-INF/mozilla.rsa', u'META-INF/mozilla.sf',
-                u'META-INF/manifest.mf']).issubset(filenames)
+    return {
+        'META-INF/mozilla.rsa',
+        'META-INF/mozilla.sf',
+        'META-INF/manifest.mf',
+    }.issubset(filenames)
 
 
-class SignatureInfo(object):
-
+class SignatureInfo:
     def __init__(self, pkcs7):
         if isinstance(pkcs7, SignatureInfo):
             # Allow passing around SignatureInfo objects to avoid
@@ -287,8 +288,8 @@ class SignatureInfo(object):
         for certificate in self.content['certificates']:
             info = certificate['tbs_certificate']
             is_signer_certificate = (
-                info['issuer'] == self.issuer and
-                info['serial_number'] == self.signer_serial_number
+                info['issuer'] == self.issuer
+                and info['serial_number'] == self.signer_serial_number
             )
             if is_signer_certificate:
                 return info

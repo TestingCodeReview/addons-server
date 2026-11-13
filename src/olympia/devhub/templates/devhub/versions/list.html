@@ -3,23 +3,34 @@
 {% set title = _('Status & Versions') %}
 {% block title %}{{ dev_page_title(title, addon) }}{% endblock %}
 
-{% if addon.has_listed_versions() %}
+{% set current_version=addon.current_version %}
+{% set latest_listed_version_including_disabled = addon.find_latest_version(channel=amo.CHANNEL_LISTED, exclude=()) %}
+{% set latest_unlisted_version_including_disabled = addon.find_latest_version(channel=amo.CHANNEL_UNLISTED, exclude=()) %}
+{% set latest_listed_version=addon.find_latest_version(channel=amo.CHANNEL_LISTED) %}
+
+{% if latest_listed_version_including_disabled %}
   {% set has_listed_versions = True %}
 {% endif %}
-{% if addon.has_unlisted_versions() %}
+{% if latest_unlisted_version_including_disabled %}
   {% set has_unlisted_versions = True %}
 {% endif %}
+{% set has_enterprise_versions = addon.has_version_in_channel(amo.CHANNEL_ENTERPRISE) %}
+{% set has_multiple_channels = addon.has_multiple_channels() %}
 
-{% if has_listed_versions and has_unlisted_versions %}
+{% if has_multiple_channels %}
   {% macro distro_tag(channel) %}
-    {% if channel == amo.RELEASE_CHANNEL_LISTED %}
+    {% if channel == amo.CHANNEL_LISTED %}
       <span class="distribution-tag-listed tooltip"
             title="{{ _('Listed on this site after passing code review. Automatic updates are handled by this site.') }}"
             >AMO</span>
-    {% elif channel == amo.RELEASE_CHANNEL_UNLISTED %}
+    {% elif channel == amo.CHANNEL_UNLISTED %}
       <span class="distribution-tag-unlisted tooltip"
             title="{{ _('Signed for self-distribution. Updates are handled by you.') }}"
             >Self</span>
+    {% elif channel == amo.CHANNEL_ENTERPRISE %}
+      <span class="distribution-tag-enterprise tooltip"
+            title="{{ _('Signed for enterprise.') }}"
+            >Enterprise</span>
     {% endif %}
   {% endmacro %}
 {% else %}
@@ -27,8 +38,8 @@
 {% endif %}
 
 {% macro version_details(version, full_info=False) %}
-  {% set latest_version_in_channel = version.addon.find_latest_version(channel=version.channel, exclude=()) %}
-  <tr{% if version_disabled(version) %} class="version-disabled"{% endif %}>
+{% set latest_version_in_channel_including_disabled = latest_listed_version_including_disabled if version.channel == amo.CHANNEL_LISTED else latest_unlisted_version_including_disabled %}
+  <tr{% if version.file.status == amo.STATUS_DISABLED %} class="version-disabled"{% endif %}>
     <td>
       <strong>
         <a href="{{ url('devhub.versions.edit', addon.slug, version.id) }}"
@@ -40,13 +51,19 @@
       </span>
     </td>
     <td class="file-status">
-      {% for count, status in dev_files_status(version.all_files) %}
-          <div>
-            {{ distro_tag(version.channel)}} {{ status }}
-          </div>
-      {% else %}
-          {{ _('0 files') }}
-      {% endfor %}
+      <div>
+        {{ distro_tag(version.channel)}}
+        <span class="file-status-text">
+          {% if version.file.status == amo.STATUS_DISABLED and version.is_blocked %}
+            {# Slight optimization: don't try getting blocked status for
+               non-disabled versions - this avoids checking if for latest/current
+               versions, which are fetched without a select_related('blockversion') #}
+            {{ version.blockversion.get_user_facing_block_type_display() }}
+          {% else %}
+            {{ version.file.get_status_display() }}
+          {% endif %}
+        </span>
+      </div>
       {% if version.is_user_disabled %}
         <div>
         <form method="post" action="{{ url('devhub.versions.reenable', addon.slug) }}">
@@ -61,40 +78,32 @@
           <a href="#" class="review-history-show" data-div="#{{ version.id }}-review-history"
             id="review-history-show-{{ version.id }}" data-version="{{ version.id }}">{{ _('Review History') }}</a>
           <a href="#" class="review-history-hide hidden">{{ _('Close Review History') }}</a>
-          {% if latest_version_in_channel == version %}
-              {% set pending_count = pending_activity_log_count_for_developer(version) %}
-              {% if pending_count > 0 %}
-                  <b class="review-history-pending-count">{{ pending_count }}</b>
-              {% endif %}
-          {% endif %}
+            {% set pending_count = pending_activity_log_count_for_developer(version) %}
+            {% if pending_count > 0 %}
+                <b class="review-history-pending-count">{{ pending_count }}</b>
+            {% endif %}
       </div>
     </td>
     <td class="file-validation">
       <ul>
-        {% for file in version.all_files %}
-          <li>{{ file.get_platform_display() }}
-          <ul>
-          {% if file.has_been_validated %}
-            <li><a href="{{ url('devhub.file_validation', addon.slug, file.id) }}">
-              {{ summarize_validation(file.validation) }}</a></li>
-          {% else %}
-            <li>{{ _('Not validated.') }}
-              <a href="{{ url('devhub.file_validation', addon.slug, file.id) }}">
-                  {{ _('Validate now.') }}</a>
-            </li>
+          <li>
+          {% if version.file.has_been_validated %}
+            <ul>
+              <li><a href="{{ url('devhub.file_validation', addon.slug, version.file.id) }}">
+                {{ summarize_validation(version.file.validation) }}</a>
+              </li>
+            </ul>
           {% endif %}
-          </ul>
           </li>
-        {% endfor %}
       </ul>
     </td>
     <td class="version-delete">
-      <a href="#" class="remove" data-version="{{ version.id }}" data-is-current="{{ (version == addon.current_version)|int }}">x</a>
+      <a href="#" class="remove" data-version="{{ version.id }}"
+         data-can-be-disabled="{{ version.can_be_disabled_and_deleted()|int }}"
+         data-is-current="{{ (version == addon.current_version)|int }}">x</a>
     </td>
   </tr>
-  {% set can_request_review=addon.can_request_review() %}
-  {% set can_cancel=(not addon.is_disabled and addon.status==amo.STATUS_NOMINATED) %}
-  {% if full_info and check_addon_ownership(request, addon, dev=True) and (can_request_review or can_cancel) %}
+  {% if full_info and version.channel == amo.CHANNEL_LISTED and can_request_review %}
     <tr>
       <td colspan="0" class="version-status-actions item-actions">
         {% if can_request_review %}
@@ -104,16 +113,13 @@
             <button class="link" type="submit">{{ _('Request Review') }}</button> &middot;
           </form>
         {% endif %}
-        {% if can_cancel %}
-          <a href="#" id="cancel-review">{{ _('Cancel Review Request') }}</a>
-        {% endif %}
       </td>
     </tr>
   {% endif %}
   <tr>
       <td colspan="4" id="{{ version.id }}-review-history" class="review-history hidden"
             data-api-url="{{ drf_url('version-reviewnotes-list', addon.id, version.id) }}"
-            data-token="{{ token }}">
+            data-session-id="{{ session_id }}">
           <div class="history-container">
               <div class="review-entry-loading">{{ _('Loading Review History...') }}</div>
               <div class="review-entry-failure hidden">{{ _('We had a problem retrieving review notes') }}</div>
@@ -121,24 +127,27 @@
                   <p><a href="#" class="review-history-loadmore" data-div="#{{ version.id }}-review-history">{{ _('Load older...') }}</a></p>
               </div>
               <div class="review-entry-empty hidden">
-                  <p><span class="action">$action_label</span> {{ _('by') }}
-                  <a href="$user_profile">$user_name</a> <time class="timeago" datetime=$date>$date</time></p>
-                  <pre>$comments</pre>
+                  <div>
+                    <p><strong class="action">$action_label</strong> {{ _('by') }}
+                    <em class="user_name">$user_name</em> <time class="timeago" datetime="$date">$date</time></p>
+                    <ul class="review-entry-policies"></ul>
+                    <p class="review-entry-comments-label hidden">{{ _('Additional comments:') }}</p>
+                    <pre>$comments</pre>
+                  </div>
+                  <div class="review-entry-attachment hidden">
+                    <a class="attachment_url">Download Attachment</a>
+                    <span class="attachment_size download-reply-attachment">($attachment_size)</span>
+                  </div>
               </div>
           </div>
-          {% if latest_version_in_channel == version %}
-            <div class="dev-review-reply">
-              <form class="dev-review-reply-form" action="{{ drf_url('version-reviewnotes-list', addon.id, version.id) }}"
-                    data-token="{{ token }}" data-history="#{{ version.id }}-review-history" data-no-csrf>
-                  <textarea name="comments" placeholder="{{ _('Leave a reply') }}"></textarea>
-                  <button type="submit" class="submit" >{{ _('Reply') }}</button ty>
-              </form>
-            </div>
-          {% else %}
-            <div>
-              <a href="#" class="review-history-show" data-version="{{ latest_version_in_channel.id }}">{{ _('Leave a reply') }}</a>
-            </div>
-          {% endif %}
+          <div class="dev-review-reply">
+            <form class="dev-review-reply-form" action="{{ drf_url('version-reviewnotes-list', addon.id, version.id) }}"
+                  data-session-id="{{ session_id }}" data-history="#{{ version.id }}-review-history" data-no-csrf>
+                {# This is not a django form, an XHR goes through to the form action on submit #}
+                <textarea maxlength="{{ comments_maxlength }}" name="comments" placeholder="{{ _('Leave a reply') }}"></textarea>
+                <button type="submit" class="submit" >{{ _('Reply') }}</button>
+            </form>
+          </div>
       </td>
   </tr>
 {% endmacro %}
@@ -148,36 +157,17 @@
   <h2>{{ addon.name }}</h2>
 </header>
 <section id="edit-addon" class="primary devhub-form" role="main">
-  {% if has_listed_versions %}
-    <h3>{{ distro_tag(amo.RELEASE_CHANNEL_LISTED)}} {{ _('Listing visibility') }}</h3>
-    <div class="item" id="addon-current-state">
-      <div class="item_wrapper">
-        {% set owner = check_addon_ownership(request, addon, dev=True) %}
-        <label><input name="addon-state" value="listed" type="radio"
-                    {% if not owner or addon.status == amo.STATUS_DISABLED %}disabled="disabled"{% endif %}
-                    {% if not addon.is_disabled %}checked="checked"{% endif %}
-                    data-url="{{ addon.get_dev_url('enable') }}"
-                    class="enable-addon">
-        {{ _("{label_open}Visible:{label_close} Visible to everyone on {site_url} and included "
-             "in search results and product pages.")|format_html(
-             label_open='<strong>'|safe, label_close='</strong>'|safe, site_url=settings.SITE_URL)|safe }}</label>
-        <br>
-        <label><input name="addon-state" value="hidden" type="radio"
-                    {% if not owner %}disabled="disabled"{% endif %}
-                    {% if addon.is_disabled %}checked="checked"{% endif %}
-                    class="disable-addon">
-        {{ _("{label_open}Invisible:{label_close} Won't be included in search results, and its product page will "
-              "indicate you disabled it. New version submissions for product "
-              "won't be accepted in this state.")|format_html(
-             label_open='<strong>'|safe, label_close='</strong>'|safe) }}</label>
-      </div>
-    </div>
-
-    {% set latest_listed_version=addon.find_latest_version(channel=amo.RELEASE_CHANNEL_LISTED) %}
-    {% set current_version=addon.current_version %}
-
+  {# Only show listing visibility if there are listed versions... or if somehow the add-on is already invisible,
+     to allow developers to toggle it back so that they can upload listed versions. If the add-on has an enterprise
+     version, only show if the listed version is still publicly available. #}
+  {% if (has_listed_versions or addon.disabled_by_user) and (not has_enterprise_versions or latest_listed_version) %}
+    {% if addon.status == amo.STATUS_REJECTED %}
+      {{ content_rejected_info(addon) }}
+    {% else %}
+      {% include "devhub/includes/listing_visibility.html" %}
+    {% endif %}
     {% if latest_listed_version or current_version %}
-        <h3>{{ distro_tag(amo.RELEASE_CHANNEL_LISTED)}} {{ _('Listed versions') }}</h3>
+        <h3>{{ distro_tag(amo.CHANNEL_LISTED)}} {{ _('Listed versions') }}</h3>
     {% endif %}
     {% if current_version %}
       <div class="item" id="current-version-status">
@@ -213,19 +203,30 @@
       </div>
     {% endif %}
 
-    <h3>{{ _('Other versions') }}</h3>
+    {% set other_versions_header_text =_('Other versions') %}
   {% else %}
-    <h3>{{ _('All versions') }}</h3>
-  {% endif %}
-  <div class="item" id="version-list"
-       data-stats="{{ url('devhub.versions.stats', addon.slug) }}">
-    <div class="item_wrapper">
-      {% if addon.status != amo.STATUS_DISABLED %}{# i.e. Admin disabled #}
+    {% set other_versions_header_text =_('All versions') %}
+{% endif %}
+  <div id="other-versions-header">
+    <h3>{{ other_versions_header_text }}</h3>
+
+    <div class="version-buttons">
+      {% if can_rollback %}
+      <div>
+        <a href="#rollback-version" class="button version-rollback">{{ _('Rollback to a previous version') }}</a>
+      </div>
+      {% endif %}
+      {% if can_submit %}
       <div>
         {% set version_upload_url = url('devhub.submit.version', addon.slug) %}
         <a href="{{ version_upload_url }}" class="button version-upload">{{ _('Upload a New Version') }}</a>
       </div>
       {% endif %}
+    </div>
+  </div>
+  <div class="item" id="version-list"
+       data-stats="{{ url('devhub.versions.stats', addon.slug) }}">
+    <div class="item_wrapper">
       <table>
         <tr>
           <th>{{ _('Version') }}</th>
@@ -234,7 +235,6 @@
           <th class="version-delete">{{ _('Delete/Disable') }}</th>
         </tr>
 
-        {% set latest_listed_version_including_disabled = addon.find_latest_version(channel=amo.RELEASE_CHANNEL_LISTED, exclude=()) %}
         {% for version in versions.object_list %}
           {% if version != current_version and version != latest_listed_version %}
             {{ version_details(version, full_info=version==latest_listed_version_including_disabled) }}
@@ -248,16 +248,12 @@
       </div>
     {% endif %}
   </div>
-  {% if check_addon_ownership(request, addon) and addon.can_be_deleted() %}
+  {# Checks for an actual owner, not just a developer #}
+  {% if check_addon_ownership(request.user, addon) and addon.can_be_deleted() %}
   <h3>{{ _('Delete Add-on') }}</h3>
   <div class="item" id="addon-delete-listing">
     <div class="item_wrapper">
-      <p>{% trans %}
-      Deleting your add-on will permanently delete all versions and files you
-      have submitted for this add-on, listed or not. The add-on ID will
-      continue to be linked to your account, so others won't be able to submit
-      versions using the same ID.
-      {% endtrans %}</p>
+      <p>{% include 'devhub/addons/listing/_delete_warning.html' %}</p>
       <a class="delete-button delete-addon" href="{{ addon.get_dev_url('versions') }}#delete-addon">{{ _('Delete Add-on') }}</a>
     </div>
   </div>
@@ -273,20 +269,22 @@
   {% endif %}
 
   <div id="modal-delete-version" class="modal modal-delete">
+    <h3 data-tmpl="{{ _('Delete Version {version}') }}"></h3>
     <form method="post" action="{{ url('devhub.versions.delete', addon.slug) }}">
-      <h3 data-tmpl="{{ _('Delete Version {version}') }}"></h3>
       <p class="current-version-warning highlight">{{ _('You are about to delete the current version of your add-on. This may cause your add-on status to change, or your listing to lose public visibility, if this is the only public version of your add-on.') }}</p>
       <p>{{ _('Deleting this version will permanently delete:') }}</p>
       <ul>
         <li id="del-files"></li>
-        <li id="del-reviews"></li>
       </ul>
       <p class="highlight warning">
+      <strong>{{ _('Important:') }}</strong>
       {% trans %}
-        <strong>Important:</strong>
         Once a version has been deleted, you may not upload a new
         version with the same version number.
+        The version will also be Restricted, which will disable and prevent any further installation in Firefox.
+        Existing users can choose to re-enable the add-on.
       {% endtrans %}
+      </p>
       <p>{{ _('Are you sure you wish to delete this version?') }}</p>
       {% csrf_token %}
       <div class="modal-actions">
@@ -299,15 +297,26 @@
         {{ _('or') }} <a href="#" class="close">{{ _('Cancel') }}</a>
       </div>
     </form>
+    <p class="promoted-version-warning">
+      {# will be hidden by default, shown by javascript if data-can-be-disabled is falsey #}
+      {% trans promoted_group_name = addon.promoted_groups().name %}
+        The latest approved version of this {{ promoted_group_name }} add-on cannot be deleted or disabled
+        because the previous version was not approved for {{ promoted_group_name }} promotion.
+        Please contact AMO Admins if you need help with this.
+      {% endtrans %}
+      <a href="#" class="close">{{ _('Cancel') }}</a>
+    </p>
   </div>
+
+  {% if can_rollback %}
+  {% include "devhub/includes/modal_rollback_version.html" %}}
+  {% endif %}
 
   {% if has_listed_versions %}
   {% if not addon.disabled_by_user and not addon.is_disabled %}
   <div id="modal-disable" class="modal">
+    <h3>{{ _('Hide Add-on') }}</h3>
     <form method="post" action="{{ addon.get_dev_url('disable') }}">
-      <h3>
-        {{ _('Hide Add-on') }}
-      </h3>
       <p>
         {% trans %}
           Hiding your add-on will prevent it from appearing anywhere in our
@@ -336,32 +345,6 @@
         </button>
         {{ _('or') }} <a href="#" class="close">{{ _('Cancel') }}</a>
       </p>
-    </form>
-  </div>
-  {% endif %}
-
-  {% if not addon.is_disabled and addon.status == amo.STATUS_NOMINATED %}
-  <div id="modal-cancel" class="modal">
-    <form method="post" action="{{ url('devhub.addons.cancel', addon.slug) }}">
-      <h3>{{ _('Cancel Review Request') }}</h3>
-      <p>
-        {% trans %}
-            Canceling your review request will mark your add-on incomplete,
-            and any versions awaiting review will be disabled.
-        {% endtrans %}
-      </p>
-      <p>
-        {% trans %}
-          Are you sure you wish to cancel your review request?
-        {% endtrans %}
-      </p>
-      {% csrf_token %}
-      <input type="hidden" name="addon_id" class="addon_id" value="{{ addon.id }}">
-      <p>
-        <button type="submit">{{ _('Cancel Review Request') }}</button>
-        {{ _('or') }} <a href="#" class="cancel close">{{ _('Close') }}</a>
-      </p>
-      <a href="#" class="close">{{ _('Close') }}</a>
     </form>
   </div>
   {% endif %}

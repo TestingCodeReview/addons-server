@@ -1,37 +1,81 @@
+# ruff: noqa: F405
 """This is the standard development settings file.
 
 If you need to overload settings, please do so in a local_settings.py file (it
 won't be tracked in git).
 
 """
-import os
-from six.moves.urllib_parse import urlparse
 
+import os
+from copy import deepcopy
+from urllib.parse import urlparse
+
+from olympia.core.utils import get_version_json
 from olympia.lib.settings_base import *  # noqa
+
+
+# Any target other than "production" is considered a development target.
+DEV_MODE = TARGET != 'production'
+
+HOST_UID = os.environ.get('HOST_UID')
 
 WSGI_APPLICATION = 'olympia.wsgi.application'
 
-DEBUG = True
+# Always
+SERVE_STATIC_FILES = True
 
 # These apps are great during development.
-INSTALLED_APPS += (
-    'olympia.landfill',
-)
+INSTALLED_APPS += ('olympia.landfill',)
+
+DBBACKUP_CONNECTOR_MAPPING = {
+    'olympia.core.db.mysql': 'dbbackup.db.mysql.MysqlDumpConnector',
+}
+SKIP_DATA_SEED = os.environ.get('SKIP_DATA_SEED')
+
+# Override logging config to enable DEBUG logs for (almost) everything.
+LOGGING['root']['level'] = logging.DEBUG
+for logger in list(LOGGING['loggers'].keys()):
+    if logger not in ['filtercascade', 'mohawk.util', 'post_request_task']:
+        # It is important to keep the loggers configured in `settings_base.py`
+        # so we only update the level below:
+        LOGGING['loggers'][logger]['level'] = logging.DEBUG
+
+
+# django-debug-doolbar middleware needs to be inserted as high as possible
+# but after GZip middleware
+def insert_debug_toolbar_middleware(middlewares):
+    ret_middleware = list(middlewares)
+
+    for i, middleware in enumerate(ret_middleware):
+        if 'GZipMiddleware' in middleware:
+            ret_middleware.insert(
+                i + 1, 'debug_toolbar.middleware.DebugToolbarMiddleware'
+            )
+            break
+
+    return tuple(ret_middleware)
+
+
+# We can only add these dependencies if we have development dependencies
+if os.environ.get('OLYMPIA_DEPS', '') == 'development':
+    INSTALLED_APPS += (
+        'debug_toolbar',
+        'dbbackup',
+        'django_model_info.apps.DjangoModelInfoConfig',
+    )
+    MIDDLEWARE = insert_debug_toolbar_middleware(MIDDLEWARE)
+
+DEBUG_TOOLBAR_CONFIG = {
+    # Enable django-debug-toolbar locally, if DEBUG is True.
+    'SHOW_TOOLBAR_CALLBACK': lambda request: DEBUG,
+}
 
 FILESYSTEM_CACHE_ROOT = os.path.join(TMP_PATH, 'cache')
-
-# We are setting memcached here to make sure our local setup is as close
-# to our production system as possible.
-CACHES = {
-    'default': {
-        'BACKEND': 'django.core.cache.backends.memcached.MemcachedCache',
-        'LOCATION': os.environ.get('MEMCACHE_LOCATION', 'localhost:11211'),
-    },
-}
 
 # If you're not running on SSL you'll want this to be False.
 SESSION_COOKIE_SECURE = False
 SESSION_COOKIE_DOMAIN = None
+WAFFLE_SECURE = False
 
 CELERY_TASK_ALWAYS_EAGER = False
 
@@ -39,90 +83,93 @@ CELERY_TASK_ALWAYS_EAGER = False
 # replicas to zero.
 ES_DEFAULT_NUM_REPLICAS = 0
 
-SITE_URL = os.environ.get('OLYMPIA_SITE_URL') or 'http://localhost:8000'
-DOMAIN = SERVICES_DOMAIN = urlparse(SITE_URL).netloc
-SERVICES_URL = SITE_URL
+SITE_URL = env('SITE_URL')
 
-ALLOWED_HOSTS = ALLOWED_HOSTS + [SERVICES_DOMAIN]
+DOMAIN = SERVICES_DOMAIN = urlparse(SITE_URL).netloc
+ADDONS_FRONTEND_PROXY_PORT = '7000'
+SERVICES_URL = SITE_URL
+INTERNAL_SITE_URL = 'http://nginx'
+EXTERNAL_SITE_URL = SITE_URL
+STATIC_URL = EXTERNAL_SITE_URL + STATIC_URL_PREFIX
+MEDIA_URL = EXTERNAL_SITE_URL + MEDIA_URL_PREFIX
+
+ALLOWED_HOSTS = ALLOWED_HOSTS + [SERVICES_DOMAIN, 'nginx', '127.0.0.1']
 
 # Default AMO user id to use for tasks (from users.json fixture in zadmin).
 TASK_USER_ID = 10968
-
-# Set to True if we're allowed to use X-SENDFILE.
-XSENDFILE = False
 
 ALLOW_SELF_REVIEWS = True
 
 AES_KEYS = {
     'api_key:secret': os.path.join(
-        ROOT, 'src', 'olympia', 'api', 'tests', 'assets', 'test-api-key.txt'),
+        ROOT, 'src', 'olympia', 'api', 'tests', 'assets', 'test-api-key.txt'
+    ),
 }
-
-CORS_ENDPOINT_OVERRIDES = cors_endpoint_overrides(
-    ['localhost:3000', 'olympia.test']
-)
 
 DATABASES = {
-    'default': get_db_config('DATABASES_DEFAULT_URL', charset='utf8mb4'),
+    'default': get_db_config('DATABASES_DEFAULT_URL'),
 }
 
-# FxA config for local development only.
-FXA_CONFIG = {
-    'default': {
-        'client_id': env('FXA_CLIENT_ID', default='f336377c014eacf0'),
-        'client_secret': env(
-            'FXA_CLIENT_SECRET',
-            default='5a36054059674b09ea56709c85b862c388f2d493d735070868ae8f476e16a80d'),  # noqa
-        'content_host': 'https://stable.dev.lcip.org',
-        'oauth_host': 'https://oauth-stable.dev.lcip.org/v1',
-        'profile_host': 'https://stable.dev.lcip.org/profile/v1',
-        'redirect_url': 'http://olympia.test/api/v3/accounts/authenticate/',
-        'scope': 'profile',
-    },
-    'amo': {
-        'client_id': env('FXA_CLIENT_ID', default='0f95f6474c24c1dc'),
-        'client_secret': env(
-            'FXA_CLIENT_SECRET',
-            default='ca45e503a1b4ec9e2a3d4855d79849e098da18b7dfe42b6bc76dfed420fc1d38'),  # noqa
-        'content_host': 'https://stable.dev.lcip.org',
-        'oauth_host': 'https://oauth-stable.dev.lcip.org/v1',
-        'profile_host': 'https://stable.dev.lcip.org/profile/v1',
-        'redirect_url': 'http://localhost:3000/fxa-authenticate',
-        'scope': 'profile',
-    },
-    'local': {
-        'client_id': env('FXA_CLIENT_ID', default='1778aef72d1adfb3'),
-        'client_secret': env(
-            'FXA_CLIENT_SECRET',
-            default='3feebe3c009c1a0acdedd009f3530eae2b88859f430fa8bb951ea41f2f859b18'),  # noqa
-        'content_host': 'https://stable.dev.lcip.org',
-        'oauth_host': 'https://oauth-stable.dev.lcip.org/v1',
-        'profile_host': 'https://stable.dev.lcip.org/profile/v1',
-        'redirect_url': 'http://localhost:3000/api/v3/accounts/authenticate/',
-        'scope': 'profile',
-    },
-}
-ALLOWED_FXA_CONFIGS = ['default', 'amo', 'local']
+FXA_CONTENT_HOST = 'https://accounts.stage.mozaws.net'
+FXA_OAUTH_HOST = 'https://oauth.stage.mozaws.net/v1'
+FXA_PROFILE_HOST = 'https://profile.stage.mozaws.net/v1'
+FXA_SUPPORT_HOST = 'https://api-accounts.stage.mozaws.net/v1'
 
-# CSP report endpoint which returns a 204 from addons-nginx in local dev.
-CSP_REPORT_URI = '/csp-report'
-
-# Allow GA over http + www subdomain in local development.
+# Set CSP like we do for dev/stage/prod, but also allow GA over http + www subdomain
+# for local development.
 HTTP_GA_SRC = 'http://www.google-analytics.com'
-CSP_IMG_SRC += (HTTP_GA_SRC,)
-CSP_SCRIPT_SRC += (HTTP_GA_SRC, "'self'")
+
+# we want to be able to test the settings_base without these overrides interfering
+CONTENT_SECURITY_POLICY = deepcopy(CONTENT_SECURITY_POLICY)
+CONTENT_SECURITY_POLICY['DIRECTIVES']['connect-src'] += (SITE_URL,)
+CONTENT_SECURITY_POLICY['DIRECTIVES']['font-src'] += (STATIC_URL,)
+CONTENT_SECURITY_POLICY['DIRECTIVES']['img-src'] += (MEDIA_URL, STATIC_URL, HTTP_GA_SRC)
+CONTENT_SECURITY_POLICY['DIRECTIVES']['script-src'] += (STATIC_URL, HTTP_GA_SRC)
+CONTENT_SECURITY_POLICY['DIRECTIVES']['style-src'] += (STATIC_URL,)
+# CSP report endpoint which returns a 204 from addons-nginx in local dev.
+CONTENT_SECURITY_POLICY['DIRECTIVES']['report-uri'] = '/csp-report'
 
 # Auth token required to authorize inbound email.
 INBOUND_EMAIL_SECRET_KEY = 'totally-unsecure-secret-string'
 # Validation key we need to send in POST response.
 INBOUND_EMAIL_VALIDATION_KEY = 'totally-unsecure-validation-string'
 
-# If you have settings you want to overload, put them in a local_settings.py.
+REMOTE_SETTINGS_IS_TEST_SERVER = True
+
 try:
     from local_settings import *  # noqa
-except ImportError as exc:
-    import warnings
-    import traceback
+except ImportError:
+    pass
 
-    warnings.warn('Could not import local_settings module. {}'.format(
-        traceback.format_exc()))
+SITEMAP_DEBUG_AVAILABLE = True
+
+# Recaptcha test keys from https://developers.google.com/recaptcha/docs/faq.
+# Will show the widget but no captcha, verification will always pass.
+RECAPTCHA_PUBLIC_KEY = '6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI'
+RECAPTCHA_PRIVATE_KEY = '6LeIxAcTAAAAAGG-vFI1TnRWxMZNFuojJ4WifJWe'
+
+ADDONS_SERVER_DOCS_URL = 'https://addons-server.readthedocs.io/en/latest'
+
+ENABLE_ADMIN_MLBF_UPLOAD = True
+
+
+# Use dev mode if we are on a non production imqage and debug is enabled.
+if get_version_json().get('target') != 'production' and DEBUG:
+    DJANGO_VITE = {
+        'default': {
+            'dev_mode': True,
+            'static_url_prefix': 'bundle',
+        }
+    }
+
+MEMCACHE_MIN_SERVER_COUNT = 1
+
+GOOGLE_APPLICATION_CREDENTIALS_BIGQUERY = env(
+    'GOOGLE_APPLICATION_CREDENTIALS_BIGQUERY',
+    # Set default path to the path explicitly gitignored.
+    default=path('private/google-application-credentials.json'),
+)
+
+CINDER_SERVER_URL = 'https://mozilla-staging.cinderapp.com/api/'
+
+PINGUINO_DEV_SERVER_URL = 'http://pinguino:5273'

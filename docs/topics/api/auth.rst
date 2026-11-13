@@ -4,7 +4,9 @@
 Authentication (External)
 =========================
 
-To access the API as an external consumer, you need to include a
+To execute authenticated calls against the API as an external consumer, (see the
+documentation for individual endpoints where it will indicate if that endpoint
+requires, or would benefit from, authentication), you need to include a
 `JSON Web Token (JWT)`_ in the ``Authorization`` header for every request.
 This header acts as a one-time token that authenticates your user account.
 No JWT claims are made about the actual API request you are making.
@@ -27,12 +29,11 @@ To create JWTs, first obtain a **key** and **secret** from the
     If someone obtains your secret they can make API requests on behalf of your user account.
 
 
-Create a JWT for each request
-=============================
+Create a JWT
+============
 
-Prior to making every API request, you need to generate a fresh `JWT`_.
-The JWT will have a short expiration time and is only valid for a single
-request so you can't cache or reuse it.
+Prior to making API requests, you need to generate a `JWT`_.
+The JWT will have a short expiration time but can be re-used until they expire.
 You only need to include a few standard fields; here's what the raw JSON object
 needs to look like before it's signed:
 
@@ -65,11 +66,6 @@ exp
     This is a `standard JWT claim`_ indicating
     the *expiration time*. It should be a Unix epoch timestamp in UTC time
     and must be **no longer than five minutes** past the issued at time.
-
-     .. versionchanged:: 2016-10-06
-
-        We increased the expiration time from 60 seconds to five minutes
-        to workaround support for large and slow uploads.
 
 
 .. note::
@@ -125,7 +121,7 @@ Using the :ref:`profile <profile>` as an example endpoint,
 here's what a JWT authenticated HTTP request would look like in
 `curl <http://curl.haxx.se/>`_::
 
-    curl "https://addons.mozilla.org/api/v4/accounts/profile/" \
+    curl "https://addons.mozilla.org/api/v5/accounts/profile/" \
          -H "Authorization: JWT eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ5b3VyLWFwaS1rZXkiLCJpYXQiOjE0NDcyNzMwOTYsImp0aSI6IjAuNDczNjI5NDQ2MjM0NTU0MDUiLCJleHAiOjE0NDcyNzMxNTZ9.TQ4B8GEm7UWZPcHuNGgjzD8EU9oUBVbL70Le1IeuYx0"
 
 

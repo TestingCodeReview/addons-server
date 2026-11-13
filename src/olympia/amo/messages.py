@@ -4,9 +4,7 @@ from django.contrib import messages as django_messages
 from django.template import loader
 from django.utils import safestring
 
-import jinja2
-import six
-
+import markupsafe
 from rest_framework.request import Request
 
 
@@ -20,7 +18,7 @@ message title).
 """
 
 
-class DoubleSafe(safestring.SafeData, jinja2.Markup):
+class DoubleSafe(safestring.SafeText, markupsafe.Markup):
     """Double safe all the way: marks safe for django and jinja2.
 
     Even though we're using jinja2 for most of the template rendering, we may
@@ -34,12 +32,15 @@ class DoubleSafe(safestring.SafeData, jinja2.Markup):
     """
 
 
-def _make_message(title=None, message=None, title_safe=False,
-                  message_safe=False):
-    c = {'title': title, 'message': message,
-         'title_safe': title_safe, 'message_safe': message_safe}
-    t = loader.get_template('message_content.html').render(c)
-    return DoubleSafe(t)
+def _make_message(title=None, message=None, title_safe=False, message_safe=False):
+    context = {
+        'title': title,
+        'message': message,
+        'title_safe': title_safe,
+        'message_safe': message_safe,
+    }
+    tpl = loader.get_template('message_content.html').render(context)
+    return DoubleSafe(tpl)
 
 
 def _is_dupe(msg, request):
@@ -52,10 +53,10 @@ def _is_dupe(msg, request):
         return False
 
     try:
-        smsg = six.text_type(msg)
+        smsg = str(msg)
         is_dupe = False
         for message in storage:
-            if six.text_type(message) == smsg:
+            if str(message) == smsg:
                 # We can't return from here because we need to tell Django not
                 # to consume the messages.
                 is_dupe = True
@@ -67,8 +68,16 @@ def _is_dupe(msg, request):
     return is_dupe
 
 
-def _file_message(type_, request, title, message=None, extra_tags='',
-                  fail_silently=False, title_safe=False, message_safe=False):
+def _file_message(
+    type_,
+    request,
+    title,
+    message=None,
+    extra_tags='',
+    fail_silently=False,
+    title_safe=False,
+    message_safe=False,
+):
     msg = _make_message(title, message, title_safe, message_safe)
     # Don't save duplicates.
     if _is_dupe(msg, request):

@@ -1,8 +1,12 @@
-from django.conf.urls import url
+from django.urls import re_path
 
 from . import views
 
 
 urlpatterns = [
-    url(r'^mail/', views.inbound_email, name='inbound-email-api'),
+    re_path(
+        r'^attachment/(?P<activity_log_id>\d+)',
+        views.download_attachment,
+        name='activity.attachment',
+    )
 ]

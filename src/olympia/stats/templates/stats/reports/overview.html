@@ -5,7 +5,9 @@
 {% block stats %}
     <section class="island two-up">
       <div>
-        <a href="downloads/">{{ _('<b>{0}</b> Downloads')|format_html(addon.total_downloads|numberfmt) }}</a>
+        <a href="downloads/">
+          {{ _('<b>{0}</b> Weekly Downloads')|format_html(addon.weekly_downloads|numberfmt) }}
+        </a>
         <small id="downloads-in-range">{{ _('Loading...') }}</small>
       </div>
       <div>
@@ -16,7 +18,7 @@
     <div class="toplists">
       <div class="toplist">
         <div class="island statbox">
-          <h2>{{ _('Top Applications') }}</h3>
+          <h2>{{ _('Top Applications') }}</h2>
           <div class="piechart"></div>
           <table data-metric="apps">
           </table>
@@ -28,7 +30,7 @@
       </div>
       <div class="toplist">
         <div class="island statbox">
-          <h2>{{ _('Top Languages') }}</h3>
+          <h2>{{ _('Top Languages') }}</h2>
           <div class="piechart"></div>
           <table data-metric="locales">
           </table>
@@ -40,7 +42,7 @@
       </div>
       <div class="toplist">
         <div class='island statbox'>
-          <h2>{{ _('Top Platforms') }}</h3>
+          <h2>{{ _('Top Platforms') }}</h2>
           <div class="piechart"></div>
           <table data-metric="os">
           </table>

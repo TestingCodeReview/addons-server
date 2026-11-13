@@ -1,15 +1,18 @@
-from django.conf.urls import include, url
+from django.urls import path
 
-from rest_framework.routers import SimpleRouter
-from .views import AddonAbuseViewSet, UserAbuseViewSet
+from olympia.abuse.views import appeal
 
-
-reporting = SimpleRouter()
-reporting.register(r'addon', AddonAbuseViewSet,
-                   basename='abusereportaddon')
-reporting.register(r'user', UserAbuseViewSet,
-                   basename='abusereportuser')
 
 urlpatterns = [
-    url(r'report/', include(reporting.urls)),
+    path(
+        'appeal/<str:decision_cinder_id>/',
+        appeal,
+        kwargs={'abuse_report_id': None},
+        name='abuse.appeal_author',
+    ),
+    path(
+        'appeal/<str:abuse_report_id>/<str:decision_cinder_id>/',
+        appeal,
+        name='abuse.appeal_reporter',
+    ),
 ]

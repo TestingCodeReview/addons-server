@@ -2,7 +2,6 @@
 
 .button, button, input[type=submit] {
     position: relative;
-    font: bold 13px/1em @head-sans;
     padding: 6px 10px 7px;
     text-align: center;
     text-decoration: none;
@@ -73,23 +72,6 @@ button.bad, .button.bad, .button.developer, .button.scary { // Red
             span {
                 .sprite-pos(1, 64, 3px);
             }
-        }
-    }
-    &.paypal {
-        .gradient-two-color(#F8EAC4, #EEC546);
-        color: rgb(51, 70, 118);
-        text-shadow: 1px 1px #EDE8BF;
-        font-style: italic;
-        font-family: Verdana, @sans-stack;
-        background-color: #EEC546;
-        small {
-            font-size: 0.7em;
-        }
-        em {
-            color: rgb(90, 120, 168);
-        }
-        &.disabled em {
-            color: #919497;
         }
     }
     &.contribute { // Blue
@@ -322,8 +304,4 @@ button[disabled],
     font-size: 25px;
     font-family: "Open Sans", X-LocaleSpecific, sans-serif;
     font-weight: normal;
-
-    /* IE7 and Below */
-    *display: inline;
-    *zoom: 1;
 }

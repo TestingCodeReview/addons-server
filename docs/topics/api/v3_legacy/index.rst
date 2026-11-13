@@ -1,8 +1,13 @@
 .. _v3-api-index:
 
-=================
-External API (V3)
-=================
+==============================
+External API (V3 - Deprecated)
+==============================
+
+.. warning::
+    These v3 APIs are now deprecated and you should switch to a newer version before
+    it is removed. See :ref:`the API versions available<api-versions-list>` for details
+    of the different API versions available and the deprecation timeline.
 
 This shows you how to use the `addons.mozilla.org <https://addons.mozilla.org/en-US/firefox/>`_
 API at ``/api/v3/`` which is hosted at the following URLs:
@@ -41,7 +46,6 @@ using the API.
    categories
    collections
    discovery
-   download_sources
    reviews
    reviewers
    signing

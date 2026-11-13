@@ -1,16 +1,14 @@
-# These two dicts are mapping between language codes in zamboni and language
-# analyzers in elasticsearch.
+# These two dicts are mapping between language codes in addons-server and
+# language analyzers in elasticsearch.
 #
-# Each key value of ANALYZER_MAP is language analyzer supported by
-# elasticsearch.  See
-# http://www.elasticsearch.org/guide/reference/index-modules/analysis/lang-analyzer.html
+# The keys are elasticsearch language analyzers while each value is a list of
+# language codes supported by AMO.
 #
-# Each value of ANALYZER_MAP is a list which is supported by the key analyzer.
-# All values are picked from AMO_LANGUAGES in settings.py.
-#
-# The rows commented out are that the language is not supported by
+# The lines commented out are that the language is not supported by
 # elasticsearch yet.  We should update it when elasticsearch supports new
 # analyzer for the language.
+#
+# http://www.elasticsearch.org/guide/reference/index-modules/analysis/lang-analyzer.html
 
 SEARCH_ANALYZER_MAP = {
     # '': ['af'],    # Afrikaans
@@ -22,7 +20,7 @@ SEARCH_ANALYZER_MAP = {
     'german': ['de'],
     'greek': ['el'],
     'english': ['en-us', 'en-ca', 'en-gb'],
-    'spanish': ['es'],
+    'spanish': ['es-es', 'es-ar', 'es-cl', 'es-mx'],
     'basque': ['eu'],
     'persian': ['fa'],
     'finnish': ['fi'],
@@ -59,31 +57,3 @@ SEARCH_LANGUAGE_TO_ANALYZER = {}
 for analyzer, languages in SEARCH_ANALYZER_MAP.items():
     for language in languages:
         SEARCH_LANGUAGE_TO_ANALYZER[language] = analyzer
-
-# Which stemmer to use for each language.
-#
-# Note: We use the keys of this dict for supported stop words, also, which is
-# specified as, e.g., '_english_'.
-STEMMER_MAP = {
-    'arabic': 'arabic',
-    'basque': 'basque',
-    'brazilian': 'brazilian',
-    'bulgarian': 'bulgarian',
-    'catalan': 'catalan',
-    'czech': 'czech',
-    'danish': 'danish',
-    'dutch': 'dutch',
-    'english': 'minimal_english',
-    'finnish': 'light_finish',  # Yes, this is misspelled in ES.
-    'french': 'light_french',
-    'german': 'light_german',
-    'greek': 'greek',
-    'hungarian': 'light_hungarian',
-    'indonesian': 'indonesian',
-    'italian': 'light_italian',
-    'portuguese': 'light_portuguese',
-    'romanian': 'romanian',
-    'russian': 'russian',
-    'spanish': 'light_spanish',
-    'swedish': 'light_swedish',
-}

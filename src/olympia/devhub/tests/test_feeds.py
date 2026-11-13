@@ -1,18 +1,19 @@
 import uuid
+from urllib.parse import urlencode
 
-import six
-from six.moves.urllib_parse import urlencode
+from django.urls import reverse
+from django.utils.encoding import force_str
 
 from pyquery import PyQuery as pq
 
 from olympia import amo, core
 from olympia.activity.models import ActivityLog
-from olympia.amo.urlresolvers import reverse
 from olympia.bandwagon.models import Collection
 from olympia.devhub.models import RssKey
 from olympia.devhub.tests.test_views import HubTest
 from olympia.ratings.models import Rating
 from olympia.tags.models import Tag
+from olympia.users.models import UserProfile
 from olympia.versions.models import Version
 
 
@@ -21,43 +22,45 @@ class TestActivity(HubTest):
 
     def setUp(self):
         """Start with one user, two add-ons."""
-        super(TestActivity, self).setUp()
+        super().setUp()
         self.clone_addon(2)
         core.set_user(self.user_profile)
         self.addon, self.addon2 = list(self.user_profile.addons.all())
+        ActivityLog.objects.all().delete()
 
     def log_creates(self, num, addon=None):
         if not addon:
             addon = self.addon
-        for i in range(num):
-            ActivityLog.create(amo.LOG.CREATE_ADDON, addon)
+        for _i in range(num):
+            ActivityLog.objects.create(amo.LOG.CREATE_ADDON, addon)
 
     def log_updates(self, num, version_string='1'):
-        version = Version.objects.create(version=version_string,
-                                         addon=self.addon)
+        version = Version.objects.create(version=version_string, addon=self.addon)
 
-        for i in range(num):
-            ActivityLog.create(amo.LOG.ADD_VERSION, self.addon, version)
+        for _i in range(num):
+            with core.override_remote_addr_or_metadata(ip_address='127.0.0.1'):
+                ActivityLog.objects.create(amo.LOG.ADD_VERSION, self.addon, version)
 
     def log_status(self, num):
-        for i in range(num):
-            ActivityLog.create(amo.LOG.USER_DISABLE, self.addon)
+        for _i in range(num):
+            ActivityLog.objects.create(amo.LOG.USER_DISABLE, self.addon)
 
     def log_collection(self, num, prefix='foo'):
         for i in range(num):
             collection = Collection.objects.create(name='%s %d' % (prefix, i))
-            ActivityLog.create(amo.LOG.ADD_TO_COLLECTION, self.addon,
-                               collection)
+            ActivityLog.objects.create(
+                amo.LOG.ADD_TO_COLLECTION, self.addon, collection
+            )
 
     def log_tag(self, num, prefix='foo'):
         for i in range(num):
             tag = Tag.objects.create(tag_text='%s %d' % (prefix, i))
-            ActivityLog.create(amo.LOG.ADD_TAG, self.addon, tag)
+            ActivityLog.objects.create(amo.LOG.ADD_TAG, self.addon, tag)
 
     def log_rating(self, num):
         rating = Rating(addon=self.addon)
-        for i in range(num):
-            ActivityLog.create(amo.LOG.ADD_RATING, self.addon, rating)
+        for _i in range(num):
+            ActivityLog.objects.create(amo.LOG.ADD_RATING, self.addon, rating)
 
     def get_response(self, **kwargs):
         follow = kwargs.pop('follow', True)
@@ -80,7 +83,8 @@ class TestActivity(HubTest):
         doc = pq(response.content)
         assert len(doc('li.item')) == 4
         assert doc('.subscribe-feed').attr('href')[:-32] == (
-            reverse('devhub.feed_all') + '?privaterss=')
+            reverse('devhub.feed_all') + '?privaterss='
+        )
 
     def test_items(self):
         self.log_creates(10)
@@ -89,8 +93,7 @@ class TestActivity(HubTest):
 
     def test_filter_persistence(self):
         doc = self.get_pq(action='status')
-        assert '?action=status' in (doc('ul.refinements').eq(0)('a').eq(1)
-                                    .attr('href'))
+        assert '?action=status' in (doc('ul.refinements').eq(0)('a').eq(1).attr('href'))
 
     def test_filter_updates(self):
         self.log_creates(10)
@@ -162,52 +165,54 @@ class TestActivity(HubTest):
     def test_filter_addon_admin(self):
         """Admins should be able to see specific pages."""
         self.log_creates(10)
-        assert self.client.login(email='admin@mozilla.com')
+        self.client.force_login(UserProfile.objects.get(email='admin@mozilla.com'))
         r = self.get_response(addon=self.addon.id)
         assert r.status_code == 200
 
     def test_filter_addon_otherguy(self):
         """Make sure nobody else can see my precious add-on feed."""
         self.log_creates(10)
-        assert self.client.login(email='clouserw@gmail.com')
+        self.client.force_login(UserProfile.objects.get(email='clouserw@gmail.com'))
         r = self.get_response(addon=self.addon.id)
         assert r.status_code == 403
 
     def test_rss(self):
         self.log_creates(5)
         # This will give us a new RssKey
-        r = self.get_response()
+        self.get_response()
         key = RssKey.objects.get()
 
         assert isinstance(key.key, uuid.UUID)
 
-        r = self.get_response(privaterss=key.key)
-        assert r['content-type'] == 'application/rss+xml; charset=utf-8'
-        assert '<title>Recent Changes for My Add-ons</title>' in r.content
+        res = self.get_response(privaterss=key.key)
+        assert res['content-type'] == 'application/rss+xml; charset=utf-8'
+        assert b'<title>Recent Changes for My Add-ons</title>' in res.content
 
     def test_rss_accepts_verbose(self):
         self.log_creates(5)
-        r = self.get_response()
+        self.get_response()
         key = RssKey.objects.get()
-        r = self.get_response(privaterss=str(key.key))
-        assert r['content-type'] == 'application/rss+xml; charset=utf-8'
-        assert '<title>Recent Changes for My Add-ons</title>' in r.content
+        res = self.get_response(privaterss=str(key.key))
+        assert res['content-type'] == 'application/rss+xml; charset=utf-8'
+        assert b'<title>Recent Changes for My Add-ons</title>' in res.content
 
     def test_rss_single(self):
         self.log_creates(5)
         self.log_creates(13, self.addon2)
 
         # This will give us a new RssKey
-        r = self.get_response(addon=self.addon.id)
+        self.get_response(addon=self.addon.id)
         key = RssKey.objects.get()
-        r = self.get_response(privaterss=key.key)
-        assert r['content-type'] == 'application/rss+xml; charset=utf-8'
-        assert len(pq(r.content)('item')) == 5
-        assert '<title>Recent Changes for %s</title>' % self.addon in r.content
+        res = self.get_response(privaterss=key.key)
+        assert res['content-type'] == 'application/rss+xml; charset=utf-8'
+        assert len(pq(res.content)('item')) == 5
+        assert '<title>Recent Changes for %s</title>' % self.addon in (
+            force_str(res.content)
+        )
 
     def test_rss_unlisted_addon(self):
         """Unlisted addon logs appear in the rss feed."""
-        self.make_addon_unlisted(self.addon)
+        self.change_channel_for_addon(self.addon, amo.CHANNEL_UNLISTED)
         self.log_creates(5)
 
         # This will give us a new RssKey
@@ -222,82 +227,82 @@ class TestActivity(HubTest):
         assert response.status_code == 302
 
     def test_xss_addon(self):
-        self.addon.name = ("<script>alert('Buy more Diet Mountain Dew.')"
-                           '</script>')
+        self.addon.name = "<script>alert('Buy more Diet Mountain Dew.')</script>"
         self.addon.save()
         self.log_creates(1)
         doc = self.get_pq()
         assert len(doc('.item')) == 1
-        assert '<script>' not in six.text_type(doc), 'XSS FTL'
-        assert '&lt;script&gt;' in six.text_type(doc), 'XSS FTL'
+        assert '<script>' not in str(doc), 'XSS FTL'
+        assert '&lt;script&gt;' in str(doc), 'XSS FTL'
 
     def test_xss_unlisted_addon(self):
-        self.addon.name = ("<script>alert('Buy more Diet Mountain Dew.')"
-                           '</script>')
+        self.addon.name = "<script>alert('Buy more Diet Mountain Dew.')</script>"
         self.addon.save()
-        self.make_addon_unlisted(self.addon)
+        self.change_channel_for_addon(self.addon, amo.CHANNEL_UNLISTED)
         self.log_creates(1)
         doc = self.get_pq()
         assert len(doc('.item')) == 2
-        assert '<script>' not in six.text_type(doc), 'XSS FTL'
-        assert '&lt;script&gt;' in six.text_type(doc), 'XSS FTL'
+        assert '<script>' not in str(doc), 'XSS FTL'
+        assert '&lt;script&gt;' in str(doc), 'XSS FTL'
 
     def test_xss_collections(self):
         self.log_collection(1, "<script>alert('v1@gra for u')</script>")
         doc = self.get_pq()
         assert len(doc('.item')) == 1
-        assert '<script>' not in six.text_type(doc), 'XSS FTL'
-        assert '&lt;script&gt;' in six.text_type(doc), 'XSS FTL'
+        assert '<script>' not in str(doc), 'XSS FTL'
+        assert '&lt;script&gt;' in str(doc), 'XSS FTL'
 
     def test_xss_collections_unlisted_addon(self):
-        self.make_addon_unlisted(self.addon)
+        self.change_channel_for_addon(self.addon, amo.CHANNEL_UNLISTED)
         self.log_collection(1, "<script>alert('v1@gra for u')</script>")
         doc = self.get_pq()
         assert len(doc('.item')) == 2
-        assert '<script>' not in six.text_type(doc), 'XSS FTL'
-        assert '&lt;script&gt;' in six.text_type(doc), 'XSS FTL'
+        assert '<script>' not in str(doc), 'XSS FTL'
+        assert '&lt;script&gt;' in str(doc), 'XSS FTL'
 
     def test_xss_tags(self):
         self.log_tag(1, "<script src='x.js'>")
         doc = self.get_pq()
         assert len(doc('.item')) == 1
-        assert '<script' not in six.text_type(doc('.item')), 'XSS FTL'
-        assert '&lt;script' in six.text_type(doc('.item')), 'XSS FTL'
+        assert '<script' not in str(doc('.item')), 'XSS FTL'
+        assert '&lt;script' in str(doc('.item')), 'XSS FTL'
 
     def test_xss_tags_unlisted_addon(self):
-        self.make_addon_unlisted(self.addon)
+        self.change_channel_for_addon(self.addon, amo.CHANNEL_UNLISTED)
         self.log_tag(1, "<script src='x.js'>")
         doc = self.get_pq()
         assert len(doc('.item')) == 2
-        assert '<script' not in six.text_type(doc('.item')), 'XSS FTL'
-        assert '&lt;script' in six.text_type(doc('.item')), 'XSS FTL'
+        assert '<script' not in str(doc('.item')), 'XSS FTL'
+        assert '&lt;script' in str(doc('.item')), 'XSS FTL'
 
     def test_xss_versions(self):
         self.log_updates(1, "<script src='x.js'>")
         doc = self.get_pq()
         assert len(doc('.item')) == 1
-        assert '<script' not in six.text_type(doc('.item')), 'XSS FTL'
-        assert '&lt;script' in six.text_type(doc('.item')), 'XSS FTL'
+        assert '<script' not in str(doc('.item')), 'XSS FTL'
+        assert '&lt;script' in str(doc('.item')), 'XSS FTL'
 
     def test_xss_versions_unlisted_addon(self):
-        self.make_addon_unlisted(self.addon)
+        self.change_channel_for_addon(self.addon, amo.CHANNEL_UNLISTED)
         self.log_updates(1, "<script src='x.js'>")
         doc = self.get_pq()
         assert len(doc('.item')) == 2
-        assert '<script' not in six.text_type(doc('.item')), 'XSS FTL'
-        assert '&lt;script' in six.text_type(doc('.item')), 'XSS FTL'
+        assert '<script' not in str(doc('.item')), 'XSS FTL'
+        assert '&lt;script' in str(doc('.item')), 'XSS FTL'
 
     def test_hidden(self):
         version = Version.objects.create(addon=self.addon)
-        ActivityLog.create(amo.LOG.COMMENT_VERSION, self.addon, version)
+        ActivityLog.objects.create(
+            amo.LOG.REVIEWER_PRIVATE_COMMENT, self.addon, version
+        )
         res = self.get_response(addon=self.addon.id)
         key = RssKey.objects.get()
         res = self.get_response(privaterss=key.key)
-        assert "<title>Comment on" not in res.content
+        assert b'<title>Comment on' not in res.content
 
     def test_no_guid(self):
         self.log_creates(1)
         self.get_response(addon=self.addon.id)
         key = RssKey.objects.get()
         res = self.get_response(privaterss=key.key)
-        assert "<guid>" not in res.content
+        assert b'<guid>' not in res.content

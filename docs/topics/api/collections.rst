@@ -4,9 +4,10 @@ Collections
 
 .. note::
 
-    These APIs are experimental and are currently being worked on. Endpoints
-    may change without warning. Consider the :ref:`v3 API<api-stable-v3>`
-    if you need stability. The only authentication method available at
+    These APIs are not frozen and can change at any time without warning.
+    See :ref:`the API versions available<api-versions-list>` for alternatives
+    if you need stability.
+    The only authentication method available at
     the moment is :ref:`the internal one<api-auth-internal>`.
 
 The following API endpoints cover user created collections.
@@ -25,7 +26,7 @@ This endpoint allows you to list all collections authored by the specified user.
 The results are sorted by the most recently updated collection first.
 
 
-.. http:get:: /api/v4/accounts/account/(int:user_id|string:username)/collections/
+.. http:get:: /api/v5/accounts/account/(int:user_id|string:username)/collections/
 
     :>json int count: The number of results for this query.
     :>json string next: The URL of the next page of results.
@@ -46,7 +47,7 @@ If you have ``Admin:Curation`` permission you can see any collection belonging
 to the ``mozilla`` user.
 
 
-.. http:get:: /api/v4/accounts/account/(int:user_id|string:username)/collections/(string:collection_slug)/
+.. http:get:: /api/v5/accounts/account/(int:user_id|string:username)/collections/(string:collection_slug)/
 
     .. _collection-detail-object:
 
@@ -57,9 +58,9 @@ to the ``mozilla`` user.
     :>json string author.url: The link to the profile page for of the author.
     :>json string author.username: The username of the author.
     :>json string default_locale: The default locale of the description and name fields. (See :ref:`translated fields <api-overview-translations>`).
-    :>json string|object|null description: The description the author added to the collection. (See :ref:`translated fields <api-overview-translations>`).
+    :>json object|null description: The description the author added to the collection. (See :ref:`translated fields <api-overview-translations>`).
     :>json string modified: The date the collection was last updated.
-    :>json string|object name: The name of the collection. (See :ref:`translated fields <api-overview-translations>`).
+    :>json object name: The name of the collection. (See :ref:`translated fields <api-overview-translations>`).
     :>json boolean public: Whether the collection is `listed` - publicly viewable.
     :>json string slug: The name used in the URL.
     :>json string url: The (absolute) collection detail URL.
@@ -72,7 +73,7 @@ Filtering is as per :ref:`collection addon list endpoint<collection-addon-filter
 Additional add-ons can be returned from the :ref:`Collection Add-on list endpoint<collection-addon-list>`.
 
 
-.. http:get:: /api/v4/accounts/account/(int:user_id|string:username)/collections/(string:collection_slug)/?with_addons
+.. http:get:: /api/v5/accounts/account/(int:user_id|string:username)/collections/(string:collection_slug)/?with_addons
 
     .. _collection-detail-object-with-addons:
 
@@ -96,13 +97,13 @@ Create
 This endpoint allows a collection to be created under your account.  Any fields
 in the :ref:`collection <collection-detail-object>` but not listed below are not settable and will be ignored in the request.
 
-.. http:post:: /api/v4/accounts/account/(int:user_id|string:username)/collections/
+.. http:post:: /api/v5/accounts/account/(int:user_id|string:username)/collections/
 
     .. _collection-create-request:
 
     :<json string|null default_locale: The default locale of the description and name fields. Defaults to `en-US`. (See :ref:`translated fields <api-overview-translations>`).
-    :<json string|object|null description: The description the author added to the collection. (See :ref:`translated fields <api-overview-translations>`).
-    :<json string|object name: The name of the collection. (required) (See :ref:`translated fields <api-overview-translations>`).
+    :<json object|null description: The description the author added to the collection. (See :ref:`translated fields <api-overview-translations>`).
+    :<json object name: The name of the collection. (required) (See :ref:`translated fields <api-overview-translations>`).
     :<json boolean public: Whether the collection is `listed` - publicly viewable.  Defaults to `True`.
     :<json string slug: The name used in the URL (required).
 
@@ -122,13 +123,13 @@ Edit
 This endpoint allows some of the details for a collection to be updated.  Any fields
 in the :ref:`collection <collection-detail-object>` but not listed below are not editable and will be ignored in the patch request.
 
-.. http:patch:: /api/v4/accounts/account/(int:user_id|string:username)/collections/(string:collection_slug)/
+.. http:patch:: /api/v5/accounts/account/(int:user_id|string:username)/collections/(string:collection_slug)/
 
     .. _collection-edit-request:
 
     :<json string default_locale: The default locale of the description and name fields. (See :ref:`translated fields <api-overview-translations>`).
-    :<json string|object|null description: The description the author added to the collection. (See :ref:`translated fields <api-overview-translations>`).
-    :<json string|object name: The name of the collection. (See :ref:`translated fields <api-overview-translations>`).
+    :<json object|null description: The description the author added to the collection. (See :ref:`translated fields <api-overview-translations>`).
+    :<json object name: The name of the collection. (See :ref:`translated fields <api-overview-translations>`).
     :<json boolean public: Whether the collection is `listed` - publicly viewable.
     :<json string slug: The name used in the URL.
 
@@ -144,7 +145,7 @@ Delete
 
 This endpoint allows the collection to be deleted.
 
-.. http:delete:: /api/v4/accounts/account/(int:user_id|string:username)/collections/(string:collection_slug)/
+.. http:delete:: /api/v5/accounts/account/(int:user_id|string:username)/collections/(string:collection_slug)/
 
 
 
@@ -156,7 +157,7 @@ Collection Add-ons List
 
 This endpoint lists the add-ons in a collection, together with collector's notes.
 
-.. http:get:: /api/v4/accounts/account/(int:user_id|string:username)/collections/(string:collection_slug)/addons/
+.. http:get:: /api/v5/accounts/account/(int:user_id|string:username)/collections/(string:collection_slug)/addons/
 
     :query string filter: The :ref:`filter <collection-addon-filtering-param>` to apply.
     :query string sort: The sort parameter. The available parameters are documented in the :ref:`table below <collection-addon-list-sort>`.
@@ -208,12 +209,12 @@ Collection Add-ons Detail
 
 This endpoint gets details of a single add-on in a collection, together with collector's notes.
 
-.. http:get:: /api/v4/accounts/account/(int:user_id|string:username)/collections/(string:collection_slug)/addons/(int:addon_id|string:slug)/
+.. http:get:: /api/v5/accounts/account/(int:user_id|string:username)/collections/(string:collection_slug)/addons/(int:addon_id|string:slug)/
 
     .. _collection-addon-detail-object:
 
     :>json object addon: The :ref:`add-on <addon-detail-object>` for this item.
-    :>json string|object|null notes: The collectors notes for this item. (See :ref:`translated fields <api-overview-translations>`).
+    :>json object|null notes: The collectors notes for this item. (See :ref:`translated fields <api-overview-translations>`).
 
 
 -------------------------
@@ -227,10 +228,10 @@ Collection Add-ons Create
 
 This endpoint allows a single add-on to be added to a collection, optionally with collector's notes.
 
-.. http:post:: /api/v4/accounts/account/(int:user_id|string:username)/collections/(string:collection_slug)/addons/
+.. http:post:: /api/v5/accounts/account/(int:user_id|string:username)/collections/(string:collection_slug)/addons/
 
     :<json string addon: The add-on id or slug to be added (required).
-    :<json string|object|null notes: The collectors notes for this item. (See :ref:`translated fields <api-overview-translations>`).
+    :<json object|null notes: The collectors notes for this item. (See :ref:`translated fields <api-overview-translations>`).
 
 
 -----------------------
@@ -248,9 +249,9 @@ Collection Add-ons Edit
 
 This endpoint allows the collector's notes for single add-on to be updated.
 
-.. http:patch:: /api/v4/accounts/account/(int:user_id|string:username)/collections/(string:collection_slug)/addons/(int:addon_id|string:slug)/
+.. http:patch:: /api/v5/accounts/account/(int:user_id|string:username)/collections/(string:collection_slug)/addons/(int:addon_id|string:slug)/
 
-    :<json string|object|null notes: The collectors notes for this item. (See :ref:`translated fields <api-overview-translations>`).
+    :<json object|null notes: The collectors notes for this item. (See :ref:`translated fields <api-overview-translations>`).
 
 
 -------------------------
@@ -268,4 +269,4 @@ Collection Add-ons Delete
 
 This endpoint allows a single add-on to be removed from a collection.
 
-.. http:delete:: /api/v4/accounts/account/(int:user_id|string:username)/collections/(string:collection_slug)/addons/(int:addon_id|string:slug)/
+.. http:delete:: /api/v5/accounts/account/(int:user_id|string:username)/collections/(string:collection_slug)/addons/(int:addon_id|string:slug)/

@@ -1,388 +1,401 @@
-# -*- coding: utf-8 -*-
-import json
-import mock
-import os
-import pytest
-import tempfile
-import zipfile
+from datetime import datetime, timedelta
+from unittest import mock
 
-from django.conf import settings
 from django.forms import ValidationError
-from django.utils.encoding import force_text
 
+import pytest
+import time_machine
 from waffle.testutils import override_switch
 
 from olympia import amo
-from olympia.addons.models import Category
-from olympia.addons.utils import (
-    build_static_theme_xpi_from_lwt, build_webext_dictionary_from_legacy,
-    get_addon_recommendations, get_addon_recommendations_invalid,
-    get_creatured_ids, get_featured_ids, is_outcome_recommended,
-    TAAR_LITE_FALLBACK_REASON_EMPTY, TAAR_LITE_FALLBACK_REASON_TIMEOUT,
-    TAAR_LITE_FALLBACKS, TAAR_LITE_OUTCOME_CURATED,
-    TAAR_LITE_OUTCOME_REAL_FAIL, TAAR_LITE_OUTCOME_REAL_SUCCESS,
-    TAAR_LITE_FALLBACK_REASON_INVALID,
-    verify_mozilla_trademark)
-from olympia.amo.tests import (
-    AMOPaths, TestCase, addon_factory, collection_factory, user_factory)
-from olympia.bandwagon.models import FeaturedCollection
-from olympia.constants.categories import CATEGORIES_BY_ID
+from olympia.activity.models import ActivityLog
+from olympia.addons.models import AddonApprovalsCounter
+from olympia.amo.tests import TestCase, addon_factory, user_factory
+from olympia.users.models import Group, GroupUser
+
+from ..utils import (
+    RECOMMENDATIONS,
+    DeleteTokenSigner,
+    get_addon_recommendations,
+    get_filtered_fallbacks,
+    request_content_review,
+    trigger_content_review,
+    validate_addon_name,
+    validate_addon_summary,
+)
 
 
 @pytest.mark.django_db
-@pytest.mark.parametrize('name, allowed, email, content_optmzn_waffle', (
-    # First with the content optimization waffle off:
-    # Regular name, obviously always allowed
-    ('Fancy new Add-on', True, 'foo@bar.com', False),
-    # We allow the 'for ...' postfix to be used
-    ('Fancy new Add-on for Firefox', True, 'foo@bar.com', False),
-    ('Fancy new Add-on for Mozilla', True, 'foo@bar.com', False),
-    # But only the postfix
-    ('Fancy new Add-on for Firefox Browser', False, 'foo@bar.com', False),
-    ('For Firefox fancy new add-on', False, 'foo@bar.com', False),
-    # But users with @mozilla.com or @mozilla.org email addresses
-    # are allowed
-    ('Firefox makes everything better', False, 'bar@baz.com', False),
-    ('Firefox makes everything better', True, 'foo@mozilla.com', False),
-    ('Firefox makes everything better', True, 'foo@mozilla.org', False),
-    ('Mozilla makes everything better', True, 'foo@mozilla.com', False),
-    ('Mozilla makes everything better', True, 'foo@mozilla.org', False),
-    # A few more test-cases...
-    ('Firefox add-on for Firefox', False, 'foo@bar.com', False),
-    ('Firefox add-on for Firefox', True, 'foo@mozilla.com', False),
-    ('Foobarfor Firefox', False, 'foo@bar.com', False),
-    ('Better Privacy for Firefox!', True, 'foo@bar.com', False),
-    ('Firefox awesome for Mozilla', False, 'foo@bar.com', False),
-    ('Firefox awesome for Mozilla', True, 'foo@mozilla.org', False),
-
-    # And with the content optimization waffle onL
-    # Regular name, obviously always allowed
-    ('Fancy new Add-on', True, 'foo@bar.com', True),
-    # We don't allow the 'for ...' postfix to be used anymore
-    ('Fancy new Add-on for Firefox', False, 'foo@bar.com', True),
-    ('Fancy new Add-on for Mozilla', False, 'foo@bar.com', True),
-    # Or the postfix
-    ('Fancy new Add-on for Firefox Browser', False, 'foo@bar.com', True),
-    ('For Firefox fancy new add-on', False, 'foo@bar.com', True),
-    # But users with @mozilla.com or @mozilla.org email addresses
-    # are allowed
-    ('Firefox makes everything better', False, 'bar@baz.com', True),
-    ('Firefox makes everything better', True, 'foo@mozilla.com', True),
-    ('Firefox makes everything better', True, 'foo@mozilla.org', True),
-    ('Mozilla makes everything better', True, 'foo@mozilla.com', True),
-    ('Mozilla makes everything better', True, 'foo@mozilla.org', True),
-    ('Fancy new Add-on for Firefox', True, 'foo@mozilla.org', True),
-    ('Fancy new Add-on for Mozilla', True, 'foo@mozilla.org', True),
-    # A few more test-cases...
-    ('Firefox add-on for Firefox', False, 'foo@bar.com', True),
-    ('Firefox add-on for Firefox', True, 'foo@mozilla.com', True),
-    ('Foobarfor Firefox', False, 'foo@bar.com', True),
-    ('Better Privacy for Firefox!', False, 'foo@bar.com', True),
-    ('Firefox awesome for Mozilla', False, 'foo@bar.com', True),
-    ('Firefox awesome for Mozilla', True, 'foo@mozilla.org', True),
-))
-def test_verify_mozilla_trademark(name, allowed, email, content_optmzn_waffle):
-    user = user_factory(email=email)
-
-    with override_switch('content-optimization', active=content_optmzn_waffle):
-        if not allowed:
-            with pytest.raises(ValidationError) as exc:
-                verify_mozilla_trademark(name, user)
-            assert exc.value.message == (
-                'Add-on names cannot contain the Mozilla or Firefox '
-                'trademarks.'
-            )
-        else:
-            verify_mozilla_trademark(name, user)
+@pytest.mark.parametrize(
+    'name',
+    (
+        'Fancy new Add-on',
+        # We allow the 'for ...' postfix to be used
+        'Fancy new Add-on for Firefox',
+        'Fancy new Add-on for Mozilla',
+        'Better Privacy for Firefox!',
+        # Right on the limit of what's acceptable for number of homoglyphs
+        'BIlIbIlI Helper: BIlIbIlI.com AuxIlIary',
+    ),
+)
+def test_validate_addon_name_allowed(name):
+    user = user_factory()
+    validate_addon_name(name, user=user)
 
 
-class TestGetFeaturedIds(TestCase):
-    fixtures = ['addons/featured', 'bandwagon/featured_collections',
-                'base/addon_3615', 'base/collections', 'base/featured',
-                'base/users']
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'name',
+    (
+        'Fancy new Add-on for Firefox Browser',
+        'For Firefox shiny new add-on',
+        'Firefox makes everything better',
+        'Mozilla makes everything better',
+        'Firefox add-on for Firefox',
+        'Foobarfor Firefox',
+        'F i r e f o x',
+        'F î r \u0435fox',
+        'FiRѐF0 x',
+        'F i r \u0435 f o x',
+        'F\u2800i r e f o x',
+        'F\u2800 i r \u0435 f o x',
+        'Fïrefox is great',
+        'Foobarfor Firefox!',
+        'Mozilla',
+        'm0z1IIa',
+        'ꮇozi𝈪𝈪a',
+        'Moziꙇꙇa',
+        'Firefox awesome for Mozilla',
+        'ƒireføx',
+        'ϝirefox',
+        'FIRꭼfox',
+        '𝈓ꞁR⋿FOX',
+        'flref0x',
+    ),
+)
+def test_validate_addon_name_disallowed_without_permission(name):
+    normal_user = user_factory()
+    special_user = user_factory()
+    group = Group.objects.create(name=name, rules='Trademark:Bypass')
+    GroupUser.objects.create(group=group, user=special_user)
 
-    no_locale = (1001, 1003, 2464, 7661, 15679)
-    en_us_locale = (3481,)
-    all_locales = no_locale + en_us_locale
-    no_locale_type_one = (1001, 1003, 2464, 7661)
+    # Validates with the permission.
+    validate_addon_name(name, user=special_user)
 
-    def setUp(self):
-        super(TestGetFeaturedIds, self).setUp()
-
-    def test_by_app(self):
-        assert set(get_featured_ids(amo.FIREFOX)) == (
-            set(self.all_locales))
-
-    def test_by_type(self):
-        assert set(get_featured_ids(amo.FIREFOX, 'xx', 1)) == (
-            set(self.no_locale_type_one))
-
-    def test_by_locale(self):
-        assert set(get_featured_ids(amo.FIREFOX)) == (
-            set(self.all_locales))
-        assert set(get_featured_ids(amo.FIREFOX, 'xx')) == (
-            set(self.no_locale))
-        assert set(get_featured_ids(amo.FIREFOX, 'en-US')) == (
-            set(self.no_locale + self.en_us_locale))
-
-    def test_locale_shuffle(self):
-        # Make sure the locale-specific add-ons are at the front.
-        ids = get_featured_ids(amo.FIREFOX, 'en-US')
-        assert (ids[0],) == self.en_us_locale
+    # Raises an error without.
+    with pytest.raises(ValidationError) as exc:
+        validate_addon_name(name, user=normal_user)
+    assert exc.value.message == (
+        'Add-on names cannot contain the Mozilla or Firefox trademarks.'
+    )
 
 
-class TestGetCreaturedIds(TestCase):
-    fixtures = ['addons/featured', 'bandwagon/featured_collections',
-                'base/addon_3615', 'base/collections', 'base/featured',
-                'base/users']
-    category_id = 22
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'name',
+    (
+        'l' * 17,  # Too many homoglyphs
+        'l' * 50,  # Way too many homoglyphs!
+    ),
+)
+def test_validate_addon_name_disallowed_no_matter_what(name):
+    normal_user = user_factory()
+    special_user = user_factory()
+    group = Group.objects.create(rules='Trademark:Bypass')
+    GroupUser.objects.create(group=group, user=special_user)
 
-    no_locale = (1001,)
-    en_us_locale = (3481,)
+    # Raises an error without the permission...
+    with pytest.raises(ValidationError) as exc:
+        validate_addon_name(name, user=normal_user)
+    assert exc.value.message == 'This name cannot be used.'
 
-    def setUp(self):
-        super(TestGetCreaturedIds, self).setUp()
+    # ... and also with it.
+    with pytest.raises(ValidationError) as exc2:
+        validate_addon_name(name, user=special_user)
+    assert exc2.value.message == 'This name cannot be used.'
 
-    def test_by_category_static(self):
-        category = CATEGORIES_BY_ID[self.category_id]
-        assert set(get_creatured_ids(category, None)) == (
-            set(self.no_locale))
 
-    def test_by_category_dynamic(self):
-        category = Category.objects.get(pk=self.category_id)
-        assert set(get_creatured_ids(category, None)) == (
-            set(self.no_locale))
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'summary',
+    (
+        'I' * 17,  # Too many homoglyphs
+        'I' * 50,  # Way too many homoglyphs!
+    ),
+)
+def test_validate_addon_summary_disallowed_no_matter_what(summary):
+    normal_user = user_factory()
+    special_user = user_factory()
+    group = Group.objects.create(rules='Trademark:Bypass')
+    GroupUser.objects.create(group=group, user=special_user)
 
-    def test_by_category_id(self):
-        assert set(get_creatured_ids(self.category_id, None)) == (
-            set(self.no_locale))
+    # Raises an error without the permission...
+    with pytest.raises(ValidationError) as exc:
+        validate_addon_summary(summary, user=normal_user)
+    assert exc.value.message == 'This add-on summary or description cannot be used.'
 
-    def test_by_category_app(self):
-        # Add an addon to the same category, but in a featured collection
-        # for a different app: it should not be returned.
-        extra_addon = addon_factory(
-            category=Category.objects.get(pk=self.category_id))
-        collection = collection_factory()
-        collection.add_addon(extra_addon)
-        FeaturedCollection.objects.create(
-            application=amo.ANDROID.id, collection=collection)
-
-        assert set(get_creatured_ids(self.category_id, None)) == (
-            set(self.no_locale))
-
-    def test_by_locale(self):
-        assert set(get_creatured_ids(self.category_id, 'en-US')) == (
-            set(self.no_locale + self.en_us_locale))
-
-    def test_by_category_app_and_locale(self):
-        # Add an addon to the same category and locale, but in a featured
-        # collection for a different app: it should not be returned.
-        extra_addon = addon_factory(
-            category=Category.objects.get(pk=self.category_id))
-        collection = collection_factory()
-        collection.add_addon(extra_addon)
-        FeaturedCollection.objects.create(
-            application=amo.ANDROID.id, collection=collection,
-            locale='en-US')
-
-        assert set(get_creatured_ids(self.category_id, 'en-US')) == (
-            set(self.no_locale + self.en_us_locale))
-
-    def test_shuffle(self):
-        ids = get_creatured_ids(self.category_id, 'en-US')
-        assert (ids[0],) == self.en_us_locale
+    # ... and also with it.
+    with pytest.raises(ValidationError) as exc2:
+        validate_addon_summary(summary, user=special_user)
+    assert exc2.value.message == 'This add-on summary or description cannot be used.'
 
 
 class TestGetAddonRecommendations(TestCase):
     def setUp(self):
-        patcher = mock.patch(
-            'olympia.addons.utils.call_recommendation_server')
-        self.recommendation_server_mock = patcher.start()
-        self.addCleanup(patcher.stop)
         self.a101 = addon_factory(id=101, guid='101@mozilla')
         addon_factory(id=102, guid='102@mozilla')
         addon_factory(id=103, guid='103@mozilla')
         addon_factory(id=104, guid='104@mozilla')
 
         self.recommendation_guids = [
-            '101@mozilla', '102@mozilla', '103@mozilla', '104@mozilla'
+            '101@mozilla',
+            '102@mozilla',
+            '103@mozilla',
+            '104@mozilla',
         ]
-        self.recommendation_server_mock.return_value = (
-            self.recommendation_guids)
-
-    def test_recommended(self):
-        recommendations, outcome, reason = get_addon_recommendations(
-            'a@b', True)
-        assert recommendations == self.recommendation_guids
-        assert outcome == TAAR_LITE_OUTCOME_REAL_SUCCESS
-        assert reason is None
-        self.recommendation_server_mock.assert_called_with(
-            settings.TAAR_LITE_RECOMMENDATION_ENGINE_URL, 'a@b', {})
-
-    def test_recommended_no_results(self):
-        self.recommendation_server_mock.return_value = []
-        recommendations, outcome, reason = get_addon_recommendations(
-            'a@b', True)
-        assert recommendations == TAAR_LITE_FALLBACKS
-        assert outcome == TAAR_LITE_OUTCOME_REAL_FAIL
-        assert reason is TAAR_LITE_FALLBACK_REASON_EMPTY
-        self.recommendation_server_mock.assert_called_with(
-            settings.TAAR_LITE_RECOMMENDATION_ENGINE_URL, 'a@b', {})
-
-    def test_recommended_timeout(self):
-        self.recommendation_server_mock.return_value = None
-        recommendations, outcome, reason = get_addon_recommendations(
-            'a@b', True)
-        assert recommendations == TAAR_LITE_FALLBACKS
-        assert outcome == TAAR_LITE_OUTCOME_REAL_FAIL
-        assert reason is TAAR_LITE_FALLBACK_REASON_TIMEOUT
-        self.recommendation_server_mock.assert_called_with(
-            settings.TAAR_LITE_RECOMMENDATION_ENGINE_URL, 'a@b', {})
 
     def test_not_recommended(self):
-        recommendations, outcome, reason = get_addon_recommendations(
-            'a@b', False)
-        assert not self.recommendation_server_mock.called
-        assert recommendations == TAAR_LITE_FALLBACKS
-        assert outcome == TAAR_LITE_OUTCOME_CURATED
-        assert reason is None
+        recommendations = get_addon_recommendations('a@b')
+        # It returns the first four fallback recommendations
+        assert recommendations == RECOMMENDATIONS[:4]
 
-    def test_invalid_fallback(self):
-        recommendations, outcome, reason = get_addon_recommendations_invalid()
-        assert not self.recommendation_server_mock.called
-        assert recommendations == TAAR_LITE_FALLBACKS
-        assert outcome == TAAR_LITE_OUTCOME_REAL_FAIL
-        assert reason == TAAR_LITE_FALLBACK_REASON_INVALID
-
-    def test_is_outcome_recommended(self):
-        assert is_outcome_recommended(TAAR_LITE_OUTCOME_REAL_SUCCESS)
-        assert not is_outcome_recommended(TAAR_LITE_OUTCOME_REAL_FAIL)
-        assert not is_outcome_recommended(TAAR_LITE_OUTCOME_CURATED)
-        assert not self.recommendation_server_mock.called
+    def test_get_filtered_fallbacks(self):
+        # Fallback filters out the current guid if it exists in RECOMMENDATIONS
+        recommendations = get_filtered_fallbacks(RECOMMENDATIONS[2])
+        assert RECOMMENDATIONS[2] not in recommendations
+        assert len(recommendations) == 4
 
 
-class TestBuildStaticThemeXpiFromLwt(TestCase):
-    def setUp(self):
-        self.background_png = os.path.join(
-            settings.ROOT, 'src/olympia/versions/tests/static_themes/weta.png')
+def test_delete_token_signer():
+    signer = DeleteTokenSigner()
+    addon_id = 1234
+    with time_machine.travel(datetime.now(), tick=False) as frozen_time:
+        token = signer.generate(addon_id)
+        # generated token is valid
+        assert signer.validate(token, addon_id)
+        # generating with the same addon_id at the same time returns the same value
+        assert token == signer.generate(addon_id)
+        # generating with a different addon_id at the same time returns different value
+        assert token != signer.generate(addon_id + 1)
+        # and the addon_id must match for it to be a valid token
+        assert not signer.validate(token, addon_id + 1)
 
-    def test_lwt(self):
-        # Create our persona.
-        lwt = addon_factory(
-            type=amo.ADDON_PERSONA, persona_id=0, name=u'Amáze',
-            description=u'It does all d£ things')
-        lwt.persona.accentcolor, lwt.persona.textcolor = '123', '456789'
-        # Give it a background header file.
-        lwt.persona.header = 'weta.png'
-        lwt.persona.header_path = self.background_png  # It's a cached_property
+        # token is valid for 60 seconds so after 59 is still valid
+        frozen_time.shift(timedelta(seconds=59))
+        assert signer.validate(token, addon_id)
 
-        static_xpi = tempfile.NamedTemporaryFile(suffix='.xpi').name
-        build_static_theme_xpi_from_lwt(lwt, static_xpi)
-
-        with zipfile.ZipFile(static_xpi, 'r', zipfile.ZIP_DEFLATED) as xpi:
-            manifest = force_text(xpi.read('manifest.json'))
-            manifest_json = json.loads(manifest)
-            assert manifest_json['name'] == u'Amáze'
-            assert manifest_json['description'] == u'It does all d£ things'
-            assert manifest_json['theme']['images']['headerURL'] == (
-                u'weta.png')
-            assert manifest_json['theme']['colors']['accentcolor'] == (
-                u'#123')
-            assert manifest_json['theme']['colors']['textcolor'] == (
-                u'#456789')
-            assert (xpi.read('weta.png') ==
-                    open(self.background_png, 'rb').read())
-
-    def test_lwt_missing_info(self):
-        # Create our persona.
-        lwt = addon_factory(
-            type=amo.ADDON_PERSONA, persona_id=0)
-        lwt.update(name='')
-        # Give it a background header file with multiple dots.
-        lwt.persona.header = 'weta......png'
-        lwt.persona.header_path = self.background_png  # It's a cached_property
-
-        static_xpi = tempfile.NamedTemporaryFile(suffix='.xpi').name
-        build_static_theme_xpi_from_lwt(lwt, static_xpi)
-
-        with zipfile.ZipFile(static_xpi, 'r', zipfile.ZIP_DEFLATED) as xpi:
-            manifest = force_text(xpi.read('manifest.json'))
-            manifest_json = json.loads(manifest)
-
-            assert manifest_json['name'] == lwt.slug
-            assert 'description' not in manifest_json.keys()
-            assert manifest_json['theme']['images']['headerURL'] == (
-                u'weta.png')
-            assert manifest_json['theme']['colors']['accentcolor'] == (
-                amo.THEME_ACCENTCOLOR_DEFAULT)
-            assert manifest_json['theme']['colors']['textcolor'] == (
-                u'#000')
-            assert (xpi.read('weta.png') ==
-                    open(self.background_png, 'rb').read())
+        # but not after 60 seconds
+        frozen_time.shift(timedelta(seconds=2))
+        assert not signer.validate(token, addon_id)
 
 
-class TestBuildWebextDictionaryFromLegacy(AMOPaths, TestCase):
-    def setUp(self):
-        self.addon = addon_factory(
-            target_locale='ar', type=amo.ADDON_DICT,
-            version_kw={'version': '1.0'},
-            file_kw={'is_webextension': False})
-        self.xpi_copy_over(
-            self.addon.current_version.all_files[0], 'dictionary-test.xpi')
+@pytest.mark.django_db
+def test_trigger_content_review():
+    addon = addon_factory(status=amo.STATUS_REJECTED)
+    activity_log = ActivityLog.objects.create(
+        amo.LOG.EDIT_ADDON_PROPERTY, user=user_factory()
+    )
+    AddonApprovalsCounter.approve_content_for_addon(addon)
+    assert (
+        addon.addonapprovalscounter.content_review_status
+        == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PASS
+    )
 
-    def check_xpi_file_contents(self, xpi_file_path, expected_version):
-        with zipfile.ZipFile(xpi_file_path, 'r', zipfile.ZIP_DEFLATED) as xpi:
-            # Check that manifest is present, contains proper version and
-            # dictionaries properties.
-            manifest = force_text(xpi.read('manifest.json'))
-            manifest_json = json.loads(manifest)
-            assert (
-                manifest_json['browser_specific_settings']['gecko']['id'] ==
-                self.addon.guid)
-            assert manifest_json['version'] == expected_version
-            expected_dict_obj = {'ar': 'dictionaries/ar.dic'}
-            assert manifest_json['dictionaries'] == expected_dict_obj
+    with (
+        override_switch('content-review-in-cinder', active=True),
+        mock.patch('olympia.amo.celery.AMOTask.apply_async') as mock_apply_async,
+    ):
+        trigger_content_review(addon, activity_log)
 
-            # Check that we haven't included any useless files.
-            expected_files = sorted([
-                'dictionaries/',
-                'dictionaries/ar.aff',
-                'dictionaries/ar.dic',
-                'dictionaries/license.txt',
-                'manifest.json'
-            ])
-            assert sorted([x.filename for x in xpi.filelist]) == expected_files
+    assert (
+        addon.addonapprovalscounter.reload().content_review_status
+        == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.CHANGED
+    )
+    # And we should have triggered the content review task
+    mock_apply_async.assert_called_once()
+    assert mock_apply_async.call_args.args == ((), {'activity_log_pk': activity_log.pk})
 
-    def test_basic(self):
-        with tempfile.NamedTemporaryFile(suffix='.xpi') as destination:
-            build_webext_dictionary_from_legacy(self.addon, destination)
-            self.check_xpi_file_contents(destination, '1.0.1webext')
 
-    def test_current_not_valid_raises(self):
-        mod = 'olympia.files.utils.SafeZip.initialize_and_validate'
-        with mock.patch(mod) as is_valid:
-            is_valid.return_value = False
-            with tempfile.NamedTemporaryFile(suffix='.xpi') as destination:
-                with self.assertRaises(ValidationError):
-                    build_webext_dictionary_from_legacy(
-                        self.addon, destination)
+@pytest.mark.django_db
+def test_trigger_content_review_not_triggered_for_non_content_review_types():
+    addon = addon_factory(type=amo.ADDON_STATICTHEME, status=amo.STATUS_REJECTED)
+    activity_log = ActivityLog.objects.create(
+        amo.LOG.EDIT_ADDON_PROPERTY, user=user_factory()
+    )
+    AddonApprovalsCounter.approve_content_for_addon(addon)
+    assert (
+        addon.addonapprovalscounter.content_review_status
+        == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PASS
+    )
 
-    def test_addon_has_no_target_locale(self):
-        self.addon.update(target_locale=None)
-        with tempfile.NamedTemporaryFile(suffix='.xpi') as destination:
-            build_webext_dictionary_from_legacy(self.addon, destination)
-            self.check_xpi_file_contents(destination, '1.0.1webext')
-        self.addon.reload()
+    with (
+        override_switch('content-review-in-cinder', active=True),
+        mock.patch('olympia.amo.celery.AMOTask.apply_async') as mock_apply_async,
+    ):
+        trigger_content_review(addon, activity_log)
 
-    def test_invalid_dictionary_path_raises(self):
-        self.xpi_copy_over(
-            self.addon.current_version.all_files[0], 'extension.xpi')
-        with tempfile.NamedTemporaryFile(suffix='.xpi') as destination:
-            with self.assertRaises(ValidationError):
-                build_webext_dictionary_from_legacy(self.addon, destination)
+    assert (
+        addon.addonapprovalscounter.reload().content_review_status
+        == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.CHANGED
+    )
+    # We should not have triggered the content review task though
+    mock_apply_async.assert_not_called()
 
-    def test_version_number_typefix(self):
-        self.addon.current_version.update(version='1.1-typefix')
-        with tempfile.NamedTemporaryFile(suffix='.xpi') as destination:
-            build_webext_dictionary_from_legacy(self.addon, destination)
-            self.check_xpi_file_contents(destination, '1.2webext')
+
+@pytest.mark.django_db
+def test_trigger_content_review_not_triggered_if_switch_inactive():
+    addon = addon_factory(status=amo.STATUS_REJECTED)
+    activity_log = ActivityLog.objects.create(
+        amo.LOG.EDIT_ADDON_PROPERTY, user=user_factory()
+    )
+    AddonApprovalsCounter.approve_content_for_addon(addon)
+    assert (
+        addon.addonapprovalscounter.content_review_status
+        == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PASS
+    )
+
+    with (
+        override_switch('content-review-in-cinder', active=False),
+        mock.patch('olympia.amo.celery.AMOTask.apply_async') as mock_apply_async,
+    ):
+        trigger_content_review(addon, activity_log)
+
+    assert (
+        addon.addonapprovalscounter.reload().content_review_status
+        == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.CHANGED
+    )
+    # We should not have triggered the content review task though
+    mock_apply_async.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_request_content_review():
+    addon = addon_factory(status=amo.STATUS_REJECTED)
+    activity_log = ActivityLog.objects.create(
+        amo.LOG.EDIT_ADDON_PROPERTY, user=user_factory()
+    )
+    AddonApprovalsCounter.reject_content_for_addon(addon)
+    assert (
+        addon.addonapprovalscounter.content_review_status
+        == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.FAIL
+    )
+
+    with (
+        override_switch('content-review-in-cinder', active=True),
+        mock.patch('olympia.amo.celery.AMOTask.apply_async') as mock_apply_async,
+    ):
+        request_content_review(addon, activity_log)
+
+    assert (
+        addon.addonapprovalscounter.reload().content_review_status
+        == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.REQUESTED
+    )
+    # And we should have triggered the content review task
+    mock_apply_async.assert_called_once()
+    assert mock_apply_async.call_args.args == ((), {'activity_log_pk': activity_log.pk})
+
+
+@pytest.mark.django_db
+def test_request_content_review_not_triggered_for_non_content_review_types():
+    addon = addon_factory(type=amo.ADDON_STATICTHEME, status=amo.STATUS_REJECTED)
+    activity_log = ActivityLog.objects.create(
+        amo.LOG.EDIT_ADDON_PROPERTY, user=user_factory()
+    )
+    AddonApprovalsCounter.reject_content_for_addon(addon)
+    assert (
+        addon.addonapprovalscounter.content_review_status
+        == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.FAIL
+    )
+
+    with (
+        override_switch('content-review-in-cinder', active=True),
+        mock.patch('olympia.amo.celery.AMOTask.apply_async') as mock_apply_async,
+    ):
+        request_content_review(addon, activity_log)
+
+    assert (
+        addon.addonapprovalscounter.reload().content_review_status
+        == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.REQUESTED
+    )
+    # We should not have triggered the content review task though
+    mock_apply_async.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_request_content_review_not_triggered_if_content_review_already_ongoing():
+    addon = addon_factory(status=amo.STATUS_REJECTED)
+    activity_log = ActivityLog.objects.create(
+        amo.LOG.EDIT_ADDON_PROPERTY, user=user_factory()
+    )
+    AddonApprovalsCounter.request_new_content_review_for_addon(addon)
+    assert (
+        addon.addonapprovalscounter.content_review_status
+        == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.REQUESTED
+    )
+
+    with (
+        override_switch('content-review-in-cinder', active=True),
+        mock.patch('olympia.amo.celery.AMOTask.apply_async') as mock_apply_async,
+    ):
+        request_content_review(addon, activity_log)
+
+    assert (
+        addon.addonapprovalscounter.reload().content_review_status
+        == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.REQUESTED
+    )
+    # We should not have triggered the content review task though
+    mock_apply_async.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_request_content_review_not_triggered_if_not_rejected():
+    addon = addon_factory()
+    activity_log = ActivityLog.objects.create(
+        amo.LOG.EDIT_ADDON_PROPERTY, user=user_factory()
+    )
+    AddonApprovalsCounter.reject_content_for_addon(addon)
+    assert (
+        addon.addonapprovalscounter.content_review_status
+        == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.FAIL
+    )
+
+    with (
+        override_switch('content-review-in-cinder', active=True),
+        mock.patch('olympia.amo.celery.AMOTask.apply_async') as mock_apply_async,
+    ):
+        request_content_review(addon, activity_log)
+
+    # State was inconsistent, addon was not in rejected status: we don't do
+    # anything.
+    assert (
+        addon.addonapprovalscounter.reload().content_review_status
+        == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.FAIL
+    )
+    # We should not have triggered the content review task either.
+    mock_apply_async.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_request_content_review_not_triggered_if_switch_inactive():
+    addon = addon_factory(status=amo.STATUS_REJECTED)
+    activity_log = ActivityLog.objects.create(
+        amo.LOG.EDIT_ADDON_PROPERTY, user=user_factory()
+    )
+    AddonApprovalsCounter.reject_content_for_addon(addon)
+    assert (
+        addon.addonapprovalscounter.content_review_status
+        == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.FAIL
+    )
+
+    with (
+        override_switch('content-review-in-cinder', active=False),
+        mock.patch('olympia.amo.celery.AMOTask.apply_async') as mock_apply_async,
+    ):
+        request_content_review(addon, activity_log)
+
+    assert (
+        addon.addonapprovalscounter.reload().content_review_status
+        == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.REQUESTED
+    )
+    # We should not have triggered the content review task though
+    mock_apply_async.assert_not_called()

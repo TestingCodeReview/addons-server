@@ -1,14 +1,15 @@
-from django.conf.urls import include, url
+from django.urls import include, re_path
 
 from rest_framework.routers import SimpleRouter
 
-from .views import AddonReviewerViewSet, BrowseVersionViewSet
+from .views import (
+    AddonReviewerViewSet,
+)
 
 
 addons = SimpleRouter()
 addons.register(r'addon', AddonReviewerViewSet, basename='reviewers-addon')
-addons.register(r'browse', BrowseVersionViewSet, basename='reviewers-browse')
 
 urlpatterns = [
-    url(r'', include(addons.urls)),
+    re_path(r'', include(addons.urls)),
 ]

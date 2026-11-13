@@ -3,10 +3,10 @@ Ratings
 =======
 
 .. note::
-
-    These APIs are experimental and are currently being worked on. Endpoints
-    may change without warning. Consider the :ref:`v3 API<api-stable-v3>`
-    if you need stability. The only authentication method available at
+    These APIs are not frozen and can change at any time without warning.
+    See :ref:`the API versions available<api-versions-list>` for alternatives
+    if you need stability.
+    The only authentication method available at
     the moment is :ref:`the internal one<api-auth-internal>`.
 
 ------------
@@ -24,9 +24,10 @@ When ``addon``, ``user`` and ``version`` are passed on the same request,
 one rating per version of a given add-on. This can be useful to find out if a
 user has already posted a rating for the current version of an add-on.
 
-.. http:get:: /api/v4/ratings/rating/
+.. http:get:: /api/v5/ratings/rating/
 
     :query string addon: The :ref:`add-on <addon-detail>` id, slug, or guid to fetch ratings from. When passed, the ratings shown will always be the latest posted by each user on this particular add-on (which means there should only be one rating per user in the results), unless the ``version`` parameter is also passed.
+    :query string app: Set the :ref:`add-on application <addon-detail-application>` for that query. This won't filter the results, but can affect the URLs being returned. Defaults to ``firefox``.
     :query string exclude_ratings: Exclude ratings by their ``id``. Multiple ratings can be specified, separated by comma(s).
     :query string filter: The :ref:`filter(s) <rating-filtering-param>` to apply.
     :query string score: Only include ratings that have been given a specific ``score``. Multiple scores can be specified, separated by comma(s).
@@ -76,7 +77,7 @@ This endpoint allows you to fetch a rating by its id.
     everyone is able to see.
 
 
-.. http:get:: /api/v4/ratings/rating/(int:id)/
+.. http:get:: /api/v5/ratings/rating/(int:id)/
 
     .. _rating-detail-object:
 
@@ -113,7 +114,7 @@ If successful a :ref:`rating object <rating-detail-object>` is returned.
      Requires authentication.
 
 
-.. http:post:: /api/v4/ratings/rating/
+.. http:post:: /api/v5/ratings/rating/
 
     :<json string addon: The add-on id the rating applies to (required).
     :<json string|null body: The text of the rating.
@@ -135,7 +136,7 @@ If successful a :ref:`rating object <rating-detail-object>` is returned.
 
      Only body and score are allowed for modification.
 
-.. http:patch:: /api/v4/ratings/rating/(int:id)/
+.. http:patch:: /api/v5/ratings/rating/(int:id)/
 
     :<json string|null body: The text of the rating.
     :<json int score: The score the user wants to give as part of the rating.
@@ -155,7 +156,7 @@ This endpoint allows you to delete an existing rating by its id.
      not delete a rating from somebody else if it was posted on an add-on they
      are listed as a developer of.
 
-.. http:delete:: /api/v4/ratings/rating/(int:id)/
+.. http:delete:: /api/v5/ratings/rating/(int:id)/
 
 
 -----
@@ -172,7 +173,7 @@ a `rating` object but with the fields ``rating``, ``reply`` and ``version`` omit
      Requires authentication and either Addons:Edit permission or a user account
      listed as a developer of the add-on.
 
-.. http:post:: /api/v4/ratings/rating/(int:id)/reply/
+.. http:post:: /api/v5/ratings/rating/(int:id)/reply/
 
     :<json string body: The text of the reply (required).
 
@@ -191,7 +192,7 @@ that something may be wrong with it.
      Requires authentication and a user account different from the one that
      posted the rating.
 
-.. http:post:: /api/v4/ratings/rating/(int:id)/flag/
+.. http:post:: /api/v5/ratings/rating/(int:id)/flag/
 
     :<json string flag: A :ref:`constant<rating-flag-constants>` describing the reason behind the flagging.
     :<json string|null note: A note to explain further the reason behind the flagging.

@@ -147,8 +147,6 @@
             "_current_version": 81551,
             "eula": 42021,
             "last_updated": "2009-10-21 09:58:40",
-            "view_source": false,
-            "total_downloads": 5546532,
             "developer_comments": 15003,
             "disabled_by_user": false,
             "guid": "{2fa4ed95-0317-4c6a-a74c-5f3e3912c1f9}",
@@ -160,7 +158,6 @@
             "bayesian_rating": 3.0784799999999999,
             "homepage": 15001,
             "support_email": 149593,
-            "public_stats": false,
             "status": 4,
             "privacy_policy": 42022,
             "default_locale": "en-US",
@@ -171,7 +168,7 @@
             "icon_type": "image/png",
             "modified": "2010-05-28 09:01:57",
             "summary": 15004,
-            "total_ratings": 413
+            "total_ratings": 32768
         }
     },
     {
@@ -204,11 +201,12 @@
             "hash": "sha256:3808b13ef8341378b9c8305ca648200954ee7dcd8dce09fef55f2673458bc31f",
             "created": "2009-10-21 09:58:52",
             "modified": "2009-10-21 10:02:38",
-            "filename": "delicious_bookmarks-2.1.072-fx.xpi",
-            "platform": 1,
+            "file": "15/3615/3615/delicious_bookmarks-2.1.072.xpi",
             "version": 81551,
             "size": 388096,
-            "datestatuschanged": "2009-10-21 09:58:40"
+            "manifest_version": 2,
+            "datestatuschanged": "2009-10-21 09:58:40",
+            "is_signed": true
         }
     },
     {
@@ -221,16 +219,17 @@
             "occupation": "",
             "homepage": "http://www.yahoo.com/",
             "email": "del@icio.us",
+            "fxa_id": "fake-fxa-id-for-55021",
             "location": "",
             "biography": null,
             "deleted": false,
             "username": "55021",
-            "is_public": true,
+            "has_full_profile": true,
             "display_name": "55021 \u0627\u0644\u062a\u0637\u0628",
             "created": "2007-03-05 13:09:56",
             "notes": null,
             "modified": "2010-05-19 16:41:22",
-            "read_dev_agreement": "2017-09-23 00:00:00",
+            "read_dev_agreement": "2099-12-02 00:00:00",
             "last_login": "2010-05-20 13:00:37"
         }
     },
@@ -289,50 +288,10 @@
         }
     },
     {
-        "pk": 1,
-        "model": "addons.category",
-        "fields": {
-            "count": 901,
-            "weight": 0,
-            "created": "2007-03-05 13:09:27",
-            "modified": "2010-02-23 19:17:32",
-            "application": 1,
-            "type": 1,
-            "slug": "feeds-news-blogging"
-        }
-    },
-    {
-        "pk": 22,
-        "model": "addons.category",
-        "fields": {
-            "count": 901,
-            "weight": 0,
-            "created": "2007-03-05 13:09:27",
-            "modified": "2010-02-23 19:17:32",
-            "application": 1,
-            "type": 1,
-            "slug": "bookmarks"
-        }
-    },
-    {
-        "pk": 71,
-        "model": "addons.category",
-        "fields": {
-            "count": 901,
-            "weight": 0,
-            "created": "2007-03-05 13:09:27",
-            "modified": "2010-02-23 19:17:32",
-            "application": 1,
-            "type": 1,
-            "slug": "social-communication"
-        }
-    },
-    {
         "pk": 6343,
         "model": "addons.addoncategory",
         "fields": {
-            "category": 22,
-            "feature": 1,
+            "category_id": 22,
             "addon": 3615
         }
     },
@@ -340,8 +299,7 @@
         "pk": 6344,
         "model": "addons.addoncategory",
         "fields": {
-            "category": 1,
-            "feature": 1,
+            "category_id": 1,
             "addon": 3615
         }
     },
@@ -349,19 +307,8 @@
         "pk": 6345,
         "model": "addons.addoncategory",
         "fields": {
-            "category": 71,
-            "feature": 1,
+            "category_id": 71,
             "addon": 3615
-        }
-    },
-    {
-        "pk": 1028,
-        "model": "addons.appsupport",
-        "fields": {
-            "app": 1,
-            "addon": 3615,
-            "modified": "2010-10-01 21:37:07",
-            "created": "2010-10-01 21:37:07"
         }
     }
 ]

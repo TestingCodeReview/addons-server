@@ -1,51 +1,79 @@
-# -*- coding: utf-8 -*-
 import json
 import os
-import time
-
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 from django import forms
 from django.conf import settings
-from django.contrib.auth.models import AnonymousUser
 from django.core import mail
+from django.db import IntegrityError
 from django.utils import translation
 
 import pytest
-import six
-
-from mock import Mock, patch
+from waffle.testutils import override_switch
 
 from olympia import amo, core
 from olympia.activity.models import ActivityLog, AddonLog
 from olympia.addons import models as addons_models
 from olympia.addons.models import (
-    Addon, AddonApprovalsCounter, AddonCategory, AddonReviewerFlags, AddonUser,
-    AppSupport, Category, CompatOverride, CompatOverrideRange, DeniedGuid,
-    DeniedSlug, FrozenAddon, IncompatibleVersions, MigratedLWT, Persona,
-    Preview, track_addon_status_change)
-from olympia.amo.templatetags.jinja_helpers import absolutify, user_media_url
+    Addon,
+    AddonApprovalsCounter,
+    AddonCategory,
+    AddonGUID,
+    AddonListingInfo,
+    AddonRegionalRestrictions,
+    AddonReviewerFlags,
+    AddonUser,
+    DeniedGuid,
+    DeniedSlug,
+    FrozenAddon,
+    GuidAlreadyDeniedError,
+    MigratedLWT,
+    Preview,
+    track_addon_status_change,
+)
 from olympia.amo.tests import (
-    TestCase, addon_factory, collection_factory, version_factory)
+    TestCase,
+    addon_factory,
+    user_factory,
+    version_factory,
+    version_review_flags_factory,
+)
 from olympia.amo.tests.test_models import BasePreviewMixin
 from olympia.applications.models import AppVersion
-from olympia.bandwagon.models import Collection, FeaturedCollection
-from olympia.constants.categories import CATEGORIES, CATEGORIES_BY_ID
+from olympia.bandwagon.models import Collection
+from olympia.blocklist.models import Block, BlocklistSubmission, BlockVersion
+from olympia.constants.blocklist import BlockReason, BlockType
+from olympia.constants.categories import CATEGORIES
+from olympia.constants.promoted import RECOMMENDED_API_NAME
 from olympia.devhub.models import RssKey
 from olympia.files.models import File
-from olympia.files.tests.test_models import UploadTest
-from olympia.files.utils import Extractor, parse_addon
+from olympia.files.tests.test_models import UploadMixin
+from olympia.files.utils import parse_addon
+from olympia.promoted.models import (
+    PromotedAddon,
+    PromotedApproval,
+    PromotedGroup,
+)
 from olympia.ratings.models import Rating, RatingFlag
+from olympia.reviewers.models import NeedsHumanReview, UsageTier
 from olympia.translations.models import (
-    Translation, TranslationSequence, delete_translation)
+    Translation,
+    TranslationSequence,
+    delete_translation,
+)
 from olympia.users.models import UserProfile
-from olympia.versions.compare import version_int
 from olympia.versions.models import (
-    ApplicationsVersions, Version, VersionPreview)
+    ApplicationsVersions,
+    Version,
+    VersionPreview,
+    VersionProvenance,
+    VersionReviewerFlags,
+)
+from olympia.zadmin.models import set_config
 
 
 class TestCleanSlug(TestCase):
-
     def test_clean_slug_new_object(self):
         # Make sure there's at least an addon with the "addon" slug, subsequent
         # ones should be "addon-1", "addon-2" ...
@@ -161,8 +189,7 @@ class TestCleanSlug(TestCase):
         assert b.slug.startswith('some-spaces-and'), b.slug
 
     @patch.object(addons_models, 'MAX_SLUG_INCREMENT', 99)
-    @patch.object(
-        addons_models, 'SLUG_INCREMENT_SUFFIXES', set(range(1, 99 + 1)))
+    @patch.object(addons_models, 'SLUG_INCREMENT_SUFFIXES', set(range(1, 99 + 1)))
     def test_clean_slug_worst_case_scenario(self):
         long_slug = 'this_is_a_very_long_slug_that_is_longer_than_thirty_chars'
 
@@ -170,7 +197,7 @@ class TestCleanSlug(TestCase):
         # worst case scenario where all the available clashes have been
         # avoided. Check the comment in addons.models.clean_slug, in the 'else'
         # part of the 'for" loop checking for available slugs not yet assigned.
-        for i in range(100):
+        for _i in range(100):
             Addon.objects.create(slug=long_slug)
 
         with self.assertRaises(RuntimeError):  # Fail on the 100th clash.
@@ -187,8 +214,8 @@ class TestCleanSlug(TestCase):
         assert b.slug == amo.utils.slugify(b.slug)
 
     def test_clean_slug_unicode(self):
-        addon = Addon.objects.create(name=u'Addön 1')
-        assert addon.slug == u'addön-1'
+        addon = Addon.objects.create(name='Addön 1')
+        assert addon.slug == 'addön-1'
 
     def test_name_only_has_invalid_slug_chars(self):
         # Create an addon and save it to have an id.
@@ -204,13 +231,18 @@ class TestCleanSlug(TestCase):
 
 
 class TestAddonManager(TestCase):
-    fixtures = ['base/appversion', 'base/users',
-                'base/addon_3615', 'addons/featured', 'addons/test_manager',
-                'base/collections', 'base/featured',
-                'bandwagon/featured_collections', 'base/addon_5299_gcal']
+    fixtures = [
+        'base/appversion',
+        'base/users',
+        'base/addon_3615',
+        'addons/test_manager',
+        'base/collections',
+        'base/featured',
+        'base/addon_5299_gcal',
+    ]
 
     def setUp(self):
-        super(TestAddonManager, self).setUp()
+        super().setUp()
         core.set_user(None)
         self.addon = Addon.objects.get(pk=3615)
 
@@ -218,13 +250,22 @@ class TestAddonManager(TestCase):
         assert self.addon in Addon.objects.all()
         assert self.addon in Addon.unfiltered.all()
 
+    def test_managers_not_disabled_by_mozilla(self):
+        assert self.addon in Addon.objects.not_disabled_by_mozilla()
+        assert self.addon in Addon.unfiltered.not_disabled_by_mozilla()
+
+        self.addon.update(status=amo.STATUS_DISABLED)
+
+        assert self.addon not in Addon.objects.not_disabled_by_mozilla()
+        assert self.addon not in Addon.unfiltered.not_disabled_by_mozilla()
+
     def test_managers_unlisted(self):
-        self.make_addon_unlisted(self.addon)
+        self.change_channel_for_addon(self.addon, amo.CHANNEL_UNLISTED)
         assert self.addon in Addon.objects.all()
         assert self.addon in Addon.unfiltered.all()
 
     def test_managers_unlisted_deleted(self):
-        self.make_addon_unlisted(self.addon)
+        self.change_channel_for_addon(self.addon, amo.CHANNEL_UNLISTED)
         self.addon.update(status=amo.STATUS_DELETED)
         assert self.addon not in Addon.objects.all()
         assert self.addon in Addon.unfiltered.all()
@@ -234,43 +275,9 @@ class TestAddonManager(TestCase):
         assert self.addon not in Addon.objects.all()
         assert self.addon in Addon.unfiltered.all()
 
-    def test_featured(self):
-        assert Addon.objects.featured(amo.FIREFOX).count() == 3
-
-    def test_listed(self):
-        # We need this for the fixtures, but it messes up the tests.
-        self.addon.update(disabled_by_user=True)
-        # Now continue as normal.
-        Addon.objects.filter(id=5299).update(disabled_by_user=True)
-        q = Addon.objects.listed(amo.FIREFOX, amo.STATUS_PUBLIC)
-        assert len(q.all()) == 4
-
-        # Pick one of the listed addons.
-        addon = Addon.objects.get(pk=2464)
-        assert addon in q.all()
-
-        # Disabling hides it.
-        addon.disabled_by_user = True
-        addon.save()
-
-        # Should be 3 now, since the one is now disabled.
-        assert q.count() == 3
-
-        # If we search for public or unreviewed we find it.
-        addon.disabled_by_user = False
-        addon.status = amo.STATUS_NOMINATED
-        addon.save()
-        assert q.count() == 3
-        assert Addon.objects.listed(amo.FIREFOX, amo.STATUS_PUBLIC,
-                                    amo.STATUS_NOMINATED).count() == 4
-
-        # Can't find it without a file.
-        addon.versions.get().files.get().delete()
-        assert q.count() == 3
-
     def test_public(self):
         for a in Addon.objects.public():
-            assert a.status == amo.STATUS_PUBLIC
+            assert a.status == amo.STATUS_APPROVED
 
     def test_valid(self):
         addon = Addon.objects.get(pk=5299)
@@ -281,52 +288,6 @@ class TestAddonManager(TestCase):
             assert addon.status in amo.VALID_ADDON_STATUSES
             assert not addon.disabled_by_user
 
-    def test_valid_disabled_by_user(self):
-        before = Addon.objects.valid_and_disabled_and_pending().count()
-        addon = Addon.objects.get(pk=5299)
-        addon.update(disabled_by_user=True)
-        assert Addon.objects.valid_and_disabled_and_pending().count() == before
-
-    def test_valid_disabled_by_admin(self):
-        before = Addon.objects.valid_and_disabled_and_pending().count()
-        addon = Addon.objects.get(pk=5299)
-        addon.update(status=amo.STATUS_DISABLED)
-        assert Addon.objects.valid_and_disabled_and_pending().count() == before
-
-    def test_invalid_deleted(self):
-        before = Addon.objects.valid_and_disabled_and_pending().count()
-        addon = Addon.objects.get(pk=5299)
-        addon.update(status=amo.STATUS_DELETED)
-        assert Addon.objects.valid_and_disabled_and_pending().count() == (
-            before - 1)
-
-    def test_valid_disabled_pending(self):
-        before = Addon.objects.valid_and_disabled_and_pending().count()
-        amo.tests.addon_factory(status=amo.STATUS_PENDING)
-        assert Addon.objects.valid_and_disabled_and_pending().count() == (
-            before + 1)
-
-    def test_valid_disabled_version(self):
-        before = Addon.objects.valid_and_disabled_and_pending().count()
-
-        # Add-on, no version. Doesn't count.
-        addon = amo.tests.addon_factory()
-        addon.update(_current_version=None, _signal=False)
-        assert Addon.objects.valid_and_disabled_and_pending().count() == before
-
-        # Theme, no version. Counts.
-        addon = amo.tests.addon_factory(type=amo.ADDON_PERSONA)
-        addon.update(_current_version=None, _signal=False)
-        assert Addon.objects.valid_and_disabled_and_pending().count() == (
-            before + 1)
-
-    def test_new_featured(self):
-        addons = Addon.objects.featured(amo.FIREFOX)
-        assert addons.count() == 3
-        assert sorted(x.id for x in addons) == (
-            [2464, 7661, 15679])
-        assert not Addon.objects.featured(amo.ANDROID).exists()
-
     def test_filter_for_many_to_many(self):
         # Check https://bugzilla.mozilla.org/show_bug.cgi?id=1142035.
         collection = self.addon.collections.first()
@@ -335,7 +296,7 @@ class TestAddonManager(TestCase):
         # Addon shouldn't be listed in collection.addons if it's deleted.
 
         # Unlisted.
-        self.make_addon_unlisted(self.addon)
+        self.change_channel_for_addon(self.addon, amo.CHANNEL_UNLISTED)
         collection = Collection.objects.get(pk=collection.pk)
         assert collection.addons.get() == self.addon
 
@@ -345,7 +306,7 @@ class TestAddonManager(TestCase):
         assert collection.addons.count() == 0
 
         # Only deleted.
-        self.make_addon_listed(self.addon)
+        self.change_channel_for_addon(self.addon, amo.CHANNEL_LISTED)
         collection = Collection.objects.get(pk=collection.pk)
         assert collection.addons.count() == 0
 
@@ -357,7 +318,7 @@ class TestAddonManager(TestCase):
         # Deleted or unlisted, version.addon should still work.
 
         # Unlisted.
-        self.make_addon_unlisted(self.addon)
+        self.change_channel_for_addon(self.addon, amo.CHANNEL_UNLISTED)
         version = Version.objects.get(pk=version.pk)  # Reload from db.
         assert version.addon == self.addon
 
@@ -367,29 +328,25 @@ class TestAddonManager(TestCase):
         assert version.addon == self.addon
 
         # Only deleted.
-        self.make_addon_listed(self.addon)
+        self.change_channel_for_addon(self.addon, amo.CHANNEL_LISTED)
         version = Version.objects.get(pk=version.pk)  # Reload from db.
         assert version.addon == self.addon
 
 
 class TestAddonModels(TestCase):
-    fixtures = ['base/appversion',
-                'base/collections',
-                'base/featured',
-                'base/users',
-                'base/addon_5299_gcal',
-                'base/addon_3615',
-                'base/addon_3723_listed',
-                'base/addon_6704_grapple.json',
-                'base/addon_4594_a9',
-                'base/addon_4664_twitterbar',
-                'addons/featured',
-                'addons/invalid_latest_version',
-                'addons/denied',
-                'bandwagon/featured_collections']
+    fixtures = [
+        'base/appversion',
+        'base/collections',
+        'base/users',
+        'base/addon_5299_gcal',
+        'base/addon_3615',
+        'base/addon_3723_listed',
+        'base/addon_4664_twitterbar',
+        'addons/denied',
+    ]
 
     def setUp(self):
-        super(TestAddonModels, self).setUp()
+        super().setUp()
         TranslationSequence.objects.create(id=99243)
 
     def test_current_version(self):
@@ -412,19 +369,25 @@ class TestAddonModels(TestCase):
     def test_latest_unlisted_version(self):
         addon = Addon.objects.get(pk=3615)
         an_unlisted_version = version_factory(
-            addon=addon, version='3.0', channel=amo.RELEASE_CHANNEL_UNLISTED)
+            addon=addon, version='3.0', channel=amo.CHANNEL_UNLISTED
+        )
         an_unlisted_version.update(created=self.days_ago(2))
         a_newer_unlisted_version = version_factory(
-            addon=addon, version='4.0', channel=amo.RELEASE_CHANNEL_UNLISTED)
+            addon=addon, version='4.0', channel=amo.CHANNEL_UNLISTED
+        )
         a_newer_unlisted_version.update(created=self.days_ago(1))
         version_factory(
-            addon=addon, version='5.0', channel=amo.RELEASE_CHANNEL_UNLISTED,
-            file_kw={'status': amo.STATUS_DISABLED})
+            addon=addon,
+            version='5.0',
+            channel=amo.CHANNEL_UNLISTED,
+            file_kw={'status': amo.STATUS_DISABLED},
+        )
         assert addon.latest_unlisted_version == a_newer_unlisted_version
 
         # Make sure the property is cached.
         an_even_newer_unlisted_version = version_factory(
-            addon=addon, version='6.0', channel=amo.RELEASE_CHANNEL_UNLISTED)
+            addon=addon, version='6.0', channel=amo.CHANNEL_UNLISTED
+        )
         assert addon.latest_unlisted_version == a_newer_unlisted_version
 
         # Make sure it can be deleted to reset it.
@@ -445,7 +408,8 @@ class TestAddonModels(TestCase):
         new_version.update(created=self.days_ago(1))
         assert addon.find_latest_version(None) == new_version
         another_new_version = version_factory(
-            addon=addon, version='3.0', channel=amo.RELEASE_CHANNEL_UNLISTED)
+            addon=addon, version='3.0', channel=amo.CHANNEL_UNLISTED
+        )
         assert addon.find_latest_version(None) == another_new_version
 
     def test_find_latest_version_different_channel(self):
@@ -454,14 +418,13 @@ class TestAddonModels(TestCase):
         new_version = version_factory(addon=addon, version='2.0')
         new_version.update(created=self.days_ago(1))
         unlisted_version = version_factory(
-            addon=addon, version='3.0', channel=amo.RELEASE_CHANNEL_UNLISTED)
+            addon=addon, version='3.0', channel=amo.CHANNEL_UNLISTED
+        )
 
+        assert addon.find_latest_version(channel=amo.CHANNEL_LISTED) == new_version
         assert (
-            addon.find_latest_version(channel=amo.RELEASE_CHANNEL_LISTED) ==
-            new_version)
-        assert (
-            addon.find_latest_version(channel=amo.RELEASE_CHANNEL_UNLISTED) ==
-            unlisted_version)
+            addon.find_latest_version(channel=amo.CHANNEL_UNLISTED) == unlisted_version
+        )
 
     def test_find_latest_version_no_version(self):
         Addon.objects.filter(pk=3723).update(_current_version=None)
@@ -476,8 +439,9 @@ class TestAddonModels(TestCase):
         v1.update(created=self.days_ago(1))
         assert addon.find_latest_version(None).id == v1.id
 
-        version_factory(addon=addon, version='2.0',
-                        file_kw={'status': amo.STATUS_DISABLED})
+        version_factory(
+            addon=addon, version='2.0', file_kw={'status': amo.STATUS_DISABLED}
+        )
         # Still should be v1
         assert addon.find_latest_version(None).id == v1.id
 
@@ -489,8 +453,9 @@ class TestAddonModels(TestCase):
 
         assert addon.find_latest_version(None, exclude=()).id == v1.id
 
-        v2 = version_factory(addon=addon, version='2.0',
-                             file_kw={'status': amo.STATUS_DISABLED})
+        v2 = version_factory(
+            addon=addon, version='2.0', file_kw={'status': amo.STATUS_DISABLED}
+        )
         v2.update(created=self.days_ago(1))
 
         # Should be v2 since we don't exclude anything.
@@ -502,20 +467,32 @@ class TestAddonModels(TestCase):
         v1 = version_factory(addon=addon, version='1.0')
         v1.update(created=self.days_ago(3))
 
-        assert addon.find_latest_version(
-            amo.RELEASE_CHANNEL_LISTED, exclude=()).id == v1.id
+        assert addon.find_latest_version(amo.CHANNEL_LISTED, exclude=()).id == v1.id
 
-        v2 = version_factory(addon=addon, version='2.0',
-                             file_kw={'status': amo.STATUS_DISABLED})
+        v2 = version_factory(
+            addon=addon, version='2.0', file_kw={'status': amo.STATUS_DISABLED}
+        )
         v2.update(created=self.days_ago(1))
 
-        version_factory(
-            addon=addon, version='4.0', channel=amo.RELEASE_CHANNEL_UNLISTED)
+        version_factory(addon=addon, version='4.0', channel=amo.CHANNEL_UNLISTED)
 
         # Should be v2 since we don't exclude anything, but do have a channel
         # set to listed, and version 4.0 is unlisted.
-        assert addon.find_latest_version(
-            amo.RELEASE_CHANNEL_LISTED, exclude=()).id == v2.id
+        assert addon.find_latest_version(amo.CHANNEL_LISTED, exclude=()).id == v2.id
+
+    def test_find_latest_version_include_deleted(self):
+        addon = Addon.objects.get(pk=3615)
+        v0 = addon.current_version
+
+        v1 = version_factory(addon=addon, version='1.0')
+        v1.update(created=self.days_ago(1))
+        v1.delete()
+        assert addon.find_latest_version(None, exclude=()).id == v0.id
+        assert addon.find_latest_version(None, exclude=(), deleted=True).id == v1.id
+
+        addon.delete()
+        assert addon.find_latest_version(None, exclude=()) is None
+        assert addon.find_latest_version(None, exclude=(), deleted=True).id == v1.id
 
     def test_current_version_unsaved(self):
         addon = Addon()
@@ -529,18 +506,93 @@ class TestAddonModels(TestCase):
     def test_transformer(self):
         author = UserProfile.objects.get(pk=55021)
         new_author = AddonUser.objects.create(
-            addon_id=3615, user=UserProfile.objects.create(username='abda'),
-            listed=True).user
+            addon_id=3615, user=user_factory(username='new_author'), listed=True
+        ).user
+        # make the new_author a deleted author of another addon
+        AddonUser.objects.create(
+            addon=addon_factory(), user=new_author, role=amo.AUTHOR_ROLE_DELETED
+        )
+        # Deleted, so shouldn't show up below.
+        AddonUser.objects.create(
+            addon_id=3615,
+            user=user_factory(username='deleted_author'),
+            listed=True,
+            role=amo.AUTHOR_ROLE_DELETED,
+        )
+        # Not listed, should not show up.
+        AddonUser.objects.create(
+            addon_id=3615,
+            user=user_factory(username='not_listed_author'),
+            listed=False,
+            role=amo.AUTHOR_ROLE_OWNER,
+        )
+        # Different author on another add-on - should not show up
+        AddonUser.objects.create(addon=addon_factory(), user=user_factory())
+        # First author, but on another add-on, not deleted - should not show up
+        AddonUser.objects.create(addon=addon_factory(), user=author)
 
-        addon = Addon.objects.get(pk=3615)
+        # Force evaluation of the queryset and test a single add-on
+        addon = list(Addon.objects.all().order_by('pk'))[0]
 
         # If the transformer works then we won't have any more queries.
         with self.assertNumQueries(0):
             assert addon.current_version
             # Use list() so that we evaluate a queryset in case the
             # transformer didn't attach the list directly
-            assert [u.pk for u in addon.listed_authors] == [
-                author.pk, new_author.pk]
+            assert [u.pk for u in addon.listed_authors] == [author.pk, new_author.pk]
+
+        # repeat to check the position ordering works
+        author.addonuser_set.filter(addon=addon).update(position=1)
+        addon = Addon.objects.get(pk=3615)
+        with self.assertNumQueries(0):
+            assert [u.pk for u in addon.listed_authors] == [new_author.pk, author.pk]
+
+    def test_transformer_all_authors(self):
+        author = UserProfile.objects.get(pk=55021)
+        new_author = AddonUser.objects.create(
+            addon_id=3615, user=user_factory(username='new_author'), listed=True
+        ).user
+        # make the new_author a deleted author of another addon
+        AddonUser.objects.create(
+            addon=addon_factory(), user=new_author, role=amo.AUTHOR_ROLE_DELETED
+        )
+        # Deleted, so it should show up cause we're looking at *all* authors
+        # explicitly.
+        deleted_author = AddonUser.objects.create(
+            addon_id=3615,
+            user=user_factory(username='deleted_author'),
+            listed=True,
+            role=amo.AUTHOR_ROLE_DELETED,
+        ).user
+        # Not listed, should also show up.
+        not_listed_author = AddonUser.objects.create(
+            addon_id=3615,
+            user=user_factory(username='not_listed_author'),
+            listed=False,
+            role=amo.AUTHOR_ROLE_OWNER,
+        ).user
+        # Different author on another add-on - should not show up
+        AddonUser.objects.create(addon=addon_factory(), user=user_factory())
+        # First author, but on another add-on, not deleted - should not show up
+        AddonUser.objects.create(addon=addon_factory(), user=author)
+
+        # Force evaluation of the queryset and test a single add-on
+        addon = list(Addon.objects.transform(Addon.attach_all_authors).order_by('pk'))[
+            0
+        ]
+
+        # If the transformer works then we won't have any more queries.
+        with self.assertNumQueries(0):
+            assert [u.pk for u in addon.all_authors] == [
+                author.pk,
+                new_author.pk,
+                deleted_author.pk,
+                not_listed_author.pk,
+            ]
+        for user in addon.all_authors:
+            addonuser = AddonUser.unfiltered.filter(user=user, addon=addon).get()
+            assert user.role == addonuser.role
+            assert user.listed == addonuser.listed
 
     def _delete(self, addon_id):
         """Test deleting add-ons."""
@@ -548,24 +600,23 @@ class TestAddonModels(TestCase):
         addon_count = Addon.unfiltered.count()
         addon = Addon.objects.get(pk=addon_id)
         guid = addon.guid
-        addon.delete('bye')
+        addon.delete(msg='bye')
         assert addon_count == Addon.unfiltered.count()  # Soft deletion.
         assert addon.status == amo.STATUS_DELETED
         assert addon.slug is None
         assert addon.current_version is None
         assert addon.guid == guid  # We don't clear it anymore.
-        deleted_count = Addon.unfiltered.filter(
-            status=amo.STATUS_DELETED).count()
+        deleted_count = Addon.unfiltered.filter(status=amo.STATUS_DELETED).count()
         assert len(mail.outbox) == deleted_count
         log = AddonLog.objects.order_by('-id').first().activity_log
         assert log.action == amo.LOG.DELETE_ADDON.id
         assert log.to_string() == (
-            'Addon id {0} with GUID {1} has been deleted'.format(
-                addon_id, guid))
+            f'Add-on id {addon_id} with GUID {guid} has been deleted'
+        )
 
     def test_delete(self):
         addon = Addon.unfiltered.get(pk=3615)
-        addon.name = u'é'  # Make sure we don't have encoding issues.
+        addon.name = 'é'  # Make sure we don't have encoding issues.
         addon.save()
         self._delete(3615)
 
@@ -573,42 +624,57 @@ class TestAddonModels(TestCase):
         # with unique constraints on fields that got nullified.
         self._delete(5299)
 
-    def test_delete_persona(self):
-        addon = amo.tests.addon_factory(type=amo.ADDON_PERSONA)
-        assert addon.guid is None  # Personas don't have GUIDs.
-        self._delete(addon.pk)
-
     @patch('olympia.addons.tasks.Preview.delete_preview_files')
     @patch('olympia.versions.tasks.VersionPreview.delete_preview_files')
-    def test_delete_deletes_preview_files(self, dpf_vesions_mock,
-                                          dpf_addons_mock):
+    def test_delete_deletes_preview_files(self, dpf_vesions_mock, dpf_addons_mock):
         addon = addon_factory()
         addon_preview = Preview.objects.create(addon=addon)
-        version_preview = VersionPreview.objects.create(
-            version=addon.current_version)
+        version_preview = VersionPreview.objects.create(version=addon.current_version)
         addon.delete()
-        dpf_addons_mock.assert_called_with(
-            sender=None, instance=addon_preview)
-        dpf_vesions_mock.assert_called_with(
-            sender=None, instance=version_preview)
+        dpf_addons_mock.assert_called_with(sender=None, instance=addon_preview)
+        dpf_vesions_mock.assert_called_with(sender=None, instance=version_preview)
 
-    def _delete_url(self):
-        """Test deleting addon has URL in the email."""
-        a = Addon.objects.get(pk=4594)
-        url = a.get_url_path()
-        a.delete('bye')
-        assert absolutify(url) in mail.outbox[0].body
-
-    def test_delete_url(self):
-        count = Addon.unfiltered.count()
-        self._delete_url()
-        assert count == Addon.unfiltered.count()
+    def test_delete_clear_pending_rejection(self):
+        addon = addon_factory()
+        user = user_factory()
+        version_factory(addon=addon)
+        other_addon = addon_factory()
+        for version in Version.objects.all():
+            version_review_flags_factory(
+                version=version,
+                pending_rejection=datetime.now() + timedelta(days=1),
+                pending_rejection_by=user,
+            )
+        assert VersionReviewerFlags.objects.filter(version__addon=addon).exists()
+        addon.delete()
+        assert addon.versions(manager='unfiltered_for_relations').exists()
+        # There shouldn't be any version reviewer flags for versions of that
+        # add-on with a non-null pending rejection anymore.
+        assert not VersionReviewerFlags.objects.filter(
+            version__addon=addon,
+            pending_rejection__isnull=False,
+        ).exists()
+        # There should still be one for the version of the other add-on though.
+        assert VersionReviewerFlags.objects.filter(
+            version__addon=other_addon,
+            pending_rejection__isnull=False,
+            pending_rejection_by=user,
+        ).exists()
+        # pending_rejection_by should have been cleared for those not pending
+        # rejection.
+        assert (
+            VersionReviewerFlags.objects.filter(
+                version__addon=other_addon,
+                pending_rejection_by=user,
+            ).count()
+            == 1
+        )
 
     def test_delete_reason(self):
         """Test deleting with a reason gives the reason in the mail."""
-        reason = u'trêason'
+        reason = 'trêason'
         a = Addon.objects.get(pk=3615)
-        a.name = u'é'
+        a.name = 'é'
         assert len(mail.outbox) == 0
         a.delete(msg='bye', reason=reason)
         assert len(mail.outbox) == 1
@@ -622,7 +688,7 @@ class TestAddonModels(TestCase):
         # The addon status will have been changed when we deleted the version,
         # and the instance should be the same, so we shouldn't need to reload.
         assert addon.status == amo.STATUS_NULL
-        addon.delete(None)
+        addon.delete(msg=None)
         assert len(mail.outbox) == 0
         assert Addon.unfiltered.count() == (count - 1)
 
@@ -632,18 +698,9 @@ class TestAddonModels(TestCase):
         a = Addon.objects.get(pk=3615)
         a.status = 0
         a.save()
-        a.delete('oh looky here')
+        a.delete(msg='oh looky here')
         assert len(mail.outbox) == 1
         assert count == Addon.unfiltered.count()
-
-    def test_delete_searchengine(self):
-        """
-        Test deleting searchengines (which have no guids) should not barf up
-        the deletion machine.
-        """
-        a = Addon.objects.get(pk=4594)
-        a.delete('bye')
-        assert len(mail.outbox) == 1
 
     def test_delete_send_delete_email_false(self):
         addon_a = addon_factory()
@@ -667,6 +724,14 @@ class TestAddonModels(TestCase):
         self._delete(3615)
         assert DeniedGuid.objects.filter(guid=addon.guid).exists()
 
+    def test_delete_disabled_addon_no_guid(self):
+        addon = Addon.unfiltered.get(pk=3615)
+        addon.update(status=amo.STATUS_DISABLED, guid=None)
+        self._delete(3615)
+        # Adding it to the DeniedGuid would be pointless since it's empty. The
+        # important thing is that the delete() calls succeeds.
+        assert not DeniedGuid.objects.filter(guid=addon.guid).exists()
+
     def test_delete_unknown_type(self):
         """
         Test making sure deleting add-ons with an unknown type, like old
@@ -675,31 +740,230 @@ class TestAddonModels(TestCase):
         addon.update(type=11)
         self._delete(3615)
 
-    def test_incompatible_latest_apps(self):
-        a = Addon.objects.get(pk=3615)
-        assert a.incompatible_latest_apps() == []
+    def test_soft_delete_disables_files_and_soft_deletes_versions(self):
+        addon = Addon.unfiltered.get(pk=3615)
+        files = File.objects.filter(version__addon=addon)
+        versions = Version.unfiltered.filter(addon=addon)
+        assert versions
+        assert files
+        for file_ in files:
+            assert file_.status != amo.STATUS_DISABLED
+        for version in versions:
+            assert not version.deleted
 
-        av = ApplicationsVersions.objects.get(pk=47881)
-        av.max = AppVersion.objects.get(pk=97)  # Firefox 2.0
-        av.save()
+        self._delete(3615)
 
-        a = Addon.objects.get(pk=3615)
-        assert a.incompatible_latest_apps() == [
-            (amo.FIREFOX, AppVersion.objects.get(version_int=4000000200100))
-        ]
+        files = File.objects.filter(version__addon=addon)
+        versions = Version.unfiltered.filter(addon=addon)
+        assert versions
+        assert files
+        for file_ in files:
+            assert file_.status == amo.STATUS_DISABLED
+            assert (
+                file_.status_disabled_reason
+                == File.STATUS_DISABLED_REASONS.ADDON_DELETE
+            )
+        for version in versions:
+            assert version.deleted
 
-        # Check a search engine addon.
-        a = Addon.objects.get(pk=4594)
-        assert a.incompatible_latest_apps() == []
+    @patch('olympia.addons.tasks.delete_all_addon_media_with_backup')
+    def test_force_disable(self, delete_all_addon_media_with_backup_mock):
+        core.set_user(UserProfile.objects.get(email='admin@mozilla.com'))
+        addon = Addon.unfiltered.get(pk=3615)
+        version1 = version_factory(addon=addon)
+        NeedsHumanReview.objects.create(version=version1, is_active=True)
+        version2 = version_factory(
+            addon=addon,
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+        )
+        NeedsHumanReview.objects.create(version=version2, is_active=True)
+        assert addon.status != amo.STATUS_DISABLED
+        files = File.objects.filter(version__addon=addon)
+        assert files
+        for file_ in files:
+            assert file_.status != amo.STATUS_DISABLED
+        already_disabled_version = version_factory(
+            addon=addon,
+            file_kw={
+                'status': amo.STATUS_DISABLED,
+                'status_disabled_reason': File.STATUS_DISABLED_REASONS.DEVELOPER,
+            },
+        )
+        assert version1.due_date
+        assert version2.due_date
 
-    def test_incompatible_asterix(self):
-        av = ApplicationsVersions.objects.get(pk=47881)
-        av.max = AppVersion.objects.create(application=amo.FIREFOX.id,
-                                           version_int=version_int('5.*'),
-                                           version='5.*')
-        av.save()
-        a = Addon.objects.get(pk=3615)
-        assert a.incompatible_latest_apps() == []
+        addon.force_disable()
+
+        log = ActivityLog.objects.latest('pk')
+        assert log.action == amo.LOG.FORCE_DISABLE.id
+
+        assert addon.status == amo.STATUS_DISABLED
+        files = File.objects.filter(version__addon=addon)
+        assert files
+        for file_ in files:
+            assert file_.status == amo.STATUS_DISABLED
+            if file_.version == already_disabled_version:
+                assert (
+                    file_.status_disabled_reason
+                    == File.STATUS_DISABLED_REASONS.DEVELOPER
+                )
+            else:
+                assert (
+                    file_.status_disabled_reason
+                    == File.STATUS_DISABLED_REASONS.ADDON_DISABLE
+                )
+                assert file_.original_status in (
+                    amo.STATUS_APPROVED,
+                    amo.STATUS_AWAITING_REVIEW,
+                )
+            assert not file_.version.due_date
+            assert not file_.version.needshumanreview_set.filter(
+                is_active=True
+            ).exists()
+
+        assert delete_all_addon_media_with_backup_mock.delay.call_count == 1
+        assert delete_all_addon_media_with_backup_mock.delay.call_args[0] == (addon.pk,)
+
+    def test_force_disable_works_if_status_is_listing_rejected(self):
+        addon = Addon.unfiltered.get(pk=3615)
+        addon.update(status=amo.STATUS_REJECTED)
+        self.test_force_disable()
+
+    def test_force_disable_clear_due_date_unlisted_auto_approval_indefinite_delay(self):
+        addon = addon_factory(status=amo.STATUS_NULL)
+        version = version_factory(
+            addon=addon,
+            channel=amo.CHANNEL_UNLISTED,
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+        )
+        AddonReviewerFlags.objects.create(
+            addon=addon, auto_approval_delayed_until_unlisted=datetime.max
+        )
+        NeedsHumanReview.objects.create(
+            version=version, reason=NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+        )
+        version.reset_due_date()
+        assert version.due_date is not None
+        addon.force_disable()
+        version.reload()
+        assert version.due_date is None
+
+    def test_force_disable_skip_activity_log(self):
+        core.set_user(UserProfile.objects.get(email='admin@mozilla.com'))
+        addon = Addon.unfiltered.get(pk=3615)
+        assert addon.status != amo.STATUS_DISABLED
+        ActivityLog.objects.all().delete()
+        addon.force_disable(skip_activity_log=True)
+        assert addon.status == amo.STATUS_DISABLED
+        assert not ActivityLog.objects.exists()
+
+    @patch('olympia.addons.tasks.restore_all_addon_media_from_backup')
+    def test_force_enable(self, restore_all_addon_media_from_backup_mock):
+        core.set_user(UserProfile.objects.get(email='admin@mozilla.com'))
+        addon = Addon.unfiltered.get(pk=3615)
+        v1 = addon.current_version
+        v2 = version_factory(addon=addon)
+        v3 = version_factory(addon=addon)
+        addon.update(status=amo.STATUS_DISABLED)
+        v1.file.update(
+            status=amo.STATUS_DISABLED,
+            original_status=amo.STATUS_APPROVED,
+            # We don't want to re-enable a version the developer disabled
+            status_disabled_reason=File.STATUS_DISABLED_REASONS.DEVELOPER,
+        )
+        v2.file.update(
+            status=amo.STATUS_DISABLED,
+            original_status=amo.STATUS_APPROVED,
+            # we also don't want to re-enable a version we rejected
+            status_disabled_reason=File.STATUS_DISABLED_REASONS.NONE,
+        )
+        v3.file.update(
+            status=amo.STATUS_DISABLED,
+            original_status=amo.STATUS_APPROVED,
+            # but we do want to re-enable a version we only disabled with the addon
+            status_disabled_reason=File.STATUS_DISABLED_REASONS.ADDON_DISABLE,
+        )
+
+        addon.force_enable()
+        assert addon.reload().status == amo.STATUS_APPROVED
+        assert v1.file.reload().status == amo.STATUS_DISABLED
+        assert v2.file.reload().status == amo.STATUS_DISABLED
+        assert v3.file.reload().status == amo.STATUS_APPROVED
+        log = ActivityLog.objects.latest('pk')
+        assert log.action == amo.LOG.FORCE_ENABLE.id
+
+        assert restore_all_addon_media_from_backup_mock.delay.call_count == 1
+        assert restore_all_addon_media_from_backup_mock.delay.call_args[0] == (
+            addon.pk,
+        )
+
+    @patch('olympia.addons.tasks.restore_all_addon_media_from_backup')
+    def test_force_enable_back_to_rejected(
+        self, restore_all_addon_media_from_backup_mock
+    ):
+        core.set_user(UserProfile.objects.get(email='admin@mozilla.com'))
+        addon = Addon.unfiltered.get(pk=3615)
+        v1 = addon.current_version
+        v2 = version_factory(addon=addon)
+        v3 = version_factory(addon=addon)
+        AddonApprovalsCounter.objects.create(
+            addon=addon,
+            content_review_status=AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.FAIL,
+        )
+        addon.update(status=amo.STATUS_DISABLED)
+        v1.file.update(
+            status=amo.STATUS_DISABLED,
+            original_status=amo.STATUS_APPROVED,
+            # We don't want to re-enable a version the developer disabled
+            status_disabled_reason=File.STATUS_DISABLED_REASONS.DEVELOPER,
+        )
+        v2.file.update(
+            status=amo.STATUS_DISABLED,
+            original_status=amo.STATUS_APPROVED,
+            # we also don't want to re-enable a version we rejected
+            status_disabled_reason=File.STATUS_DISABLED_REASONS.NONE,
+        )
+        v3.file.update(
+            status=amo.STATUS_DISABLED,
+            original_status=amo.STATUS_APPROVED,
+            # but we do want to re-enable a version we only disabled with the addon
+            status_disabled_reason=File.STATUS_DISABLED_REASONS.ADDON_DISABLE,
+        )
+
+        addon.force_enable()
+        assert addon.reload().status == amo.STATUS_REJECTED
+        assert v1.file.reload().status == amo.STATUS_DISABLED
+        assert v2.file.reload().status == amo.STATUS_DISABLED
+        assert v3.file.reload().status == amo.STATUS_APPROVED
+        assert ActivityLog.objects.latest('pk').action == amo.LOG.CHANGE_STATUS.id
+        assert (
+            ActivityLog.objects.exclude(action=amo.LOG.CHANGE_STATUS.id)
+            .latest('pk')
+            .action
+            == amo.LOG.FORCE_ENABLE.id
+        )
+
+        assert restore_all_addon_media_from_backup_mock.delay.call_count == 1
+        assert restore_all_addon_media_from_backup_mock.delay.call_args[0] == (
+            addon.pk,
+        )
+
+    def test_force_enable_skip_activity_log(self):
+        core.set_user(UserProfile.objects.get(email='admin@mozilla.com'))
+        addon = Addon.unfiltered.get(pk=3615)
+        addon.update(status=amo.STATUS_DISABLED)
+        ActivityLog.objects.all().delete()
+        addon.force_enable(skip_activity_log=True)
+        assert addon.status == amo.STATUS_APPROVED
+        assert not ActivityLog.objects.exists()
+
+    def test_get_icon_dir_and_path(self):
+        assert Addon(pk=4815162342).get_icon_dir().endswith('addon_icons/4815162')
+        assert (
+            Addon(pk=4815162342)
+            .get_icon_path('whatever')
+            .endswith('addon_icons/4815162/4815162342-whatever.png')
+        )
 
     def test_icon_url(self):
         """
@@ -710,41 +974,32 @@ class TestAddonModels(TestCase):
         4. Test for default non-THEME icon.
         """
         addon = Addon.objects.get(pk=3615)
-        assert addon.get_icon_url(32).endswith(
-            '/3/3615-32.png?modified=1275037317')
+        assert addon.get_icon_url(32).endswith('/3/3615-32.png?modified=1275037317')
 
         addon.icon_hash = 'somehash'
-        assert addon.get_icon_url(32).endswith(
-            '/3/3615-32.png?modified=somehash')
-
-        addon = Addon.objects.get(pk=6704)
-        addon.icon_type = None
-        assert addon.get_icon_url(32).endswith('/icons/default-theme.png'), (
-            'No match for %s' % addon.get_icon_url(32))
+        assert addon.get_icon_url(32).endswith('/3/3615-32.png?modified=somehash')
 
         addon = Addon.objects.get(pk=3615)
         addon.icon_type = None
-        assert addon.get_icon_url(32).endswith('icons/default-32.png')
+        assert (
+            addon.get_icon_url(32)
+            == 'http://testserver/static/img/addon-icons/default-32.png'
+        )
 
     def test_icon_url_default(self):
-        a = Addon.objects.get(pk=3615)
-        a.update(icon_type='')
-        default = 'icons/default-32.png'
-        assert a.get_icon_url(32).endswith(default)
-        assert a.get_icon_url(32).endswith(default)
-        assert a.get_icon_url(32, use_default=True).endswith(default)
-        assert a.get_icon_url(32, use_default=False) is None
-
-    def test_thumbnail_url(self):
-        """
-        Test for the actual thumbnail URL if it should exist, or the no-preview
-        url.
-        """
-        a = Addon.objects.get(pk=4664)
-        a.thumbnail_url.index('/previews/thumbs/20/20397.png?modified=')
-        a = Addon.objects.get(pk=5299)
-        assert a.thumbnail_url.endswith('/icons/no-preview.png'), (
-            'No match for %s' % a.thumbnail_url)
+        addon = Addon.objects.get(pk=3615)
+        addon.update(icon_type='')
+        # In prod there would be some cachebusting because we're using
+        # staticfiles's storage url() method, but in tests where we don't run
+        # collectstatic first that is not the case.
+        assert (
+            addon.get_icon_url(32)
+            == 'http://testserver/static/img/addon-icons/default-32.png'
+        )
+        assert (
+            addon.get_icon_url(64)
+            == 'http://testserver/static/img/addon-icons/default-64.png'
+        )
 
     def test_is_unreviewed(self):
         """Test if add-on is unreviewed or not"""
@@ -758,64 +1013,12 @@ class TestAddonModels(TestCase):
     def test_is_public(self):
         # Public add-on.
         addon = Addon.objects.get(pk=3615)
-        assert addon.status == amo.STATUS_PUBLIC
+        assert addon.status == amo.STATUS_APPROVED
         assert addon.is_public()
 
         # Should be public by status, but since it's disabled add-on it's not.
         addon.disabled_by_user = True
         assert not addon.is_public()
-
-    def test_is_restart_required(self):
-        addon = Addon.objects.get(pk=3615)
-        file_ = addon.current_version.all_files[0]
-        assert not file_.is_restart_required
-        assert not addon.is_restart_required
-
-        file_.update(is_restart_required=True)
-        assert Addon.objects.get(pk=3615).is_restart_required
-
-        addon.versions.all().delete()
-        addon._current_version = None
-        assert not addon.is_restart_required
-
-    def test_is_featured(self):
-        """Test if an add-on is globally featured"""
-        a = Addon.objects.get(pk=1003)
-        assert a.is_featured(amo.FIREFOX, 'en-US'), (
-            'globally featured add-on not recognized')
-
-    def test_get_featured_by_app(self):
-        addon = Addon.objects.get(pk=1003)
-        featured_coll = addon.collections.get().featuredcollection_set.get()
-        assert featured_coll.locale is None
-        # Get the applications this addon is featured for.
-        assert addon.get_featured_by_app() == {amo.FIREFOX.id: {None}}
-
-        featured_coll.update(locale='')
-        # Check that an empty string is considered None.
-        assert addon.get_featured_by_app() == {amo.FIREFOX.id: {None}}
-
-        featured_coll.update(locale='fr')
-        # Check the locale works.
-        assert addon.get_featured_by_app() == {amo.FIREFOX.id: {'fr'}}
-
-        pt_coll = collection_factory()
-        pt_coll.add_addon(addon)
-        FeaturedCollection.objects.create(collection=pt_coll,
-                                          application=amo.FIREFOX.id,
-                                          locale='pt-PT')
-        # Add another featured collection for the same application.
-        assert addon.get_featured_by_app() == {amo.FIREFOX.id: {'fr', 'pt-PT'}}
-
-        mobile_coll = collection_factory()
-        mobile_coll.add_addon(addon)
-        FeaturedCollection.objects.create(collection=mobile_coll,
-                                          application=amo.ANDROID.id,
-                                          locale='pt-PT')
-        # Add a featured collection for the a different application.
-        assert addon.get_featured_by_app() == {
-            amo.FIREFOX.id: {'fr', 'pt-PT'},
-            amo.ANDROID.id: {'pt-PT'}}
 
     def newlines_helper(self, string_before):
         addon = Addon.objects.get(pk=3615)
@@ -823,179 +1026,148 @@ class TestAddonModels(TestCase):
         addon.save()
         return addon.privacy_policy.localized_string_clean
 
-    def test_newlines_normal(self):
-        before = ("Paragraph one.\n"
-                  "This should be on the very next line.\n\n"
-                  "Should be two nl's before this line.\n\n\n"
-                  "Should be three nl's before this line.\n\n\n\n"
-                  "Should be four nl's before this line.")
+    def test_newlines(self):
+        before = (
+            'Paragraph one.\n'
+            'This should be on the very next line.\n\n'
+            "Should be two nl's before this line.\n\n\n"
+            "Should be two nl's before this line.\n\n\n\n"
+            "Should be two nl's before this line."
+        )
 
-        after = before  # Nothing special; this shouldn't change.
-
-        assert self.newlines_helper(before) == after
-
-    def test_newlines_ul(self):
-        before = ("<ul>\n\n"
-                  "<li>No nl's between the ul and the li.</li>\n\n"
-                  "<li>No nl's between li's.\n\n"
-                  "But there should be two before this line.</li>\n\n"
-                  "</ul>")
-
-        after = ("<ul>"
-                 "<li>No nl's between the ul and the li.</li>"
-                 "<li>No nl's between li's.\n\n"
-                 "But there should be two before this line.</li>"
-                 "</ul>")
+        # Markdown treats multiple blank lines as one.
+        after = (
+            'Paragraph one.\n'
+            'This should be on the very next line.\n\n'
+            "Should be two nl's before this line.\n\n"
+            "Should be two nl's before this line.\n\n"
+            "Should be two nl's before this line."
+        )
 
         assert self.newlines_helper(before) == after
 
-    def test_newlines_ul_tight(self):
-        before = ("There should be one nl between this and the ul.\n"
-                  "<ul><li>test</li><li>test</li></ul>\n"
-                  "There should be no nl's above this line.")
+    @patch('olympia.amo.templatetags.jinja_helpers.urlresolvers.get_outgoing_url')
+    def test_link_markdown(self, mock_get_outgoing_url):
+        mock_get_outgoing_url.return_value = 'https://www.mozilla.org'
+        before = 'Heres a link [to here!](https://www.mozilla.org "Click me!")'
 
-        after = ("There should be one nl between this and the ul.\n"
-                 "<ul><li>test</li><li>test</li></ul>"
-                 "There should be no nl's above this line.")
-
-        assert self.newlines_helper(before) == after
-
-    def test_newlines_ul_loose(self):
-        before = ("There should be two nl's between this and the ul.\n\n"
-                  "<ul><li>test</li><li>test</li></ul>\n\n"
-                  "There should be one nl above this line.")
-
-        after = ("There should be two nl's between this and the ul.\n\n"
-                 "<ul><li>test</li><li>test</li></ul>\n"
-                 "There should be one nl above this line.")
+        after = (
+            'Heres a link '
+            '<a href="https://www.mozilla.org" '
+            'title="Click me!" rel="nofollow">'
+            'to here!'
+            '</a>'
+        )
 
         assert self.newlines_helper(before) == after
 
-    def test_newlines_blockquote_tight(self):
-        before = ("There should be one nl below this.\n"
-                  "<blockquote>Hi</blockquote>\n"
-                  "There should be no nl's above this.")
-
-        after = ("There should be one nl below this.\n"
-                 "<blockquote>Hi</blockquote>"
-                 "There should be no nl's above this.")
-
-        assert self.newlines_helper(before) == after
-
-    def test_newlines_blockquote_loose(self):
-        before = ("There should be two nls below this.\n\n"
-                  "<blockquote>Hi</blockquote>\n\n"
-                  "There should be one nl above this.")
-
-        after = ("There should be two nls below this.\n\n"
-                 "<blockquote>Hi</blockquote>\n"
-                 "There should be one nl above this.")
+    def test_abbr_markdown(self):
+        before = (
+            'TGIF ROFL\n\n*[TGIF]:i stand for this\n\n*[ROFL]: i stand for that\n\n'
+        )
+        after = (
+            '<abbr title="i stand for this">TGIF</abbr> '
+            '<abbr title="i stand for that">ROFL</abbr>'
+        )
 
         assert self.newlines_helper(before) == after
 
-    def test_newlines_inline(self):
-        before = ("If we end a paragraph w/ a <b>non-block-level tag</b>\n\n"
-                  "<b>The newlines</b> should be kept")
-
-        after = before  # Should stay the same
-
-        assert self.newlines_helper(before) == after
-
-    def test_newlines_code_inline(self):
-        before = ("Code tags aren't blocks.\n\n"
-                  "<code>alert(test);</code>\n\n"
-                  "See?")
-
-        after = before  # Should stay the same
+    def test_bold_markdown(self):
+        before = "Line.\n\n__This line is bold.__\n\n**So is this.**\n\nThis isn't."
+        after = (
+            'Line.\n\n<strong>This line is bold.</strong>\n\n'
+            "<strong>So is this.</strong>\n\nThis isn't."
+        )
 
         assert self.newlines_helper(before) == after
 
-    def test_newlines_li_newlines(self):
-        before = ("<ul><li>\nxx</li></ul>")
-        after = ("<ul><li>xx</li></ul>")
+    def test_italics_markdown(self):
+        before = "Line.\n\n_This line is emphasized._\n\n*So is this.*\n\nThis isn't."
+        after = (
+            'Line.\n\n<em>This line is emphasized.</em>\n\n'
+            "<em>So is this.</em>\n\nThis isn't."
+        )
+
         assert self.newlines_helper(before) == after
 
-        before = ("<ul><li>xx\n</li></ul>")
-        after = ("<ul><li>xx</li></ul>")
+    def test_empty_markdown(self):
+        before = 'This is a **** test!'
+        after = before
+
         assert self.newlines_helper(before) == after
 
-        before = ("<ul><li>xx\nxx</li></ul>")
-        after = ("<ul><li>xx\nxx</li></ul>")
+    def test_nested_newline(self):
+        # Nested newlines escape the markdown.
+        before = '**\nThis line is not bold.\n\n*This is italic***'
+        after = '**\nThis line is not bold.\n\n<em>This is italic</em>**'
+
         assert self.newlines_helper(before) == after
 
-        before = ("<ul><li></li></ul>")
-        after = ("<ul><li></li></ul>")
+    def test_code_markdown(self):
+        before = (
+            '````'
+            'System.out.println("Hello, World!")'
+            '````\n\n'
+            '    System.out.println("Hello Again!")'
+        )
+
+        after = (
+            '<code>System.out.println("Hello, World!")</code>\n\n'
+            '<code>System.out.println("Hello Again!")\n</code>'
+        )
+
+        assert self.newlines_helper(before) == after
+
+    def test_blockquote_markdown(self):
+        before = 'Test.\n\n> \n> -  \n\ntest.'
+        after = 'Test.\n<blockquote><ul><li></li></ul></blockquote>\ntest.'
+
+        assert self.newlines_helper(before) == after
+
+    def test_ul_markdown(self):
+        before = '* \nxx'
+        after = '<ul><li>xx</li></ul>'
+        assert self.newlines_helper(before) == after
+
+        before = '* xx'
+        after = '<ul><li>xx</li></ul>'
+        assert self.newlines_helper(before) == after
+
+        before = '* xx\nxx'
+        after = '<ul><li>xx\nxx</li></ul>'
+        assert self.newlines_helper(before) == after
+
+        before = '*'
+        after = before  # Doesn't do anything on its own
         assert self.newlines_helper(before) == after
 
         # All together now
-        before = ("<ul><li>\nxx</li> <li>xx\n</li> <li>xx\nxx</li> "
-                  "<li></li>\n</ul>")
+        before = '* \nxx\n* xx\n* \n* xx\nxx\n'
 
-        after = ("<ul><li>xx</li> <li>xx</li> <li>xx\nxx</li> "
-                 "<li></li></ul>")
-
+        after = '<ul><li>xx</li><li>xx</li><li></li><li>xx\nxx</li></ul>'
         assert self.newlines_helper(before) == after
 
-    def test_newlines_empty_tag(self):
-        before = ("This is a <b></b> test!")
-        after = before
-
+    def test_ol_markdown(self):
+        before = '1. \nxx'
+        after = '<ol><li>xx</li></ol>'
         assert self.newlines_helper(before) == after
 
-    def test_newlines_empty_tag_nested(self):
-        before = ("This is a <b><i></i></b> test!")
-        after = before
-
+        before = '1. xx'
+        after = '<ol><li>xx</li></ol>'
         assert self.newlines_helper(before) == after
 
-    def test_newlines_empty_tag_block_nested(self):
-        b = ("Test.\n\n<blockquote><ul><li></li></ul></blockquote>\ntest.")
-        a = ("Test.\n\n<blockquote><ul><li></li></ul></blockquote>test.")
-
-        assert self.newlines_helper(b) == a
-
-    def test_newlines_empty_tag_block_nested_spaced(self):
-        before = ("Test.\n\n<blockquote>\n\n<ul>\n\n<li>"
-                  "</li>\n\n</ul>\n\n</blockquote>\ntest.")
-        after = ("Test.\n\n<blockquote><ul><li></li></ul></blockquote>test.")
-
+        before = '1. xx\nxx'
+        after = '<ol><li>xx\nxx</li></ol>'
         assert self.newlines_helper(before) == after
 
-    def test_newlines_li_newlines_inline(self):
-        before = ("<ul><li>\n<b>test\ntest\n\ntest</b>\n</li>"
-                  "<li>Test <b>test</b> test.</li></ul>")
-
-        after = ("<ul><li><b>test\ntest\n\ntest</b></li>"
-                 "<li>Test <b>test</b> test.</li></ul>")
-
+        before = '1.'
+        after = before  # Doesn't do anything on its own
         assert self.newlines_helper(before) == after
 
-    def test_newlines_li_all_inline(self):
-        before = ("Test with <b>no newlines</b> and <code>block level "
-                  "stuff</code> to see what happens.")
+        # All together now
+        before = '1. \nxx\n2. xx\n3. \n4. xx\nxx\n'
 
-        after = before  # Should stay the same
-
-        assert self.newlines_helper(before) == after
-
-    def test_newlines_spaced_blocks(self):
-        before = ("<blockquote>\n\n<ul>\n\n<li>\n\ntest\n\n</li>\n\n"
-                  "</ul>\n\n</blockquote>")
-
-        after = "<blockquote><ul><li>test</li></ul></blockquote>"
-
-        assert self.newlines_helper(before) == after
-
-    def test_newlines_spaced_inline(self):
-        before = "Line.\n\n<b>\nThis line is bold.\n</b>\n\nThis isn't."
-        after = before
-
-        assert self.newlines_helper(before) == after
-
-    def test_newlines_nested_inline(self):
-        before = "<b>\nThis line is bold.\n\n<i>This is also italic</i></b>"
-        after = before
-
+        after = '<ol><li>xx</li><li>xx</li><li></li><li>xx\nxx</li></ol>'
         assert self.newlines_helper(before) == after
 
     def test_newlines_xss_script(self):
@@ -1005,13 +1177,12 @@ class TestAddonModels(TestCase):
         assert self.newlines_helper(before) == after
 
     def test_newlines_xss_inline(self):
-        before = "<b onclick=\"alert('test');\">test</b>"
-        after = "<b>test</b>"
+        before = '<b onclick="alert(\'test\');">test</b>'
+        after = '&lt;b onclick="alert(\'test\');"&gt;test&lt;/b&gt;'
 
         assert self.newlines_helper(before) == after
 
-    @patch(
-        'olympia.amo.templatetags.jinja_helpers.urlresolvers.get_outgoing_url')
+    @patch('olympia.amo.templatetags.jinja_helpers.urlresolvers.get_outgoing_url')
     def test_newlines_attribute_link_doublequote(self, mock_get_outgoing_url):
         mock_get_outgoing_url.return_value = 'http://google.com'
         before = '<a href="http://google.com">test</a>'
@@ -1020,160 +1191,59 @@ class TestAddonModels(TestCase):
 
         assert 'rel="nofollow"' in parsed
 
-    def test_newlines_attribute_singlequote(self):
-        before = "<abbr title='laugh out loud'>lol</abbr>"
-        after = '<abbr title="laugh out loud">lol</abbr>'
+    def test_newlines_tag(self):
+        # user-inputted HTML is cleaned and ignored in favour of markdown.
+        # Disallowed markdown is stripped from the final result.
+        before = 'This is a <b>bold</b> **test!** \n\n --- \n\n'
+        after = 'This is a &lt;b&gt;bold&lt;/b&gt; <strong>test!</strong>'
 
         assert self.newlines_helper(before) == after
 
-    def test_newlines_attribute_doublequote(self):
-        before = '<abbr title="laugh out loud">lol</abbr>'
-        after = before
-
-        assert self.newlines_helper(before) == after
-
-    def test_newlines_attribute_nestedquotes_doublesingle(self):
-        before = '<abbr title="laugh \'out\' loud">lol</abbr>'
-        after = before
-
-        assert self.newlines_helper(before) == after
-
-    def test_newlines_attribute_nestedquotes_singledouble(self):
-        before = '<abbr title=\'laugh "out" loud\'>lol</abbr>'
-        after = before
-
-        assert self.newlines_helper(before) == after
-
-    def test_newlines_unclosed_b(self):
-        before = ("<b>test")
-        after = ("<b>test</b>")
-
-        assert self.newlines_helper(before) == after
-
-    def test_newlines_unclosed_b_wrapped(self):
-        before = ("This is a <b>test")
-        after = ("This is a <b>test</b>")
-
-        assert self.newlines_helper(before) == after
-
-    def test_newlines_unclosed_li(self):
-        before = ("<ul><li>test</ul>")
-        after = ("<ul><li>test</li></ul>")
+    def test_newlines_unclosed_tag(self):
+        before = '<b>test'
+        after = '&lt;b&gt;test'
 
         assert self.newlines_helper(before) == after
 
     def test_newlines_malformed_faketag(self):
-        before = "<madonna"
-        after = ""
+        before = '<madonna'
+        after = '&lt;madonna'
 
         assert self.newlines_helper(before) == after
 
     def test_newlines_correct_faketag(self):
-        before = "<madonna>"
-        after = "&lt;madonna&gt;"
+        before = '<madonna>'
+        after = '&lt;madonna&gt;'
 
         assert self.newlines_helper(before) == after
 
     def test_newlines_malformed_tag(self):
-        before = "<strong"
-        after = ""
+        before = '<strong'
+        after = '&lt;strong'
 
         assert self.newlines_helper(before) == after
 
     def test_newlines_malformed_faketag_surrounded(self):
-        before = "This is a <test of bleach"
-        after = 'This is a'
+        before = 'This is a <test of JustHTML'
+        after = 'This is a &lt;test of JustHTML'
         assert self.newlines_helper(before) == after
 
     def test_newlines_malformed_tag_surrounded(self):
-        before = "This is a <strong of bleach"
-        after = "This is a"
+        before = 'This is a <strong of JustHTML'
+        after = 'This is a &lt;strong of JustHTML'
         assert self.newlines_helper(before) == after
 
     def test_newlines_less_than(self):
-        before = "3 < 5"
-        after = "3 &lt; 5"
+        before = '3 < 5'
+        after = '3 &lt; 5'
 
         assert self.newlines_helper(before) == after
 
     def test_newlines_less_than_tight(self):
-        before = "abc 3<5 def"
-        after = "abc 3&lt;5 def"
+        before = 'abc 3<5 def'
+        after = 'abc 3&lt;5 def'
 
         assert self.newlines_helper(before) == after
-
-    def test_app_categories(self):
-        def get_addon():
-            return Addon.objects.get(pk=3615)
-
-        # This add-on is already associated with three Firefox categories
-        # using fixtures: Bookmarks, Feeds, Social.
-        FIREFOX_EXT_CATS = CATEGORIES[amo.FIREFOX.id][amo.ADDON_EXTENSION]
-        expected_firefox_cats = [
-            FIREFOX_EXT_CATS['bookmarks'],
-            FIREFOX_EXT_CATS['feeds-news-blogging'],
-            FIREFOX_EXT_CATS['social-communication']
-        ]
-
-        addon = get_addon()
-        assert sorted(addon.all_categories) == expected_firefox_cats
-        assert addon.app_categories == {'firefox': expected_firefox_cats}
-
-        # Let's add a ANDROID category.
-        android_static_cat = (
-            CATEGORIES[amo.ANDROID.id][amo.ADDON_EXTENSION]['sports-games'])
-        and_category = Category.from_static_category(android_static_cat)
-        and_category.save()
-        AddonCategory.objects.create(addon=addon, category=and_category)
-
-        # Reload the addon to get a fresh, uncached categories list.
-        addon = get_addon()
-
-        # Test that the ANDROID category was added correctly.
-        assert sorted(addon.all_categories) == sorted(
-            expected_firefox_cats + [android_static_cat])
-        assert sorted(addon.app_categories.keys()) == ['android', 'firefox']
-        assert addon.app_categories['firefox'] == expected_firefox_cats
-        assert addon.app_categories['android'] == [android_static_cat]
-
-    def test_app_categories_ignore_unknown_cats(self):
-        def get_addon():
-            return Addon.objects.get(pk=3615)
-
-        # This add-on is already associated with three Firefox categories
-        # using fixtures: Bookmarks, Feeds, Social.
-        FIREFOX_EXT_CATS = CATEGORIES[amo.FIREFOX.id][amo.ADDON_EXTENSION]
-        expected_firefox_cats = [
-            FIREFOX_EXT_CATS['bookmarks'],
-            FIREFOX_EXT_CATS['feeds-news-blogging'],
-            FIREFOX_EXT_CATS['social-communication']
-        ]
-
-        addon = get_addon()
-        assert sorted(addon.all_categories) == sorted(expected_firefox_cats)
-        assert addon.app_categories == {'firefox': expected_firefox_cats}
-
-        # Associate this add-on with a couple more categories, including
-        # one that does not exist in the constants.
-        unknown_cat = Category.objects.create(
-            application=amo.SUNBIRD.id, id=123456, type=amo.ADDON_EXTENSION)
-        AddonCategory.objects.create(addon=addon, category=unknown_cat)
-        android_static_cat = (
-            CATEGORIES[amo.ANDROID.id][amo.ADDON_EXTENSION]['sports-games'])
-        an_category = Category.from_static_category(android_static_cat)
-        an_category.save()
-        AddonCategory.objects.create(addon=addon, category=an_category)
-
-        # Reload the addon to get a fresh, uncached categories list.
-        addon = get_addon()
-
-        # The sunbird category should not be present since it does not match
-        # an existing static category, android one should have been added.
-        assert sorted(addon.all_categories) == sorted(
-            expected_firefox_cats + [android_static_cat])
-        assert sorted(addon.app_categories.keys()) == ['android', 'firefox']
-        assert addon.app_categories['firefox'] == expected_firefox_cats
-        assert addon.app_categories['android'] == [android_static_cat]
 
     def test_review_replies(self):
         """
@@ -1183,20 +1253,28 @@ class TestAddonModels(TestCase):
         addon = Addon.objects.get(id=3615)
         u = UserProfile.objects.get(pk=999)
         version = addon.current_version
-        new_rating = Rating(version=version, user=u, rating=2, body='hello',
-                            addon=addon)
+        new_rating = Rating(
+            version=version, user=u, rating=2, body='hello', addon=addon
+        )
         new_rating.save()
-        new_reply = Rating(version=version, user=addon.authors.all()[0],
-                           addon=addon, reply_to=new_rating,
-                           rating=2, body='my reply')
+        new_reply = Rating(
+            version=version,
+            user=addon.authors.all()[0],
+            addon=addon,
+            reply_to=new_rating,
+            rating=2,
+            body='my reply',
+        )
         new_reply.save()
 
         review_list = [rating.pk for rating in addon.ratings]
 
         assert new_rating.pk in review_list, (
-            'Original review must show up in review list.')
+            'Original review must show up in review list.'
+        )
         assert new_reply.pk not in review_list, (
-            'Developer reply must not show up in review list.')
+            'Developer reply must not show up in review list.'
+        )
 
     def test_update_logs(self):
         addon = Addon.objects.get(id=3615)
@@ -1209,15 +1287,23 @@ class TestAddonModels(TestCase):
     def setup_files(self, status):
         addon = Addon.objects.create(type=1)
         version = Version.objects.create(addon=addon)
-        File.objects.create(status=status, version=version)
+        File.objects.create(status=status, version=version, manifest_version=2)
         return addon, version
 
-    def test_no_change_disabled_user(self):
+    def test_disabled_by_user_disables_listed_versions_waiting_for_review(self):
         addon, version = self.setup_files(amo.STATUS_AWAITING_REVIEW)
-        addon.update(status=amo.STATUS_PUBLIC)
+        addon.update(status=amo.STATUS_APPROVED)
         addon.update(disabled_by_user=True)
         version.save()
-        assert addon.status == amo.STATUS_PUBLIC
+        file_ = version.file
+        file_.reload()
+        assert version.file.status == amo.STATUS_DISABLED
+        assert version.file.original_status == amo.STATUS_AWAITING_REVIEW
+        assert (
+            version.file.status_disabled_reason
+            == File.STATUS_DISABLED_REASONS.DEVELOPER
+        )
+        assert addon.status == amo.STATUS_NULL
         assert addon.is_disabled
 
     def test_no_change_disabled(self):
@@ -1238,19 +1324,15 @@ class TestAddonModels(TestCase):
 
     def test_removing_public(self):
         addon, version = self.setup_files(amo.STATUS_AWAITING_REVIEW)
-        addon.update(status=amo.STATUS_PUBLIC)
+        addon.update(status=amo.STATUS_APPROVED)
         version.save()
         assert addon.status == amo.STATUS_NOMINATED
 
-    def test_can_request_review_no_files(self):
-        addon = Addon.objects.get(pk=3615)
-        addon.versions.all()[0].files.all().delete()
-        assert addon.can_request_review() is False
-
     def test_can_request_review_rejected(self):
         addon = Addon.objects.get(pk=3615)
-        latest_version = addon.find_latest_version(amo.RELEASE_CHANNEL_LISTED)
-        latest_version.files.update(status=amo.STATUS_DISABLED)
+        latest_version = addon.find_latest_version(amo.CHANNEL_LISTED)
+        latest_version.update(human_review_date=datetime.now())
+        latest_version.file.update(status=amo.STATUS_DISABLED)
         assert addon.can_request_review() is False
 
     def check_can_request_review(self, status, expected, extra_update_kw=None):
@@ -1267,13 +1349,14 @@ class TestAddonModels(TestCase):
 
     def test_can_request_review_null_disabled(self):
         self.check_can_request_review(
-            amo.STATUS_NULL, False, extra_update_kw={'disabled_by_user': True})
+            amo.STATUS_NULL, False, extra_update_kw={'disabled_by_user': True}
+        )
 
     def test_can_request_review_nominated(self):
         self.check_can_request_review(amo.STATUS_NOMINATED, False)
 
     def test_can_request_review_public(self):
-        self.check_can_request_review(amo.STATUS_PUBLIC, False)
+        self.check_can_request_review(amo.STATUS_APPROVED, False)
 
     def test_can_request_review_disabled(self):
         self.check_can_request_review(amo.STATUS_DISABLED, False)
@@ -1306,12 +1389,12 @@ class TestAddonModels(TestCase):
     def delete(self):
         addon = Addon.objects.get(id=3615)
         assert len(mail.outbox) == 0
-        addon.delete('so long and thanks for all the fish')
+        addon.delete(msg='so long and thanks for all the fish')
         assert len(mail.outbox) == 1
 
     def test_delete_to(self):
         self.delete()
-        assert mail.outbox[0].to == [settings.FLIGTAR]
+        assert mail.outbox[0].to == [settings.DELETION_EMAIL]
 
     def test_delete_by(self):
         try:
@@ -1336,50 +1419,29 @@ class TestAddonModels(TestCase):
         assert 'Deleting EXTENSION a3615 (3615)' in admin_mail.subject
         assert 'The following EXTENSION was deleted' in admin_mail.body
 
-    def test_view_source(self):
-        # view_source should default to True.
-        a = Addon.objects.create(type=1)
-        assert a.view_source
-
-    @patch('olympia.files.models.File.hide_disabled_file')
-    def test_admin_disabled_file_hidden(self, hide_mock):
-        a = Addon.objects.get(id=3615)
-        a.status = amo.STATUS_PUBLIC
-        a.save()
-        assert not hide_mock.called
-
-        a.status = amo.STATUS_DISABLED
-        a.save()
-        assert hide_mock.called
-
-    @patch('olympia.files.models.File.hide_disabled_file')
-    def test_user_disabled_file_hidden(self, hide_mock):
-        a = Addon.objects.get(id=3615)
-        a.disabled_by_user = False
-        a.save()
-        assert not hide_mock.called
-
-        a.disabled_by_user = True
-        a.save()
-        assert hide_mock.called
-
     def test_category_transform(self):
         addon = Addon.objects.get(id=3615)
-        cats = addon.categories.filter(application=amo.FIREFOX.id)
-        names = [c.name for c in cats]
-        assert addon.get_category(amo.FIREFOX.id).name in names
+        assert addon.all_categories[0] in CATEGORIES[addon.type].values()
 
-    def test_binary_property(self):
+    def test_can_submit_listed_versions(self):
         addon = Addon.objects.get(id=3615)
-        file = addon.current_version.files.all()[0]
-        file.update(binary=True)
-        assert addon.binary
+        assert addon.can_submit_listed_versions()
 
-    def test_binary_components_property(self):
+        addon.update(status=amo.STATUS_REJECTED)
+        assert not addon.can_submit_listed_versions()
+
+    def test_can_submit_listed_versions_deleted(self):
         addon = Addon.objects.get(id=3615)
-        file = addon.current_version.files.all()[0]
-        file.update(binary_components=True)
-        assert addon.binary_components
+        addon.update(status=amo.STATUS_DELETED)
+        assert not addon.can_submit_listed_versions()
+
+    def test_can_submit_listed_versions_disabled(self):
+        addon = Addon.objects.get(id=3615)
+        addon.update(status=amo.STATUS_DISABLED)
+        assert not addon.can_submit_listed_versions()
+
+        addon.update(status=amo.STATUS_APPROVED, disabled_by_user=True)
+        assert not addon.can_submit_listed_versions()
 
     def test_listed_has_complete_metadata_no_categories(self):
         addon = Addon.objects.get(id=3615)
@@ -1397,8 +1459,16 @@ class TestAddonModels(TestCase):
         delete_translation(addon, 'summary')
         addon = Addon.objects.get(id=3615)
         assert not addon.has_complete_metadata()
-        assert addon.has_complete_metadata(
-            has_listed_versions=False)
+        assert addon.has_complete_metadata(has_listed_versions=False)
+
+    def test_listed_has_complete_metadata_no_name(self):
+        addon = Addon.objects.get(id=3615)
+        assert addon.has_complete_metadata()  # Confirm complete already.
+
+        delete_translation(addon, 'name')
+        addon = Addon.objects.get(id=3615)
+        assert not addon.has_complete_metadata()
+        assert addon.has_complete_metadata(has_listed_versions=False)
 
     def test_listed_has_complete_metadata_no_license(self):
         addon = Addon.objects.get(id=3615)
@@ -1407,12 +1477,11 @@ class TestAddonModels(TestCase):
         addon.current_version.update(license=None)
         addon = Addon.objects.get(id=3615)
         assert not addon.has_complete_metadata()
-        assert addon.has_complete_metadata(
-            has_listed_versions=False)
+        assert addon.has_complete_metadata(has_listed_versions=False)
 
     def test_unlisted_has_complete_metadata(self):
         addon = Addon.objects.get(id=3615)
-        self.make_addon_unlisted(addon)
+        self.change_channel_for_addon(addon, amo.CHANNEL_UNLISTED)
         assert addon.has_complete_metadata()  # Confirm complete already.
 
         # Clear everything
@@ -1422,17 +1491,6 @@ class TestAddonModels(TestCase):
         addon = Addon.objects.get(id=3615)
         assert addon.has_complete_metadata()  # Still complete
         assert not addon.has_complete_metadata(has_listed_versions=True)
-
-    def test_can_review(self):
-        user = AnonymousUser()
-        addon = Addon.objects.get(id=3615)
-        assert addon.can_review(user)
-
-        user = addon.addonuser_set.all()[0].user
-        assert not addon.can_review(user)
-
-        user = UserProfile.objects.get(pk=2519)
-        assert addon.can_review(user)
 
     def test_has_author(self):
         addon = Addon.objects.get(id=3615)
@@ -1454,29 +1512,169 @@ class TestAddonModels(TestCase):
         flags.update(auto_approval_disabled=True)
         assert addon.auto_approval_disabled is True
 
-    def test_needs_admin_code_review_property(self):
+    def test_auto_approval_disabled_unlisted_property(self):
         addon = Addon.objects.get(pk=3615)
         # No flags: None
-        assert addon.needs_admin_code_review is None
-        # Flag present, value is False (default): False.
+        assert addon.auto_approval_disabled_unlisted is None
+        # Flag present, value is None (default): None.
         flags = AddonReviewerFlags.objects.create(addon=addon)
-        assert flags.needs_admin_code_review is False
-        assert addon.needs_admin_code_review is False
+        assert flags.auto_approval_disabled_unlisted is None
+        assert addon.auto_approval_disabled_unlisted is None
         # Flag present, value is True: True.
-        flags.update(needs_admin_code_review=True)
-        assert addon.needs_admin_code_review is True
+        flags.update(auto_approval_disabled_unlisted=True)
+        assert addon.auto_approval_disabled_unlisted is True
+        # Flag present, value is False: False.
+        flags.update(auto_approval_disabled_unlisted=False)
+        assert addon.auto_approval_disabled_unlisted is False
 
-    def test_needs_admin_content_review_property(self):
+    def test_auto_approval_disabled_until_next_approval_property(self):
         addon = Addon.objects.get(pk=3615)
         # No flags: None
-        assert addon.needs_admin_content_review is None
-        # Flag present, value is False (default): False.
+        assert addon.auto_approval_disabled_until_next_approval is None
+        # Flag present, value is None (default): None.
         flags = AddonReviewerFlags.objects.create(addon=addon)
-        assert flags.needs_admin_content_review is False
-        assert addon.needs_admin_content_review is False
+        assert flags.auto_approval_disabled_until_next_approval is None
+        assert addon.auto_approval_disabled_until_next_approval is None
         # Flag present, value is True: True.
-        flags.update(needs_admin_content_review=True)
-        assert addon.needs_admin_content_review is True
+        flags.update(auto_approval_disabled_until_next_approval=True)
+        assert addon.auto_approval_disabled_until_next_approval is True
+        # Flag present, value is False: False.
+        flags.update(auto_approval_disabled_until_next_approval=False)
+        assert addon.auto_approval_disabled_until_next_approval is False
+
+    def test_auto_approval_disabled_until_next_approval_unlisted_property(self):
+        addon = Addon.objects.get(pk=3615)
+        # No flags: None
+        assert addon.auto_approval_disabled_until_next_approval_unlisted is None
+        # Flag present, value is None (default): None.
+        flags = AddonReviewerFlags.objects.create(addon=addon)
+        assert flags.auto_approval_disabled_until_next_approval_unlisted is None
+        assert addon.auto_approval_disabled_until_next_approval_unlisted is None
+        # Flag present, value is True: True.
+        flags.update(auto_approval_disabled_until_next_approval_unlisted=True)
+        assert addon.auto_approval_disabled_until_next_approval_unlisted is True
+        # Flag present, value is False: False.
+        flags.update(auto_approval_disabled_until_next_approval_unlisted=False)
+        assert addon.auto_approval_disabled_until_next_approval_unlisted is False
+
+    def test_auto_approval_delayed_until_property(self):
+        addon = Addon.objects.get(pk=3615)
+        # No flags: None
+        assert addon.auto_approval_delayed_until is None
+        # Flag present, value is None (default): None.
+        flags = AddonReviewerFlags.objects.create(addon=addon)
+        assert flags.auto_approval_delayed_until is None
+        assert addon.auto_approval_delayed_until is None
+        # Flag present, value is a date.
+        in_the_past = self.days_ago(1)
+        flags.update(auto_approval_delayed_until=in_the_past)
+        assert addon.auto_approval_delayed_until == in_the_past
+
+    def test_auto_approval_delayed_until_unlisted_property(self):
+        addon = Addon.objects.get(pk=3615)
+        # No flags: None
+        assert addon.auto_approval_delayed_until_unlisted is None
+        # Flag present, value is None (default): None.
+        flags = AddonReviewerFlags.objects.create(addon=addon)
+        assert flags.auto_approval_delayed_until_unlisted is None
+        assert addon.auto_approval_delayed_until_unlisted is None
+        # Flag present, value is a date.
+        in_the_past = self.days_ago(1)
+        flags.update(auto_approval_delayed_until_unlisted=in_the_past)
+        assert addon.auto_approval_delayed_until_unlisted == in_the_past
+
+    def test_auto_approval_delayed_indefinitely_property(self):
+        addon = Addon.objects.get(pk=3615)
+        # No flags: None
+        assert addon.auto_approval_delayed_indefinitely is False
+        # Flag present, value is None (default): None.
+        flags = AddonReviewerFlags.objects.create(addon=addon)
+        assert addon.auto_approval_delayed_indefinitely is False
+        # Flag present, value is a date.
+        in_the_past = self.days_ago(1)
+        flags.update(auto_approval_delayed_until=in_the_past)
+        assert addon.auto_approval_delayed_indefinitely is False
+        # In the future, but not far enough.
+        in_the_future = datetime.now() + timedelta(hours=24)
+        flags.update(auto_approval_delayed_until=in_the_future)
+        assert addon.auto_approval_delayed_indefinitely is False
+        # This time it's truly delayed indefinitely.
+        flags.update(auto_approval_delayed_until=datetime.max)
+        assert addon.auto_approval_delayed_indefinitely is True
+
+    def test_auto_approval_delayed_indefinitely_unlisted_property(self):
+        addon = Addon.objects.get(pk=3615)
+        # No flags: None
+        assert addon.auto_approval_delayed_indefinitely_unlisted is False
+        # Flag present, value is None (default): None.
+        flags = AddonReviewerFlags.objects.create(addon=addon)
+        assert addon.auto_approval_delayed_indefinitely_unlisted is False
+        # Flag present, value is a date.
+        in_the_past = self.days_ago(1)
+        flags.update(auto_approval_delayed_until_unlisted=in_the_past)
+        assert addon.auto_approval_delayed_indefinitely_unlisted is False
+        # In the future, but not far enough.
+        in_the_future = datetime.now() + timedelta(hours=24)
+        flags.update(auto_approval_delayed_until_unlisted=in_the_future)
+        assert addon.auto_approval_delayed_indefinitely_unlisted is False
+        # This time it's truly delayed indefinitely.
+        flags.update(auto_approval_delayed_until_unlisted=datetime.max)
+        assert addon.auto_approval_delayed_indefinitely_unlisted is True
+        # We only consider the unlisted flag.
+        flags.update(
+            auto_approval_delayed_until_unlisted=datetime.now(),
+            auto_approval_delayed_until=datetime.max,
+        )
+        assert addon.auto_approval_delayed_indefinitely_unlisted is False
+        flags.update(
+            auto_approval_delayed_until_unlisted=datetime.max,
+            auto_approval_delayed_until=datetime.now(),
+        )
+        assert addon.auto_approval_delayed_indefinitely_unlisted is True
+
+    def test_auto_approval_delayed_temporarily_property(self):
+        addon = Addon.objects.get(pk=3615)
+        # No flags: None
+        assert addon.auto_approval_delayed_temporarily is False
+        # Flag present, value is None (default): None.
+        flags = AddonReviewerFlags.objects.create(addon=addon)
+        assert addon.auto_approval_delayed_temporarily is False
+        # Flag present, value is a date.
+        in_the_past = self.days_ago(1)
+        flags.update(auto_approval_delayed_until=in_the_past)
+        assert addon.auto_approval_delayed_temporarily is False
+        # Flag present, now properly in the future.
+        in_the_future = datetime.now() + timedelta(hours=24)
+        flags.update(auto_approval_delayed_until=in_the_future)
+        assert addon.auto_approval_delayed_temporarily is True
+        # Not considered temporary any more if it's until the end of time!
+        flags.update(auto_approval_delayed_until=datetime.max)
+        assert addon.auto_approval_delayed_temporarily is False
+        # Not even if the unlisted flag is set since it's a separate property.
+        flags.update(auto_approval_delayed_until_unlisted=in_the_future)
+        assert addon.auto_approval_delayed_temporarily is False
+
+    def test_auto_approval_delayed_temporarily_unlisted_property(self):
+        addon = Addon.objects.get(pk=3615)
+        # No flags: None
+        assert addon.auto_approval_delayed_temporarily_unlisted is False
+        # Flag present, value is None (default): None.
+        flags = AddonReviewerFlags.objects.create(addon=addon)
+        assert addon.auto_approval_delayed_temporarily_unlisted is False
+        # Flag present, value is a date.
+        in_the_past = self.days_ago(1)
+        flags.update(auto_approval_delayed_until_unlisted=in_the_past)
+        assert addon.auto_approval_delayed_temporarily_unlisted is True
+        # Flag present, now properly in the future.
+        in_the_future = datetime.now() + timedelta(hours=24)
+        flags.update(auto_approval_delayed_until_unlisted=in_the_future)
+        assert addon.auto_approval_delayed_temporarily_unlisted is True
+        # Not considered temporary any more if it's until the end of time!
+        flags.update(auto_approval_delayed_until_unlisted=datetime.max)
+        assert addon.auto_approval_delayed_temporarily_unlisted is False
+        # Not even if the listed flag is set since it's a separate property.
+        flags.update(auto_approval_delayed_until=in_the_future)
+        assert addon.auto_approval_delayed_temporarily_unlisted is False
 
     def test_needs_admin_theme_review_property(self):
         addon = Addon.objects.get(pk=3615)
@@ -1490,59 +1688,719 @@ class TestAddonModels(TestCase):
         flags.update(needs_admin_theme_review=True)
         assert addon.needs_admin_theme_review is True
 
-    def test_pending_info_request_property(self):
+    def test_content_review_status_property(self):
         addon = Addon.objects.get(pk=3615)
-        # No flags: None
-        assert addon.pending_info_request is None
-        # Flag present, value is None (default): None.
-        flags = AddonReviewerFlags.objects.create(addon=addon)
-        assert flags.pending_info_request is None
-        assert addon.pending_info_request is None
-        # Flag present, value is a date.
-        in_the_past = self.days_ago(1)
-        flags.update(pending_info_request=in_the_past)
-        assert addon.pending_info_request == in_the_past
+        # No approvals counter: unreviewed
+        assert (
+            addon.content_review_status
+            == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.UNREVIEWED
+        )
+        # approvals counter present, default is also unreviewed.
+        approvalscounter = AddonApprovalsCounter.objects.create(addon=addon)
+        assert (
+            addon.content_review_status
+            == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.UNREVIEWED
+        )
+        # follows the approvals counter value
+        approvalscounter.update(
+            content_review_status=AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.REQUESTED
+        )
+        assert (
+            addon.content_review_status
+            == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.REQUESTED
+        )
 
-    def test_expired_info_request_property(self):
+    def test_has_ongoing_content_review_request_property(self):
         addon = Addon.objects.get(pk=3615)
-        # No flags: None
-        assert addon.expired_info_request is None
-        # Flag present, value is None (default): None.
-        flags = AddonReviewerFlags.objects.create(addon=addon)
-        assert flags.pending_info_request is None
-        assert addon.expired_info_request is None
-        # Flag present, value is a date in the past.
-        in_the_past = self.days_ago(1)
-        flags.update(pending_info_request=in_the_past)
-        assert addon.expired_info_request
-
-        # Flag present, value is a date in the future.
-        in_the_future = datetime.now() + timedelta(days=2)
-        flags.update(pending_info_request=in_the_future)
-        assert not addon.expired_info_request
+        # Not even rejected: False
+        assert addon.has_ongoing_content_review_request is False
+        # No approvals counter: still False
+        addon.update(status=amo.STATUS_REJECTED)
+        assert addon.has_ongoing_content_review_request is False
+        # approvals counter present, default is unreviewed so still false
+        approvalscounter = AddonApprovalsCounter.objects.create(addon=addon)
+        assert addon.has_ongoing_content_review_request is False
+        # If requested, true.
+        approvalscounter.update(
+            content_review_status=AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.REQUESTED
+        )
+        assert addon.has_ongoing_content_review_request is True
 
     def test_attach_previews(self):
-        addons = [addon_factory(), addon_factory(), addon_factory()]
+        addons = [
+            addon_factory(),
+            addon_factory(),
+            addon_factory(),
+            addon_factory(type=amo.ADDON_STATICTHEME),
+        ]
         # Give some of the addons previews:
         # 2 for addons[0]
         pa = Preview.objects.create(addon=addons[0])
         pb = Preview.objects.create(addon=addons[0])
-        # nothing for addons[1]; and 1 for addons[2]
+        # nothing for addons[1]; and 1 for addons[2];
+        # addons[3] is a theme so doesn't have Preview instances
         pc = Preview.objects.create(addon=addons[2])
 
         Addon.attach_previews(addons)
 
-        # Create some more previews for [0] and [1].  As _all_previews and
-        # _current_previews are cached_property-s then if attach_previews
+        # Create some more previews for [0] and [1].
+        # As _current_previews is a cached_property then if attach_previews
         # worked then these new Previews won't be in the cached values.
         Preview.objects.create(addon=addons[0])
         Preview.objects.create(addon=addons[1])
-        assert addons[0]._all_previews == [pa, pb]
-        assert addons[1]._all_previews == []
-        assert addons[2]._all_previews == [pc]
         assert addons[0].current_previews == [pa, pb]
         assert addons[1].current_previews == []
         assert addons[2].current_previews == [pc]
+        # But addons[3]'s cached_property shouldn't have been filled with []
+        vp = VersionPreview.objects.create(version=addons[3].current_version)
+        assert addons[3].current_previews == [vp]
+
+    def test_no_promoted_groups(self):
+        addon = addon_factory()
+        assert not addon.promoted_groups()
+        assert not addon.promoted_groups(currently_approved=False)
+
+    def test_unapproved_promoted_groups(self):
+        addon = addon_factory()
+        self.make_addon_promoted(
+            addon=addon, api_name='pre_review', listed_pre_review=True
+        )
+        self.make_addon_promoted(addon=addon, api_name='line', listed_pre_review=True)
+        assert addon.promoted_groups(currently_approved=False)
+        assert not addon.promoted_groups()
+
+    def test_approved_promoted_groups(self):
+        addon = addon_factory()
+        self.make_addon_promoted(
+            addon=addon, api_name='pre_review', listed_pre_review=True
+        )
+        self.make_addon_promoted(addon=addon, api_name='line', listed_pre_review=True)
+        # spotlight group used later to swap a promotion to an unapproved group
+        spotlight_group, _ = PromotedGroup.objects.get_or_create(
+            api_name='spotlight', name='spotlight', listed_pre_review=True
+        )
+        addon.approve_for_version()
+        assert addon.promoted_groups()
+        assert 'pre_review' in addon.promoted_groups().api_name
+        assert 'line' in addon.promoted_groups().api_name
+        # if the group for one approved group changes, its
+        # approval for the current version isn't valid,
+        # but other groups remain valid
+        PromotedAddon.objects.filter(
+            addon=addon, promoted_group__api_name='pre_review'
+        ).update(promoted_group=spotlight_group)
+        assert 'spotlight' in addon.promoted_groups(currently_approved=False).api_name
+        assert 'line' in addon.promoted_groups(currently_approved=False).api_name
+        assert 'spotlight' not in addon.promoted_groups().api_name
+        assert 'line' in addon.promoted_groups().api_name
+
+    def test_unapproved_group_after_approval_promoted_groups(self):
+        addon = addon_factory()
+        self.make_addon_promoted(
+            addon=addon, api_name='pre_review', listed_pre_review=True
+        )
+        self.make_addon_promoted(addon=addon, api_name='line', listed_pre_review=True)
+        addon.approve_for_version()
+        self.make_addon_promoted(
+            addon=addon, api_name='notable', listed_pre_review=True
+        )
+        assert addon.promoted_groups()
+        assert 'pre_review' in addon.promoted_groups().api_name
+        assert 'line' in addon.promoted_groups().api_name
+        assert 'notable' not in addon.promoted_groups().api_name
+        assert 'notable' in addon.promoted_groups(currently_approved=False).api_name
+        # Unless approved.
+        addon.approve_for_version()
+        assert 'pre_review' in addon.promoted_groups().api_name
+        assert 'line' in addon.promoted_groups().api_name
+        assert 'notable' in addon.promoted_groups().api_name
+
+    def test_application_specific_multiple_promoted_groups(self):
+        addon = addon_factory()
+        self.make_addon_promoted(
+            addon=addon,
+            api_name='pre_review',
+            listed_pre_review=True,
+            approve_version=True,
+        )
+        self.make_addon_promoted(
+            addon=addon,
+            api_name='line',
+            listed_pre_review=True,
+            approve_version=True,
+        )
+        # Application specific group membership should still work
+        assert 'pre_review' in addon.promoted_groups().api_name
+        assert 'line' in addon.promoted_groups().api_name
+        # update to android only
+        PromotedAddon.objects.filter(
+            addon=addon,
+            promoted_group__api_name='line',
+            application_id=amo.FIREFOX.id,
+        ).delete()
+        assert 'pre_review' in addon.promoted_groups().api_name
+        assert 'line' in addon.promoted_groups().api_name
+
+        # but if there's no approval for Android it's not promoted
+        addon.current_version.promoted_versions.filter(
+            application_id=amo.ANDROID.id
+        ).delete()
+        assert 'pre_review' in addon.promoted_groups().api_name
+        assert 'line' not in addon.promoted_groups().api_name
+
+    def test_no_promoted(self):
+        addon = addon_factory()
+        # default case - no group so return None.
+        assert addon.publicly_promoted_groups == []
+
+    def test_promoted_groups_doesnt_error_with_no_version(self):
+        addon = addon_factory()
+        self.make_addon_promoted(
+            addon=addon, api_name='pre_review', listed_pre_review=True
+        )
+        addon.current_version.file.update(status=amo.STATUS_DISABLED)
+        addon.update_version()
+        assert not addon.current_version
+        assert not addon.promoted_groups()
+        assert addon.promoted_groups(currently_approved=False)
+
+    def test_unapproved_promoted(self):
+        addon = addon_factory()
+        self.make_addon_promoted(
+            addon=addon, api_name='pre_review', listed_pre_review=True
+        )
+        self.make_addon_promoted(addon=addon, api_name='line', listed_pre_review=True)
+        assert addon.publicly_promoted_groups == []
+
+    def test_approved_promoted(self):
+        addon = addon_factory()
+        self.make_addon_promoted(
+            addon=addon, api_name='pre_review', listed_pre_review=True
+        )
+        self.make_addon_promoted(addon=addon, api_name='line', listed_pre_review=True)
+        # spotlight group used later to swap a promotion to an unapproved group
+        spotlight_group, _ = PromotedGroup.objects.get_or_create(
+            api_name='spotlight', name='spotlight', listed_pre_review=True
+        )
+        addon.approve_for_version(addon.current_version)
+        assert (
+            PromotedGroup.objects.get(api_name='pre_review')
+            in addon.publicly_promoted_groups
+        )
+        assert (
+            PromotedGroup.objects.get(api_name='line') in addon.publicly_promoted_groups
+        )
+        # If the group changes the approval for that group
+        # in the current version isn't valid.
+        PromotedAddon.objects.filter(
+            addon=addon, promoted_group__api_name='pre_review'
+        ).update(promoted_group=spotlight_group)
+        del addon.publicly_promoted_groups
+        assert spotlight_group not in addon.publicly_promoted_groups
+        assert (
+            PromotedGroup.objects.get(api_name='line') in addon.publicly_promoted_groups
+        )
+
+    def test_unapproved_group_after_approval_promoted(self):
+        addon = addon_factory()
+        self.make_addon_promoted(
+            addon=addon, api_name='pre_review', listed_pre_review=True
+        )
+        self.make_addon_promoted(addon=addon, api_name='line', listed_pre_review=True)
+        addon.approve_for_version(addon.current_version)
+        self.make_addon_promoted(
+            addon=addon, api_name='spotlight', listed_pre_review=True
+        )
+        assert (
+            PromotedGroup.objects.get(api_name='line') in addon.publicly_promoted_groups
+        )
+        assert (
+            PromotedGroup.objects.get(api_name='pre_review')
+            in addon.publicly_promoted_groups
+        )
+        assert (
+            PromotedGroup.objects.get(api_name='spotlight')
+            not in addon.publicly_promoted_groups
+        )
+        # Approving approves them all
+        addon.approve_for_version(addon.current_version)
+        del addon.publicly_promoted_groups
+        assert (
+            PromotedGroup.objects.get(api_name='line') in addon.publicly_promoted_groups
+        )
+        assert (
+            PromotedGroup.objects.get(api_name='pre_review')
+            in addon.publicly_promoted_groups
+        )
+        assert (
+            PromotedGroup.objects.get(api_name='spotlight')
+            in addon.publicly_promoted_groups
+        )
+
+    def test_promoted_theme(self):
+        recommended, _ = PromotedGroup.objects.get_or_create(
+            api_name=RECOMMENDED_API_NAME, name='Recommended'
+        )
+        addon = addon_factory(type=amo.ADDON_STATICTHEME)
+        # default case - no group so return None.
+        assert not addon.publicly_promoted_groups
+
+        featured_collection, _ = Collection.objects.get_or_create(
+            id=settings.COLLECTION_FEATURED_THEMES_ID
+        )
+        featured_collection.add_addon(addon)
+        del addon.publicly_promoted_groups
+        # it's in the collection, so is now promoted.
+        assert addon.publicly_promoted_groups
+        assert any(
+            recommended == promotion for promotion in addon.publicly_promoted_groups
+        )
+
+        featured_collection.remove_addon(addon)
+        del addon.publicly_promoted_groups
+        addon = Addon.objects.get(id=addon.id)
+        # but not when it's removed.
+        assert not addon.publicly_promoted_groups
+
+    def test_block_property(self):
+        addon = Addon.objects.get(id=3615)
+        assert addon.block is None
+
+        del addon.block
+        block = Block.objects.create(guid=addon.guid, updated_by=user_factory())
+        assert addon.block == block
+
+        del addon.block
+        block.update(guid='not-a-guid')
+        assert addon.block is None
+
+        del addon.block
+        addon.delete()
+        AddonGUID.objects.create(addon=addon, guid='not-a-guid')
+        assert addon.block == block
+
+    def test_blocklistsubmissions_property(self):
+        addon = Addon.objects.get(id=3615)
+        assert not addon.blocklistsubmissions.exists()
+
+        submission = BlocklistSubmission.objects.create(
+            input_guids=addon.guid, updated_by=user_factory()
+        )
+        assert list(addon.blocklistsubmissions) == [submission]
+
+        submission.update(input_guids='not-a-guid')
+        submission.update(to_block=[{'guid': 'not-a-guid'}])
+        assert not addon.blocklistsubmissions.exists()
+
+        addon.delete()
+        AddonGUID.objects.create(addon=addon, guid='not-a-guid')
+        assert list(addon.blocklistsubmissions) == [submission]
+
+    def test_can_be_compatible_with_all_fenix_versions_property(self):
+        addon = addon_factory()
+        assert not addon.can_be_compatible_with_all_fenix_versions
+
+        # It's promoted but nothing has been approved.
+        self.make_addon_promoted(
+            addon=addon,
+            api_name='line',
+            listed_pre_review=True,
+            can_be_compatible_with_all_fenix_versions=True,
+        )
+        assert not addon.can_be_compatible_with_all_fenix_versions
+
+        # The latest version is approved.
+        addon.approve_for_version(addon.current_version)
+        del addon.publicly_promoted_groups
+        assert addon.can_be_compatible_with_all_fenix_versions
+
+        addon.promotedaddon.all().delete()
+        self.make_addon_promoted(
+            addon=addon,
+            api_name='line',
+            listed_pre_review=True,
+            can_be_compatible_with_all_fenix_versions=True,
+            apps=[amo.FIREFOX],
+        )
+        assert not addon.can_be_compatible_with_all_fenix_versions
+
+        self.make_addon_promoted(
+            addon=addon,
+            api_name='line',
+            listed_pre_review=True,
+            can_be_compatible_with_all_fenix_versions=True,
+            apps=[amo.ANDROID],
+        )
+        assert addon.can_be_compatible_with_all_fenix_versions
+
+    def test_all_approved_applications_for_group_removal_after_approval(self):
+        addon = addon_factory()
+        self.make_addon_promoted(
+            addon=addon, api_name='spotlight', listed_pre_review=True
+        )
+        self.make_addon_promoted(addon=addon, api_name='line', listed_pre_review=True)
+        assert addon.all_applications_for(
+            PromotedGroup.objects.get(api_name='spotlight')
+        ) == [amo.FIREFOX, amo.ANDROID]
+        assert (
+            addon.approved_applications_for(
+                PromotedGroup.objects.get(api_name='spotlight')
+            )
+            == []
+        )
+
+        addon.approve_for_version()
+        assert addon.all_applications_for(
+            PromotedGroup.objects.get(api_name='spotlight')
+        ) == [amo.FIREFOX, amo.ANDROID]
+        assert addon.approved_applications_for(
+            PromotedGroup.objects.get(api_name='spotlight')
+        ) == [amo.FIREFOX, amo.ANDROID]
+
+        # If an app is removed, it should no longer be in all_apps nor approved
+        PromotedAddon.objects.filter(
+            promoted_group__api_name='line',
+            application_id=amo.FIREFOX.id,
+        ).delete()
+        assert addon.all_applications_for(
+            PromotedGroup.objects.get(api_name='line')
+        ) == [amo.ANDROID]
+        assert addon.approved_applications_for(
+            PromotedGroup.objects.get(api_name='line')
+        ) == [amo.ANDROID]
+
+        # Shouldn't affect any other promotion
+        assert addon.all_applications_for(
+            PromotedGroup.objects.get(api_name='spotlight')
+        ) == [amo.FIREFOX, amo.ANDROID]
+        assert addon.approved_applications_for(
+            PromotedGroup.objects.get(api_name='spotlight')
+        ) == [amo.FIREFOX, amo.ANDROID]
+
+        # But the approval still exists
+        assert PromotedApproval.objects.filter(
+            promoted_group__api_name='line',
+            application_id=amo.FIREFOX.id,
+        ).exists()
+
+        # And if we add the PromotedAddon back, it should be approved again
+        self.make_addon_promoted(addon=addon, api_name='line', listed_pre_review=True)
+        assert addon.approved_applications_for(
+            PromotedGroup.objects.get(api_name='line')
+        ) == [amo.FIREFOX, amo.ANDROID]
+
+    def test_all_approved_applications_for_group_addition_after_approval(self):
+        addon = addon_factory()
+        self.make_addon_promoted(
+            addon=addon, api_name='line', listed_pre_review=True, apps=[amo.FIREFOX]
+        )
+        assert addon.all_applications_for(
+            PromotedGroup.objects.get(api_name='line')
+        ) == [amo.FIREFOX]
+        assert (
+            addon.approved_applications_for(PromotedGroup.objects.get(api_name='line'))
+            == []
+        )
+
+        # Adding an app after a version should not approve the application
+        addon.approve_for_version()
+        self.make_addon_promoted(
+            addon=addon,
+            api_name='line',
+            listed_pre_review=True,
+        )
+        assert addon.all_applications_for(
+            PromotedGroup.objects.get(api_name='line')
+        ) == [amo.FIREFOX, amo.ANDROID]
+        assert addon.approved_applications_for(
+            PromotedGroup.objects.get(api_name='line')
+        ) == [amo.FIREFOX]
+
+    def test_rollbackable_versions_qs_unavailable(self):
+        def get_rvs(channel):
+            return list(addon.rollbackable_versions_qs(channel=channel))
+
+        addon = addon_factory()
+        version_factory(addon=addon)
+        version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+
+        with override_switch('version-rollback', active=False):
+            assert get_rvs(amo.CHANNEL_LISTED) == []
+            assert get_rvs(amo.CHANNEL_UNLISTED) == []
+
+        with override_switch('version-rollback', active=True):
+            assert get_rvs(amo.CHANNEL_LISTED) != []
+            assert get_rvs(amo.CHANNEL_UNLISTED) != []
+
+            addon.update(type=amo.ADDON_STATICTHEME)
+            assert get_rvs(amo.CHANNEL_LISTED) == []
+            assert get_rvs(amo.CHANNEL_UNLISTED) == []
+
+    @override_switch('version-rollback', active=True)
+    def test_rollbackable_versions_qs(self):
+        def get_rvs(channel):
+            return list(addon.rollbackable_versions_qs(channel=channel))
+
+        addon = addon_factory()
+        assert get_rvs(amo.CHANNEL_LISTED) == []
+        assert get_rvs(amo.CHANNEL_UNLISTED) == []
+
+        version1 = addon.current_version
+        version2 = version_factory(addon=addon)
+        version3 = version_factory(addon=addon)
+        assert version3 == addon.reload().current_version
+        assert get_rvs(amo.CHANNEL_LISTED) == [version2, version1]
+        assert get_rvs(amo.CHANNEL_UNLISTED) == []
+
+        version2.file.update(status=amo.STATUS_DISABLED)
+        assert get_rvs(amo.CHANNEL_LISTED) == [version1]
+        assert get_rvs(amo.CHANNEL_UNLISTED) == []
+
+        version1.file.update(status=amo.STATUS_DISABLED)
+        assert get_rvs(amo.CHANNEL_LISTED) == []
+        assert get_rvs(amo.CHANNEL_UNLISTED) == []
+
+        self.change_channel_for_addon(addon, amo.CHANNEL_UNLISTED)
+        File.objects.filter(version__addon=addon).update(status=amo.STATUS_APPROVED)
+        assert addon.reload().current_version is None
+        assert get_rvs(amo.CHANNEL_LISTED) == []
+        assert get_rvs(amo.CHANNEL_UNLISTED) == [version2, version1]
+
+        version2.file.update(status=amo.STATUS_DISABLED)
+        assert get_rvs(amo.CHANNEL_LISTED) == []
+        assert get_rvs(amo.CHANNEL_UNLISTED) == [version1]
+
+        version1.file.update(status=amo.STATUS_DISABLED)
+        assert get_rvs(amo.CHANNEL_LISTED) == []
+        assert get_rvs(amo.CHANNEL_UNLISTED) == []
+
+    def test_get_usage_tier(self):
+        a_tier = UsageTier.objects.create(upper_adu_threshold=1000)
+        b_tier = UsageTier.objects.create(
+            lower_adu_threshold=1001, upper_adu_threshold=10000
+        )
+        c_tier = UsageTier.objects.create(lower_adu_threshold=10001)
+        addon = addon_factory(average_daily_users=42)
+        assert addon.get_usage_tier() == a_tier
+        addon.update(average_daily_users=4242)
+        assert addon.get_usage_tier() == b_tier
+        addon.update(average_daily_users=424242)
+        assert addon.get_usage_tier() == c_tier
+
+    def test_get_usage_tier_edge_cases(self):
+        a_tier = UsageTier.objects.create(
+            lower_adu_threshold=100, upper_adu_threshold=1000
+        )
+        addon = addon_factory(average_daily_users=101)
+        assert addon.get_usage_tier() == a_tier
+
+        addon.update(type=amo.ADDON_STATICTHEME)
+        assert addon.get_usage_tier() is None
+
+        addon.update(status=amo.STATUS_DISABLED, type=amo.ADDON_EXTENSION)
+        assert addon.get_usage_tier() is None
+
+        addon.update(status=amo.STATUS_NOMINATED)
+        assert addon.get_usage_tier() == a_tier
+
+
+class TestAddonUser(TestCase):
+    def test_delete(self):
+        addon = addon_factory()
+        user = user_factory()
+        addonuser = AddonUser.objects.create(addon=addon, user=user)
+        assert AddonUser.objects.count() == 1
+        assert addonuser.role == amo.AUTHOR_ROLE_OWNER
+        assert list(addon.authors.all()) == [user]
+
+        addonuser.delete()
+        addonuser.reload()
+        addon.reload()
+        user.reload()
+
+        assert AddonUser.objects.count() == 0
+        assert AddonUser.unfiltered.count() == 1
+        assert addonuser.role == amo.AUTHOR_ROLE_DELETED
+        assert addonuser.original_role == amo.AUTHOR_ROLE_OWNER
+        assert addonuser.addon == addon
+        assert addonuser.user == user
+        assert user.addons.count() == 0
+        assert addon.authors.count() == 0
+
+    def test_delete_dev(self):
+        addon = addon_factory()
+        user = user_factory()
+        addonuser = AddonUser.objects.create(
+            addon=addon, user=user, role=amo.AUTHOR_ROLE_DEV
+        )
+        addonuser.delete()
+        addonuser.reload()
+
+        assert AddonUser.objects.count() == 0
+        assert AddonUser.unfiltered.count() == 1
+        assert addonuser.role == amo.AUTHOR_ROLE_DELETED
+        assert addonuser.original_role == amo.AUTHOR_ROLE_DEV
+
+    def test_delete_queryset(self):
+        addon = addon_factory()
+        user = user_factory()
+        addonuser = AddonUser.objects.create(addon=addon, user=user)
+        assert AddonUser.objects.count() == 1
+        assert addonuser.role == amo.AUTHOR_ROLE_OWNER
+        assert list(addon.authors.all()) == [user]
+
+        AddonUser.objects.filter(pk=addonuser.pk).delete()
+        addonuser.reload()
+        addon.reload()
+        user.reload()
+
+        assert AddonUser.objects.count() == 0
+        assert AddonUser.unfiltered.count() == 1
+        assert addonuser.role == amo.AUTHOR_ROLE_DELETED
+        assert addonuser.original_role == amo.AUTHOR_ROLE_OWNER
+        assert addonuser.addon == addon
+        assert addonuser.user == user
+        assert user.addons.count() == 0
+        assert addon.authors.count() == 0
+
+    def test_delete_queryset_dev(self):
+        addon = addon_factory()
+        user = user_factory()
+        addonuser = AddonUser.objects.create(
+            addon=addon, user=user, role=amo.AUTHOR_ROLE_DEV
+        )
+        AddonUser.objects.filter(pk=addonuser.pk).delete()
+        addonuser.reload()
+
+        assert AddonUser.objects.count() == 0
+        assert AddonUser.unfiltered.count() == 1
+        assert addonuser.role == amo.AUTHOR_ROLE_DELETED
+        assert addonuser.original_role == amo.AUTHOR_ROLE_DEV
+
+    def test_undelete_queryset(self):
+        addon = addon_factory()
+        user = user_factory()
+        addonuser = AddonUser.objects.create(addon=addon, user=user)
+
+        AddonUser.objects.filter(pk=addonuser.pk).delete()
+
+        assert AddonUser.objects.count() == 0
+        assert AddonUser.unfiltered.count() == 1
+
+        AddonUser.unfiltered.filter(pk=addonuser.pk).undelete()
+        addonuser.reload()
+        addon.reload()
+        user.reload()
+
+        assert AddonUser.objects.count() == 1
+        assert AddonUser.unfiltered.count() == 1
+        assert addonuser.role == amo.AUTHOR_ROLE_OWNER
+        assert addonuser.original_role == amo.AUTHOR_ROLE_DEV  # default value.
+        assert addonuser.addon == addon
+        assert addonuser.user == user
+        assert user.addons.count() == 1
+        assert addon.authors.count() == 1
+
+    def test_undelete_queryset_dev(self):
+        addon = addon_factory()
+        user = user_factory()
+        addonuser = AddonUser.objects.create(
+            addon=addon, user=user, role=amo.AUTHOR_ROLE_DEV
+        )
+        AddonUser.objects.filter(pk=addonuser.pk).delete()
+
+        assert AddonUser.objects.count() == 0
+        assert AddonUser.unfiltered.count() == 1
+
+        AddonUser.unfiltered.filter(pk=addonuser.pk).undelete()
+        addonuser.reload()
+        addon.reload()
+        user.reload()
+
+        assert AddonUser.objects.count() == 1
+        assert AddonUser.unfiltered.count() == 1
+        assert addonuser.role == amo.AUTHOR_ROLE_DEV
+        assert addonuser.original_role == amo.AUTHOR_ROLE_DEV  # default value.
+        assert addonuser.addon == addon
+        assert addonuser.user == user
+        assert user.addons.count() == 1
+        assert addon.authors.count() == 1
+
+    @patch('olympia.scanners.tasks.run_narc_on_version')
+    def test_dont_run_narc_waffle_switch_off(self, run_narc_on_version_mock):
+        addon = addon_factory(users=[user_factory()])
+        addon.addonuser_set.create(user=user_factory())
+        assert run_narc_on_version_mock.delay.call_count == 0
+
+    @patch('olympia.scanners.tasks.run_narc_on_version')
+    def test_run_narc_new_author(self, run_narc_on_version_mock):
+        self.create_switch('enable-narc', active=True)
+        addon = addon_factory(users=[user_factory()])
+        addon.addonuser_set.create(user=user_factory())
+        assert run_narc_on_version_mock.delay.call_count == 1
+        assert run_narc_on_version_mock.delay.call_args[0] == (
+            addon.current_version.pk,
+        )
+
+    @patch('olympia.scanners.tasks.run_narc_on_version')
+    def test_run_narc_no_current_version(self, run_narc_on_version_mock):
+        self.create_switch('enable-narc', active=True)
+        addon = addon_factory(users=[user_factory()])
+        version = addon.current_version
+        version.is_user_disabled = True
+        assert not addon.current_version
+        addon.addonuser_set.create(user=user_factory())
+        assert run_narc_on_version_mock.delay.call_count == 1
+        assert run_narc_on_version_mock.delay.call_args[0] == (version.pk,)
+
+    @patch('olympia.scanners.tasks.run_narc_on_version')
+    def test_dont_run_narc_first_author(self, run_narc_on_version_mock):
+        self.create_switch('enable-narc', active=True)
+        # Note: in "real" situation, the first author would have been added
+        # before the first Version, after creating the Addon.
+        addon = addon_factory()
+        addon.addonuser_set.create(user=user_factory())
+        assert run_narc_on_version_mock.delay.call_count == 0
+
+    @patch('olympia.scanners.tasks.run_narc_on_version')
+    def test_dont_run_narc_no_listed_version(self, run_narc_on_version_mock):
+        self.create_switch('enable-narc', active=True)
+        addon = addon_factory(users=[user_factory()])
+        self.change_channel_for_addon(addon, amo.CHANNEL_UNLISTED)
+        addon.addonuser_set.create(user=user_factory())
+        assert run_narc_on_version_mock.delay.call_count == 0
+
+    @patch('olympia.scanners.tasks.run_narc_on_version')
+    def test_dont_run_narc_rejected_listed_version(self, run_narc_on_version_mock):
+        self.create_switch('enable-narc', active=True)
+        addon = addon_factory(users=[user_factory()])
+        addon.current_version.file.update(status=amo.STATUS_DISABLED)
+        addon.addonuser_set.create(user=user_factory())
+        assert run_narc_on_version_mock.delay.call_count == 0
+
+    @patch('olympia.scanners.tasks.call_webhooks_on_listing_changed')
+    def test_call_webhooks_on_listing_changed_new_author(self, webhooks_mock):
+        addon = addon_factory(users=[user_factory()])
+        addon.addonuser_set.create(user=user_factory())
+        webhooks_mock.delay.assert_called_once_with(
+            addon.current_version.pk, reason='authors'
+        )
+
+    @patch('olympia.scanners.tasks.call_webhooks_on_listing_changed')
+    def test_dont_call_webhooks_on_listing_changed_first_author(self, webhooks_mock):
+        addon = addon_factory()
+        addon.addonuser_set.create(user=user_factory())
+        webhooks_mock.delay.assert_not_called()
+
+    @patch('olympia.scanners.tasks.call_webhooks_on_listing_changed')
+    def test_dont_call_webhooks_on_listing_changed_no_listed_version(
+        self, webhooks_mock
+    ):
+        addon = addon_factory(users=[user_factory()])
+        self.change_channel_for_addon(addon, amo.CHANNEL_UNLISTED)
+        addon.addonuser_set.create(user=user_factory())
+        webhooks_mock.delay.assert_not_called()
 
 
 class TestShouldRedirectToSubmitFlow(TestCase):
@@ -1574,9 +2432,8 @@ class TestShouldRedirectToSubmitFlow(TestCase):
         addon.update(status=amo.STATUS_NULL)
         assert addon.should_redirect_to_submit_flow()
 
-        for ver in addon.versions.all():
-            for file_ in ver.all_files:
-                file_.update(status=amo.STATUS_DISABLED)
+        for version in addon.versions.all():
+            version.file.update(status=amo.STATUS_DISABLED)
         assert not addon.should_redirect_to_submit_flow()
 
     def test_only_null_redirects(self):
@@ -1590,7 +2447,7 @@ class TestShouldRedirectToSubmitFlow(TestCase):
 
         status_exc_null = dict(amo.STATUS_CHOICES_ADDON)
         status_exc_null.pop(amo.STATUS_NULL)
-        for status in status_exc_null:
+        for _status in status_exc_null:
             assert not addon.should_redirect_to_submit_flow()
         addon.update(status=amo.STATUS_NULL)
         assert addon.should_redirect_to_submit_flow()
@@ -1599,166 +2456,416 @@ class TestShouldRedirectToSubmitFlow(TestCase):
 class TestHasListedAndUnlistedVersions(TestCase):
     def setUp(self):
         self.addon = addon_factory()
-        latest_version = self.addon.find_latest_version(
-            channel=amo.RELEASE_CHANNEL_LISTED)
+        latest_version = self.addon.find_latest_version(channel=amo.CHANNEL_LISTED)
         latest_version.delete(hard=True)
         assert self.addon.versions.count() == 0
 
     def test_no_versions(self):
-        assert not self.addon.has_listed_versions()
-        assert not self.addon.has_unlisted_versions()
+        assert not self.addon.has_version_in_channel(amo.CHANNEL_LISTED)
+        assert not self.addon.has_version_in_channel(amo.CHANNEL_UNLISTED)
 
     def test_listed_version(self):
-        version_factory(channel=amo.RELEASE_CHANNEL_LISTED, addon=self.addon)
-        assert self.addon.has_listed_versions()
-        assert not self.addon.has_unlisted_versions()
+        version_factory(channel=amo.CHANNEL_LISTED, addon=self.addon)
+        assert self.addon.has_version_in_channel(amo.CHANNEL_LISTED)
+        assert not self.addon.has_version_in_channel(amo.CHANNEL_UNLISTED)
 
     def test_unlisted_version(self):
-        version_factory(channel=amo.RELEASE_CHANNEL_UNLISTED, addon=self.addon)
-        assert not self.addon.has_listed_versions()
-        assert self.addon.has_unlisted_versions()
+        version_factory(channel=amo.CHANNEL_UNLISTED, addon=self.addon)
+        assert not self.addon.has_version_in_channel(amo.CHANNEL_LISTED)
+        assert self.addon.has_version_in_channel(amo.CHANNEL_UNLISTED)
 
     def test_unlisted_and_listed_versions(self):
-        version_factory(channel=amo.RELEASE_CHANNEL_LISTED, addon=self.addon)
-        version_factory(channel=amo.RELEASE_CHANNEL_UNLISTED, addon=self.addon)
-        assert self.addon.has_listed_versions()
-        assert self.addon.has_unlisted_versions()
+        version_factory(channel=amo.CHANNEL_LISTED, addon=self.addon)
+        version_factory(channel=amo.CHANNEL_UNLISTED, addon=self.addon)
+        assert self.addon.has_version_in_channel(amo.CHANNEL_LISTED)
+        assert self.addon.has_version_in_channel(amo.CHANNEL_UNLISTED)
+
+    def test_has_listed_versions_current_version_shortcut(self):
+        # We shouldn't even do a exists() query if the add-on has a
+        # current_version.
+        self.addon._current_version_id = 123
+        assert self.addon.has_version_in_channel(amo.CHANNEL_LISTED)
+
+    def test_has_listed_versions_soft_delete(self):
+        version_factory(channel=amo.CHANNEL_LISTED, addon=self.addon, deleted=True)
+        version_factory(channel=amo.CHANNEL_UNLISTED, addon=self.addon)
+        assert not self.addon.has_version_in_channel(amo.CHANNEL_LISTED)
+        assert self.addon.has_version_in_channel(
+            amo.CHANNEL_LISTED, include_deleted=True
+        )
+
+    def test_has_unlisted_versions_soft_delete(self):
+        version_factory(channel=amo.CHANNEL_UNLISTED, addon=self.addon, deleted=True)
+        version_factory(channel=amo.CHANNEL_LISTED, addon=self.addon)
+        assert not self.addon.has_version_in_channel(amo.CHANNEL_UNLISTED)
+        assert self.addon.has_version_in_channel(
+            amo.CHANNEL_UNLISTED, include_deleted=True
+        )
 
 
-class TestAddonNomination(TestCase):
+class TestAddonDueDate(TestCase):
     fixtures = ['base/addon_3615']
 
-    def test_set_nomination(self):
-        a = Addon.objects.get(id=3615)
-        a.update(status=amo.STATUS_NULL)
-        a.versions.latest().update(nomination=None)
-        a.update(status=amo.STATUS_NOMINATED)
-        assert a.versions.latest().nomination
+    def setUp(self):
+        user_factory(pk=settings.TASK_USER_ID)
 
-    def test_new_version_inherits_nomination(self):
-        a = Addon.objects.get(id=3615)
-        ver = 10
-        a.update(status=amo.STATUS_NOMINATED)
-        old_ver = a.versions.latest()
-        v = Version.objects.create(addon=a, version=str(ver))
-        assert v.nomination == old_ver.nomination
-        ver += 1
+    def test_set_due_date(self):
+        addon = Addon.objects.get(id=3615)
+        addon.update(status=amo.STATUS_NULL)
+        version = addon.versions.latest()
+        version.file.update(status=amo.STATUS_AWAITING_REVIEW)
+        version.update(due_date=None)
+        NeedsHumanReview.objects.create(
+            version=version, reason=NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+        )
+        addon.update(status=amo.STATUS_NOMINATED)
+        assert version.reload().due_date
 
-    def test_lone_version_does_not_inherit_nomination(self):
-        a = Addon.objects.get(id=3615)
+    def test_new_version_inherits_due_date(self):
+        addon = Addon.objects.get(id=3615)
+        old_version = addon.versions.latest()
+        addon.update(status=amo.STATUS_NOMINATED)
+        old_version.file.update(status=amo.STATUS_AWAITING_REVIEW)
+        NeedsHumanReview.objects.create(
+            version=old_version, reason=NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+        )
+        old_version.reload()
+        assert old_version.due_date
+        old_version.update(due_date=self.days_ago(15))
+        old_version_due_date = old_version.due_date
+        new_version = version_factory(
+            addon=addon, version='10.0', file_kw={'status': amo.STATUS_AWAITING_REVIEW}
+        )
+        NeedsHumanReview.objects.create(
+            version=new_version, reason=NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+        )
+        assert new_version.reload().due_date == old_version_due_date
+
+    def test_lone_version_does_not_inherit_due_date(self):
+        addon = Addon.objects.get(id=3615)
+        old_version = addon.versions.latest()
+        addon.update(status=amo.STATUS_NOMINATED)
+        old_version.file.update(status=amo.STATUS_AWAITING_REVIEW)
+        NeedsHumanReview.objects.create(
+            version=old_version, reason=NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+        )
+        old_version.reload()
+        assert old_version.due_date
+        old_version.update(due_date=self.days_ago(15))
+        old_version_due_date = old_version.due_date
         Version.objects.all().delete()
-        v = Version.objects.create(addon=a, version='1.0')
-        assert v.nomination is None
+        new_version = version_factory(
+            addon=addon, version='42.0', file_kw={'status': amo.STATUS_AWAITING_REVIEW}
+        )
+        NeedsHumanReview.objects.create(
+            version=new_version, reason=NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+        )
+        new_version.reload()
+        assert new_version.due_date
+        assert new_version.due_date != old_version_due_date
 
-    def test_reviewed_addon_does_not_inherit_nomination(self):
-        a = Addon.objects.get(id=3615)
-        ver = 10
-        for st in (amo.STATUS_PUBLIC, amo.STATUS_NULL):
-            a.update(status=st)
-            v = Version.objects.create(addon=a, version=str(ver))
-            assert v.nomination is None
-            ver += 1
+    def test_reviewed_addon_does_not_inherit_due_date(self):
+        addon = Addon.objects.get(id=3615)
+        version_number = 10.0
+        for status in (amo.STATUS_APPROVED, amo.STATUS_NULL):
+            addon.update(status=status)
+            version = Version.objects.create(addon=addon, version=str(version_number))
+            assert version.due_date is None
+            version_number += 1
 
-    def test_nomination_no_version(self):
+    def test_due_date_no_version(self):
         # Check that the on_change method still works if there are no versions.
-        a = Addon.objects.get(id=3615)
-        a.versions.all().delete()
-        a.update(status=amo.STATUS_NOMINATED)
+        addon = Addon.objects.get(id=3615)
+        addon.versions.all().delete()
+        addon.update(status=amo.STATUS_NOMINATED)
 
-    def test_nomination_already_set(self):
+    def test_due_date_already_set(self):
         addon = Addon.objects.get(id=3615)
         earlier = datetime.today() - timedelta(days=2)
-        addon.versions.latest().update(nomination=earlier)
+        version = addon.versions.latest()
+        version.file.update(status=amo.STATUS_AWAITING_REVIEW)
+        NeedsHumanReview.objects.create(
+            version=version, reason=NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+        )
+        version.update(due_date=earlier)
         addon.update(status=amo.STATUS_NOMINATED)
-        assert addon.versions.latest().nomination.date() == earlier.date()
+        assert version.reload().due_date.date() == earlier.date()
 
-    def setup_nomination(self, addon_status=amo.STATUS_NOMINATED,
-                         file_status=amo.STATUS_AWAITING_REVIEW):
-        addon = Addon.objects.create()
-        version = Version.objects.create(addon=addon)
-        File.objects.create(status=file_status, version=version)
+    def setup_due_date(
+        self, addon_status=amo.STATUS_NOMINATED, file_status=amo.STATUS_AWAITING_REVIEW
+    ):
+        addon = addon_factory(
+            status=addon_status,
+            file_kw={'status': file_status},
+            version_kw={'version': '0.1'},
+            reviewer_flags={'auto_approval_disabled': True},
+        )
+        version = addon.current_version
+        # This would be created by `auto_approve` because of the
+        # auto_approval_disabled reviewer flag on the addon.
+        NeedsHumanReview.objects.create(
+            version=version, reason=NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+        )
         # Cheating date to make sure we don't have a date on the same second
         # the code we test is running.
         past = self.days_ago(1)
-        version.update(nomination=past, created=past, modified=past)
+        version.update(due_date=past, created=past, modified=past)
         addon.update(status=addon_status)
-        nomination = addon.versions.latest().nomination
-        assert nomination
-        return addon, nomination
+        due_date = addon.versions.latest().due_date
+        assert bool(due_date) == version.should_have_due_date
+        return addon, due_date
 
-    def test_new_version_of_under_review_addon_does_not_reset_nomination(self):
-        addon, nomination = self.setup_nomination()
-        version = Version.objects.create(addon=addon, version='0.2')
-        File.objects.create(status=amo.STATUS_AWAITING_REVIEW, version=version)
-        assert addon.versions.latest().nomination == nomination
-
-    def test_nomination_not_reset_if_adding_new_versions_and_files(self):
+    def test_due_date_not_reset_if_adding_new_versions(self):
         """
-        When under review, adding new versions and files should not
-        reset nomination.
+        When the add-on is under initial review (STATUS_NOMINATED), adding new
+        versions and files should not reset due date.
         """
-        addon, nomination = self.setup_nomination()
-        # Switching it to a public status.
-        version = Version.objects.create(addon=addon, version="0.1")
-        File.objects.create(status=amo.STATUS_PUBLIC, version=version)
-        assert addon.versions.latest().nomination == nomination
-        # Adding a new unreviewed version.
-        version = Version.objects.create(addon=addon, version="0.2")
-        File.objects.create(status=amo.STATUS_AWAITING_REVIEW, version=version)
-        assert addon.versions.latest().nomination == nomination
-        # Adding a new unreviewed version.
-        version = Version.objects.create(addon=addon, version="0.3")
-        File.objects.create(status=amo.STATUS_AWAITING_REVIEW, version=version)
-        assert addon.versions.latest().nomination == nomination
+        addon, existing_due_date = self.setup_due_date()
 
-    def check_nomination_reset_with_new_version(self, addon, nomination):
-        version = Version.objects.create(addon=addon, version="0.2")
-        assert version.nomination is None
-        File.objects.create(status=amo.STATUS_AWAITING_REVIEW, version=version)
-        assert addon.versions.latest().nomination != nomination
+        # Adding a new unreviewed version.
+        new_version = version_factory(
+            addon=addon,
+            version='0.2',
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+        )
+        # We force the creation of the NHR that would have happened during
+        # `auto_approve` like `setup_due_date()` did for the first one.
+        NeedsHumanReview.objects.create(
+            version=new_version, reason=NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+        )
+        # Because the add-on is still nominated, the new version should inherit
+        # from the existing due date.
+        assert new_version.reload().due_date == existing_due_date
 
-    def test_new_version_of_approved_addon_should_reset_nomination(self):
-        addon, nomination = self.setup_nomination(
-            addon_status=amo.STATUS_PUBLIC, file_status=amo.STATUS_PUBLIC)
+        # Adding a new unreviewed version again.
+        new_new_version = version_factory(
+            addon=addon,
+            version='0.3',
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+        )
+        # Once again we force the creation of the NHR that would have happened
+        # during `auto_approve` like `setup_due_date()` did for the first one.
+        NeedsHumanReview.objects.create(
+            version=new_new_version,
+            reason=NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED,
+        )
+        assert new_new_version.reload().due_date == existing_due_date
+
+    def test_new_version_of_approved_addon_should_reset_due_date(self):
+        addon, due_date = self.setup_due_date(
+            addon_status=amo.STATUS_APPROVED, file_status=amo.STATUS_APPROVED
+        )
         # Now create a new version with an attached file, and update status.
-        self.check_nomination_reset_with_new_version(addon, nomination)
+        version = Version.objects.create(addon=addon, version='0.2')
+        assert version.due_date is None
+        File.objects.create(
+            status=amo.STATUS_AWAITING_REVIEW, version=version, manifest_version=2
+        )
+        assert addon.versions.latest().due_date != due_date
 
+    def _test_set_needs_human_review_on_latest_versions(self, *, skip_activity_log):
+        addon = Addon.objects.get(id=3615)
+        listed_version = version_factory(
+            addon=addon, created=self.days_ago(1), file_kw={'is_signed': True}
+        )
+        unsigned_listed_version = version_factory(
+            addon=addon, file_kw={'is_signed': False}
+        )
+        unlisted_version = version_factory(
+            addon=addon,
+            created=self.days_ago(1),
+            channel=amo.CHANNEL_UNLISTED,
+            file_kw={'is_signed': True},
+        )
+        unsigned_unlisted_version = version_factory(
+            addon=addon, channel=amo.CHANNEL_UNLISTED, file_kw={'is_signed': False}
+        )
+        due_date = datetime.now() + timedelta(hours=42)
+        assert addon.set_needs_human_review_on_latest_versions(
+            due_date=due_date,
+            reason=NeedsHumanReview.REASONS.ADDED_TO_PROMOTED_GROUP,
+            skip_activity_log=skip_activity_log,
+        ) == [listed_version, unlisted_version]
+        for version in [listed_version, unlisted_version]:
+            assert version.needshumanreview_set.filter(is_active=True).count() == 1
+            assert (
+                version.needshumanreview_set.get().reason
+                == NeedsHumanReview.REASONS.ADDED_TO_PROMOTED_GROUP
+            )
+        for version in [unsigned_listed_version, unsigned_unlisted_version]:
+            # Those are more recent but unsigned, so we don't consider them
+            # when figuring out which version to flag for human review.
+            assert version.needshumanreview_set.filter(is_active=True).count() == 0
 
-class TestThemeDelete(TestCase):
+    def test_set_needs_human_review_on_latest_versions_with_log(self):
+        self._test_set_needs_human_review_on_latest_versions(skip_activity_log=False)
+        assert ActivityLog.objects.filter(
+            action=amo.LOG.NEEDS_HUMAN_REVIEW_AUTOMATIC.id
+        ).exists()
 
-    def setUp(self):
-        super(TestThemeDelete, self).setUp()
-        self.addon = addon_factory(type=amo.ADDON_PERSONA)
+    def test_set_needs_human_review_on_latest_versions_without_log(self):
+        self._test_set_needs_human_review_on_latest_versions(skip_activity_log=True)
+        assert not ActivityLog.objects.filter(
+            action=amo.LOG.NEEDS_HUMAN_REVIEW_AUTOMATIC.id
+        ).exists()
 
-        # Taking the creation and modified time back 1 day
-        self.addon.update(created=self.days_ago(1), modified=self.days_ago(1))
+    def test_set_needs_human_review_on_latest_versions_ignore_already_reviewed(self):
+        addon = Addon.objects.get(id=3615)
+        version = addon.current_version
+        version.update(human_review_date=self.days_ago(1))
+        assert (
+            addon.set_needs_human_review_on_latest_versions(
+                reason=NeedsHumanReview.REASONS.ADDED_TO_PROMOTED_GROUP
+            )
+            == []
+        )
+        assert version.needshumanreview_set.filter(is_active=True).count() == 0
 
-    def test_remove_theme_update_m_time(self):
-        m_time_before = self.addon.modified
-        self.addon.delete('enough', 'no reason at all')
-        m_time_after = self.addon.modified
+        assert addon.set_needs_human_review_on_latest_versions(
+            reason=NeedsHumanReview.REASONS.ADDED_TO_PROMOTED_GROUP,
+            ignore_reviewed=False,
+        ) == [version]
+        assert version.needshumanreview_set.filter(is_active=True).count() == 1
+        assert (
+            version.needshumanreview_set.get().reason
+            == NeedsHumanReview.REASONS.ADDED_TO_PROMOTED_GROUP
+        )
+        assert ActivityLog.objects.filter(
+            action=amo.LOG.NEEDS_HUMAN_REVIEW_AUTOMATIC.id
+        ).get().arguments == [version]
 
-        assert m_time_before != m_time_after
+    def test_set_needs_human_review_on_latest_versions_unique_reason(self):
+        addon = Addon.objects.get(id=3615)
+        version = addon.current_version
+        NeedsHumanReview.objects.create(
+            version=version, reason=NeedsHumanReview.REASONS.SCANNER_ACTION
+        )
+
+        assert not addon.set_needs_human_review_on_latest_versions(
+            reason=NeedsHumanReview.REASONS.ADDED_TO_PROMOTED_GROUP, unique_reason=False
+        )
+        assert version.needshumanreview_set.filter(is_active=True).count() == 1
+        assert (
+            version.needshumanreview_set.get().reason
+            == NeedsHumanReview.REASONS.SCANNER_ACTION
+        )
+
+        assert addon.set_needs_human_review_on_latest_versions(
+            reason=NeedsHumanReview.REASONS.ADDED_TO_PROMOTED_GROUP, unique_reason=True
+        )
+        assert version.needshumanreview_set.filter(is_active=True).count() == 2
+        assert list(version.needshumanreview_set.values_list('reason', flat=True)) == [
+            NeedsHumanReview.REASONS.SCANNER_ACTION,
+            NeedsHumanReview.REASONS.ADDED_TO_PROMOTED_GROUP,
+        ]
+
+    def test_set_needs_human_review_on_latest_versions_even_deleted(self):
+        addon = Addon.objects.get(id=3615)
+        version = addon.current_version
+        version.delete()
+        assert addon.set_needs_human_review_on_latest_versions(
+            reason=NeedsHumanReview.REASONS.UNKNOWN
+        )
+        assert version.needshumanreview_set.filter(is_active=True).count() == 1
+        assert (
+            version.needshumanreview_set.get().reason
+            == NeedsHumanReview.REASONS.UNKNOWN
+        )
+
+    def test_versions_triggering_needs_human_review_inheritance(self):
+        addon = Addon.objects.get(id=3615)
+        version = addon.current_version
+        version.needshumanreview_set.create(reason=NeedsHumanReview.REASONS.UNKNOWN)
+        version2 = version_factory(addon=addon)
+        unlisted_version = version_factory(addon=addon, channel=amo.CHANNEL_UNLISTED)
+        unlisted_version.needshumanreview_set.create(
+            reason=NeedsHumanReview.REASONS.UNKNOWN
+        )
+        assert set(
+            addon.versions_triggering_needs_human_review_inheritance(amo.CHANNEL_LISTED)
+        ) == {version}
+        assert set(
+            addon.versions_triggering_needs_human_review_inheritance(
+                amo.CHANNEL_UNLISTED
+            )
+        ) == {unlisted_version}
+
+        # Adding any of those NHR should not matter.
+        for reason_value in NeedsHumanReview.REASONS.NO_DUE_DATE_INHERITANCE:
+            version2.needshumanreview_set.create(reason=reason_value)
+
+        assert set(
+            addon.versions_triggering_needs_human_review_inheritance(amo.CHANNEL_LISTED)
+        ) == {version}
+
+        # Adding any other NHR should.
+        nhr = version2.needshumanreview_set.create(
+            reason=NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+        )
+        assert set(
+            addon.versions_triggering_needs_human_review_inheritance(amo.CHANNEL_LISTED)
+        ) == {version, version2}
+
+        # An inactive NHR should not trigger inheritance.
+        nhr.update(is_active=False)
+        assert set(
+            addon.versions_triggering_needs_human_review_inheritance(amo.CHANNEL_LISTED)
+        ) == {version}
+
+    def test_update_all_due_dates(self):
+        addon = Addon.objects.get(id=3615)
+        versions_that_should_have_due_date = [
+            version_factory(addon=addon, file_kw={'is_signed': True}),
+            version_factory(addon=addon, file_kw={'is_signed': True}),
+        ]
+        versions_that_should_not_have_due_date = [
+            version_factory(addon=addon, file_kw={'is_signed': True}),
+            version_factory(addon=addon, file_kw={'is_signed': True}),
+        ]
+        # For the versions that should ultimately have a due date, start with
+        # an inactive NHR, they shouldn't have their due date yet.
+        for version in versions_that_should_have_due_date:
+            version.needshumanreview_set.create(is_active=False)
+        # For the versions that should not, do it the other way around (so at
+        # that moment they do have a due date, but they'll soon lose it).
+        for version in versions_that_should_not_have_due_date:
+            version.needshumanreview_set.create(is_active=True)
+
+        # Update the NHR through a queryset update: that won't trigger
+        # post_save so the due date would not be set/unset until we force it.
+        NeedsHumanReview.objects.filter(
+            version__in=versions_that_should_have_due_date
+        ).update(is_active=True)
+        NeedsHumanReview.objects.filter(
+            version__in=versions_that_should_not_have_due_date
+        ).update(is_active=False)
+
+        addon.update_all_due_dates()
+        for version in versions_that_should_have_due_date:
+            version.reload()
+            assert version.due_date
+        for version in versions_that_should_not_have_due_date:
+            version.reload()
+            assert not version.due_date
 
 
 class TestAddonDelete(TestCase):
+    def setUp(self):
+        user_factory(pk=settings.TASK_USER_ID)
 
     def test_cascades(self):
         addon = Addon.objects.create(type=amo.ADDON_EXTENSION)
 
-        AddonCategory.objects.create(
-            addon=addon,
-            category=Category.objects.create(type=amo.ADDON_EXTENSION))
-        AddonUser.objects.create(
-            addon=addon, user=UserProfile.objects.create())
-        AppSupport.objects.create(addon=addon, app=1)
-        CompatOverride.objects.create(addon=addon)
+        AddonCategory.objects.create(addon=addon, category_id=1)
+        AddonUser.objects.create(addon=addon, user=UserProfile.objects.create())
         FrozenAddon.objects.create(addon=addon)
-        Persona.objects.create(addon=addon, persona_id=0)
-        Preview.objects.create(addon=addon)
 
         AddonLog.objects.create(
-            addon=addon, activity_log=ActivityLog.objects.create(action=0))
+            addon=addon,
+            activity_log=ActivityLog.objects.create(
+                action=1, user=UserProfile.objects.create()
+            ),
+        )
         RssKey.objects.create(addon=addon)
 
         # This should not throw any FK errors if all the cascades work.
@@ -1767,11 +2874,13 @@ class TestAddonDelete(TestCase):
         assert not Addon.unfiltered.filter(pk=addon.pk).exists()
 
     def test_review_delete(self):
-        addon = Addon.objects.create(type=amo.ADDON_EXTENSION,
-                                     status=amo.STATUS_PUBLIC)
+        addon = Addon.objects.create(
+            type=amo.ADDON_EXTENSION, status=amo.STATUS_APPROVED
+        )
 
-        rating = Rating.objects.create(addon=addon, rating=1, body='foo',
-                                       user=UserProfile.objects.create())
+        rating = Rating.objects.create(
+            addon=addon, rating=1, body='foo', user=UserProfile.objects.create()
+        )
 
         flag = RatingFlag(rating=rating)
 
@@ -1781,131 +2890,291 @@ class TestAddonDelete(TestCase):
         assert not Rating.objects.filter(pk=rating.pk).exists()
         assert not RatingFlag.objects.filter(pk=flag.pk).exists()
 
+        assert Rating.unfiltered.filter(pk=rating.pk).exists()
+        assert not ActivityLog.objects.filter(action=amo.LOG.DELETE_RATING.id).exists()
+
     def test_delete_with_deleted_versions(self):
         addon = Addon.objects.create(type=amo.ADDON_EXTENSION)
-        version = Version.objects.create(addon=addon, version="1.0")
+        version = Version.objects.create(addon=addon, version='1.0')
         version.delete()
         addon.delete()
         assert Addon.unfiltered.filter(pk=addon.pk).exists()
 
+    def test_delete_soft_blocks_all_versions(self):
+        developer = user_factory()
+        addon = addon_factory(users=[developer])
+        version = addon.current_version
+        deleted_version = version_factory(addon=addon, deleted=True)
+        hard_blocked_version = version_factory(
+            addon=addon, file_kw={'status': amo.STATUS_DISABLED}
+        )
+        block = Block.objects.create(guid=addon.guid, updated_by=developer)
+        BlockVersion.objects.create(block=block, version=hard_blocked_version)
+
+        addon.delete(send_delete_email=False)
+
+        assert Block.objects.count() == 1
+        assert set(block.blockversion_set.values_list('version', flat=True)) == {
+            version.id,
+            deleted_version.id,
+            hard_blocked_version.id,
+        }
+        assert (
+            block.blockversion_set.filter(block_type=BlockType.SOFT_BLOCKED).count()
+            == 2
+        )
+        assert (
+            block.blockversion_set.filter(
+                auto_block_reason=BlockReason.ADDON_DELETED
+            ).count()
+            == 2
+        )
+
+        assert (
+            hard_blocked_version.blockversion.reload().block_type == BlockType.BLOCKED
+        )
+        assert hard_blocked_version.blockversion.auto_block_reason is None
+        assert len(mail.outbox) == 0
+
 
 class TestUpdateStatus(TestCase):
-
     def test_no_file_ends_with_NULL(self):
         addon = Addon.objects.create(type=amo.ADDON_EXTENSION)
         addon.status = amo.STATUS_NOMINATED
         addon.save()
-        assert Addon.objects.get(pk=addon.pk).status == (
-            amo.STATUS_NOMINATED)
+        assert Addon.objects.get(pk=addon.pk).status == (amo.STATUS_NOMINATED)
         Version.objects.create(addon=addon)
-        assert Addon.objects.get(pk=addon.pk).status == (
-            amo.STATUS_NULL)
+        assert Addon.objects.get(pk=addon.pk).status == (amo.STATUS_NULL)
 
     def test_no_valid_file_ends_with_NULL(self):
         addon = Addon.objects.create(type=amo.ADDON_EXTENSION)
         version = Version.objects.create(addon=addon)
         file_ = File.objects.create(
-            status=amo.STATUS_AWAITING_REVIEW, version=version)
+            status=amo.STATUS_AWAITING_REVIEW, version=version, manifest_version=2
+        )
         addon.status = amo.STATUS_NOMINATED
         addon.save()
-        assert Addon.objects.get(pk=addon.pk).status == (
-            amo.STATUS_NOMINATED)
+        assert Addon.objects.get(pk=addon.pk).status == (amo.STATUS_NOMINATED)
         file_.status = amo.STATUS_DISABLED
         file_.save()
-        assert Addon.objects.get(pk=addon.pk).status == (
-            amo.STATUS_NULL)
+        assert Addon.objects.get(pk=addon.pk).status == (amo.STATUS_NULL)
 
     def test_unlisted_versions_ignored(self):
-        addon = addon_factory(status=amo.STATUS_PUBLIC)
+        addon = addon_factory(status=amo.STATUS_APPROVED)
         addon.update_status()
-        assert Addon.objects.get(pk=addon.pk).status == (
-            amo.STATUS_PUBLIC)
+        assert Addon.objects.get(pk=addon.pk).status == (amo.STATUS_APPROVED)
 
-        addon.current_version.update(channel=amo.RELEASE_CHANNEL_UNLISTED)
+        addon.current_version.update(channel=amo.CHANNEL_UNLISTED)
         # update_status will have been called via versions.models.update_status
         assert Addon.objects.get(pk=addon.pk).status == (
-            amo.STATUS_NULL)  # No listed versions so now NULL
+            amo.STATUS_NULL
+        )  # No listed versions so now NULL
+
+    def test_approved_versions_ends_with_approved_addon(self):
+        addon = addon_factory(
+            status=amo.STATUS_NULL, file_kw={'status': amo.STATUS_DISABLED}
+        )
+        assert addon.status == amo.STATUS_NULL
+
+        version_factory(addon=addon, file_kw={'status': amo.STATUS_APPROVED})
+        addon.reload()
+        assert addon.status == amo.STATUS_APPROVED
+
+    def test_awaiting_review_versions_ends_with_nominated(self):
+        addon = addon_factory(
+            status=amo.STATUS_NULL,
+            summary=None,
+            file_kw={'status': amo.STATUS_DISABLED},
+        )
+        assert addon.status == amo.STATUS_NULL
+
+        version_factory(addon=addon, file_kw={'status': amo.STATUS_AWAITING_REVIEW})
+        addon.reload()
+        # Because it doesn't have complete metadata the status isn't changed
+        assert not addon.has_complete_metadata(), addon.get_required_metadata()
+        addon.update_status()
+        assert addon.status == amo.STATUS_NULL
+
+        addon.summary = 'addon summary'
+        addon.save()
+        assert addon.has_complete_metadata(), addon.get_required_metadata()
+        addon.update_status()
+        assert addon.status == amo.STATUS_NOMINATED
+
+    def test_disabled_addons_do_not_update(self):
+        addon = addon_factory(
+            status=amo.STATUS_DISABLED, file_kw={'status': amo.STATUS_DISABLED}
+        )
+        assert addon.status == amo.STATUS_DISABLED
+
+        version_factory(addon=addon, file_kw={'status': amo.STATUS_APPROVED})
+        addon.reload()
+        addon.update_status()
+        assert addon.status == amo.STATUS_DISABLED
+
+        version_factory(addon=addon, file_kw={'status': amo.STATUS_AWAITING_REVIEW})
+        addon.reload()
+        addon.update_status()
+        assert addon.status == amo.STATUS_DISABLED
+
+    def test_rejected_listing_addons_do_not_update(self):
+        addon = addon_factory(
+            status=amo.STATUS_REJECTED, file_kw={'status': amo.STATUS_DISABLED}
+        )
+        AddonApprovalsCounter.objects.create(
+            addon=addon,
+            content_review_status=AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.FAIL,
+        )
+        assert addon.status == amo.STATUS_REJECTED
+
+        version_factory(addon=addon, file_kw={'status': amo.STATUS_APPROVED})
+        addon.reload()
+        addon.update_status()
+        assert addon.status == amo.STATUS_REJECTED
+
+        version_factory(addon=addon, file_kw={'status': amo.STATUS_AWAITING_REVIEW})
+        addon.reload()
+        addon.update_status()
+        assert addon.status == amo.STATUS_REJECTED
+
+        # but if the content review passed, the status will update
+        AddonApprovalsCounter.objects.get(addon=addon).update(
+            content_review_status=AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PASS
+        )
+        addon.update_status()
+        assert addon.status == amo.STATUS_APPROVED
+
+    @patch('olympia.abuse.tasks.submit_addon_for_content_review.delay')
+    @override_switch('content-review-in-cinder', active=True)
+    def test_content_review_triggered_for_addon_submission(self, submit_mock):
+        addon = addon_factory()
+        submit_mock.reset_mock()
+        addon.update(status=amo.STATUS_NOMINATED)
+        submit_mock.assert_called_once_with(addon_pk=addon.pk)
+
+    @patch('olympia.abuse.tasks.submit_addon_for_content_review.delay')
+    @override_switch('content-review-in-cinder', active=False)
+    def test_content_review_not_triggered_when_waffle_not_enabled(self, submit_mock):
+        addon = addon_factory()
+        submit_mock.reset_mock()
+        addon.update(status=amo.STATUS_NOMINATED)
+        submit_mock.assert_not_called()
+
+    @patch('olympia.abuse.tasks.submit_addon_for_content_review.delay')
+    @override_switch('content-review-in-cinder', active=True)
+    def test_content_review_not_triggered_for_non_valid_status(self, submit_mock):
+        addon = addon_factory()
+        submit_mock.reset_mock()
+        addon.update(status=amo.STATUS_DISABLED)
+        submit_mock.assert_not_called()
+
+    @patch('olympia.abuse.tasks.submit_addon_for_content_review.delay')
+    @override_switch('content-review-in-cinder', active=True)
+    def test_content_review_not_triggered_when_already_pending(self, submit_mock):
+        addon = addon_factory()
+        AddonApprovalsCounter.objects.create(
+            addon=addon,
+            content_review_status=AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PENDING,
+        )
+        submit_mock.reset_mock()
+        addon.update(status=amo.STATUS_NOMINATED)
+        submit_mock.assert_not_called()
+
+    @patch('olympia.abuse.tasks.submit_addon_for_content_review.delay')
+    @override_switch('content-review-in-cinder', active=True)
+    def test_content_review_not_triggered_when_content_already_reviewed(
+        self, submit_mock
+    ):
+        addon = addon_factory()
+        AddonApprovalsCounter.objects.create(
+            addon=addon,
+            content_review_status=AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PASS,
+        )
+        submit_mock.reset_mock()
+        addon.update(status=amo.STATUS_NOMINATED)
+        submit_mock.assert_not_called()
 
 
 class TestGetVersion(TestCase):
-    fixtures = ['base/addon_3615', ]
+    fixtures = [
+        'base/addon_3615',
+    ]
 
     def setUp(self):
-        super(TestGetVersion, self).setUp()
+        super().setUp()
         self.addon = Addon.objects.get(id=3615)
         self.version = self.addon.current_version
 
     def test_public_new_public_version(self):
         new_version = version_factory(
-            addon=self.addon, file_kw={'status': amo.STATUS_PUBLIC})
+            addon=self.addon, file_kw={'status': amo.STATUS_APPROVED}
+        )
         assert self.addon.find_latest_public_listed_version() == new_version
 
     def test_public_new_unreviewed_version(self):
         version_factory(
-            addon=self.addon, file_kw={'status': amo.STATUS_AWAITING_REVIEW})
+            addon=self.addon, file_kw={'status': amo.STATUS_AWAITING_REVIEW}
+        )
         assert self.addon.find_latest_public_listed_version() == self.version
 
     def test_should_promote_previous_valid_version_if_latest_is_disabled(self):
-        version_factory(
-            addon=self.addon, file_kw={'status': amo.STATUS_DISABLED})
+        version_factory(addon=self.addon, file_kw={'status': amo.STATUS_DISABLED})
         assert self.addon.find_latest_public_listed_version() == self.version
 
     def test_should_be_listed(self):
         new_version = version_factory(
             addon=self.addon,
-            channel=amo.RELEASE_CHANNEL_UNLISTED,
-            file_kw={'status': amo.STATUS_PUBLIC})
+            channel=amo.CHANNEL_UNLISTED,
+            file_kw={'status': amo.STATUS_APPROVED},
+        )
         assert new_version != self.version
         # Since the new version is unlisted, find_latest_public_listed_version
         # should still find the current one.
         assert self.addon.find_latest_public_listed_version() == self.version
 
+    def test_find_latest_non_rejected_listed_version(self):
+        assert (
+            self.addon.find_latest_non_rejected_listed_version()
+            == self.addon.current_version
+        )
+
+        new_version = version_factory(addon=self.addon)
+        assert self.addon.find_latest_non_rejected_listed_version() == new_version
+
+        new_version.is_user_disabled = True  # auto-saves
+        # No change
+        assert self.addon.find_latest_non_rejected_listed_version() == new_version
+
+        # If the version is rejected though, we skip it.
+        new_version.file.update(
+            status_disabled_reason=File.STATUS_DISABLED_REASONS.NONE
+        )
+        assert self.addon.find_latest_non_rejected_listed_version() == self.version
+
+    def test_find_latest_non_rejected_listed_version_no_deleted(self):
+        self.version.delete()
+        assert self.addon.find_latest_non_rejected_listed_version() is None
+
+    def test_find_latest_non_rejected_listed_version_no_listed(self):
+        self.change_channel_for_addon(self.addon, amo.CHANNEL_UNLISTED)
+        assert self.addon.find_latest_non_rejected_listed_version() is None
+
 
 class TestAddonGetURLPath(TestCase):
-
     def test_get_url_path(self):
         addon = addon_factory(slug='woo')
         assert addon.get_url_path() == '/en-US/firefox/addon/woo/'
 
-    def test_get_url_path_more(self):
-        addon = addon_factory(slug='yeah')
-        assert addon.get_url_path(more=True) == (
-            '/en-US/firefox/addon/yeah/more')
-
     def test_unlisted_addon_get_url_path(self):
-        addon = addon_factory(
-            slug='woo', version_kw={'channel': amo.RELEASE_CHANNEL_UNLISTED})
+        addon = addon_factory(slug='woo', version_kw={'channel': amo.CHANNEL_UNLISTED})
         assert addon.get_url_path() == ''
-
-
-class TestAddonModelsFeatured(TestCase):
-    fixtures = ['base/appversion', 'base/users',
-                'addons/featured', 'bandwagon/featured_collections',
-                'base/addon_3615', 'base/collections', 'base/featured']
-
-    def setUp(self):
-        super(TestAddonModelsFeatured, self).setUp()
-        # Addon._featured keeps an in-process cache we need to clear.
-        if hasattr(Addon, '_featured'):
-            del Addon._featured
-
-    def _test_featured_random(self):
-        featured = Addon.featured_random(amo.FIREFOX, 'en-US')
-        assert sorted(featured) == [1001, 1003, 2464, 3481, 7661, 15679]
-        featured = Addon.featured_random(amo.FIREFOX, 'fr')
-        assert sorted(featured) == [1001, 1003, 2464, 7661, 15679]
-        featured = Addon.featured_random(amo.ANDROID, 'en-US')
-        assert featured == []
-
-    def test_featured_random(self):
-        self._test_featured_random()
 
 
 class TestBackupVersion(TestCase):
     fixtures = ['addons/update', 'base/appversion']
 
     def setUp(self):
-        super(TestBackupVersion, self).setUp()
+        super().setUp()
         self.version_1_2_0 = 105387
         self.addon = Addon.objects.get(pk=1865)
         core.set_user(None)
@@ -1924,7 +3193,7 @@ class TestBackupVersion(TestCase):
 
     def test_current_version_listed_only(self):
         version = self.addon.current_version
-        version.update(channel=amo.RELEASE_CHANNEL_UNLISTED)
+        version.update(channel=amo.CHANNEL_UNLISTED)
         # The call above should have triggerred update_version().
         assert self.addon.current_version != version
         # new current_version should be version 1.2.1, since 1.2.2 is unlisted.
@@ -1945,228 +3214,35 @@ class TestBackupVersion(TestCase):
         version.save()
         assert Addon.objects.get(pk=1865).current_version
 
-    def test_update_version_theme(self):
-        # Test versions do not get deleted when calling with theme.
-        self.addon.update(type=amo.ADDON_PERSONA)
-        assert not self.addon.update_version()
-        assert self.addon._current_version
-
-        # Test latest version copied to current version if no current version.
-        self.addon.update(_current_version=None, _signal=False)
-        assert self.addon.update_version()
-        assert self.addon._current_version == (
-            self.addon.find_latest_version(None))
-
-
-class TestCategoryModel(TestCase):
-
-    def test_category_url(self):
-        """Every type must have a url path for its categories."""
-        for t in amo.ADDON_TYPE.keys():
-            if t == amo.ADDON_DICT:
-                continue  # Language packs don't have categories.
-            cat = Category(type=t, slug='omg')
-            assert cat.get_url_path()
-
-    @pytest.mark.needs_locales_compilation
-    def test_name_from_constants(self):
-        category = Category(
-            type=amo.ADDON_EXTENSION, application=amo.FIREFOX.id,
-            slug='alerts-updates')
-        assert category.name == u'Alerts & Updates'
-        with translation.override('fr'):
-            assert category.name == u'Alertes et mises à jour'
-
-    def test_name_fallback_to_empty(self):
-        category = Category.objects.create(
-            type=amo.ADDON_EXTENSION, application=amo.FIREFOX.id,
-            slug='this-cat-does-not-exist')
-
-        assert category.name == u''
-        with translation.override('fr'):
-            assert category.name == u''
-
-
-class TestPersonaModel(TestCase):
-    fixtures = ['addons/persona']
-
-    def setUp(self):
-        super(TestPersonaModel, self).setUp()
-        self.addon = Addon.objects.get(id=15663)
-        self.persona = self.addon.persona
-        self.persona.header = 'header.png'
-        self.persona.footer = 'footer.png'
-        self.persona.popularity = 12345
-        self.persona.save()
-
-    def _expected_url(self, img_name, modified_suffix):
-        return '/15663/%s?modified=%s' % (img_name, modified_suffix)
-
-    def test_image_urls(self):
-        self.persona.persona_id = 0
-        self.persona.checksum = 'fakehash'
-        self.persona.save()
-        modified = 'fakehash'
-        assert self.persona.thumb_url.endswith(
-            self._expected_url('preview.png', modified))
-        assert self.persona.icon_url.endswith(
-            self._expected_url('icon.png', modified))
-        assert self.persona.preview_url.endswith(
-            self._expected_url('preview.png', modified))
-        assert self.persona.header_url.endswith(
-            self._expected_url('header.png', modified))
-        assert self.persona.footer_url.endswith(
-            self._expected_url('footer.png', modified))
-
-    def test_image_urls_no_checksum(self):
-        # AMO-uploaded themes have `persona_id=0`.
-        self.persona.persona_id = 0
-        self.persona.save()
-        modified = int(time.mktime(self.persona.addon.modified.timetuple()))
-        assert self.persona.thumb_url.endswith(
-            self._expected_url('preview.png', modified))
-        assert self.persona.icon_url.endswith(
-            self._expected_url('icon.png', modified))
-        assert self.persona.preview_url.endswith(
-            self._expected_url('preview.png', modified))
-        assert self.persona.header_url.endswith(
-            self._expected_url('header.png', modified))
-        assert self.persona.footer_url.endswith(
-            self._expected_url('footer.png', modified))
-
-    def test_old_image_urls(self):
-        self.persona.addon.modified = None
-        modified = 0
-        assert self.persona.thumb_url.endswith(
-            self._expected_url('preview.jpg', modified))
-        assert self.persona.icon_url.endswith(
-            self._expected_url('preview_small.jpg', modified))
-        assert self.persona.preview_url.endswith(
-            self._expected_url('preview_large.jpg', modified))
-        assert self.persona.header_url.endswith(
-            self._expected_url('header.png', modified))
-        assert self.persona.footer_url.endswith(
-            self._expected_url('footer.png', modified))
-
-    def test_update_url(self):
-        with self.settings(LANGUAGE_CODE='fr', LANGUAGE_URL_MAP={}):
-            url_ = self.persona.update_url
-            assert url_.endswith('/fr/themes/update-check/15663')
-
-    def test_json_data(self):
-        self.persona.addon.all_categories = [
-            Category.from_static_category(CATEGORIES_BY_ID[100])
-        ]
-
-        with self.settings(LANGUAGE_CODE='fr',
-                           LANGUAGE_URL_MAP={},
-                           VAMO_URL='https://vamo',
-                           SITE_URL='https://omgsh.it'):
-            data = self.persona.theme_data
-
-            id_ = str(self.persona.addon.id)
-
-            assert data['id'] == id_
-            assert data['name'] == six.text_type(self.persona.addon.name)
-            assert data['accentcolor'] == '#8d8d97'
-            assert data['textcolor'] == '#ffffff'
-            assert data['category'] == 'Abstract'
-            assert data['author'] == 'persona_author'
-            assert data['description'] == six.text_type(self.addon.description)
-
-            assert data['headerURL'].startswith(
-                '%s%s/header.png?' % (user_media_url('addons'), id_))
-            assert data['footerURL'].startswith(
-                '%s%s/footer.png?' % (user_media_url('addons'), id_))
-            assert data['previewURL'].startswith(
-                '%s%s/preview_large.jpg?' % (user_media_url('addons'), id_))
-            assert data['iconURL'].startswith(
-                '%s%s/preview_small.jpg?' % (user_media_url('addons'), id_))
-
-            assert data['detailURL'] == (
-                'https://omgsh.it%s' % self.persona.addon.get_url_path())
-            assert data['updateURL'] == (
-                'https://vamo/fr/themes/update-check/' + id_)
-            assert data['version'] == '1.0'
-
-    def test_json_data_new_persona(self):
-        self.persona.persona_id = 0  # Make this a "new" theme.
-        self.persona.save()
-
-        self.persona.addon.all_categories = [
-            Category.from_static_category(CATEGORIES_BY_ID[100])
-        ]
-
-        with self.settings(LANGUAGE_CODE='fr',
-                           LANGUAGE_URL_MAP={},
-                           VAMO_URL='https://vamo',
-                           SITE_URL='https://omgsh.it'):
-            data = self.persona.theme_data
-
-            id_ = str(self.persona.addon.id)
-
-            assert data['id'] == id_
-            assert data['name'] == six.text_type(self.persona.addon.name)
-            assert data['accentcolor'] == '#8d8d97'
-            assert data['textcolor'] == '#ffffff'
-            assert data['category'] == 'Abstract'
-            assert data['author'] == 'persona_author'
-            assert data['description'] == six.text_type(self.addon.description)
-
-            assert data['headerURL'].startswith(
-                '%s%s/header.png?' % (user_media_url('addons'), id_))
-            assert data['footerURL'].startswith(
-                '%s%s/footer.png?' % (user_media_url('addons'), id_))
-            assert data['previewURL'].startswith(
-                '%s%s/preview.png?' % (user_media_url('addons'), id_))
-            assert data['iconURL'].startswith(
-                '%s%s/icon.png?' % (user_media_url('addons'), id_))
-
-            assert data['detailURL'] == (
-                'https://omgsh.it%s' % self.persona.addon.get_url_path())
-            assert data['updateURL'] == (
-                'https://vamo/fr/themes/update-check/' + id_)
-            assert data['version'] == '1.0'
-
-    def test_json_data_missing_colors(self):
-        self.persona.accentcolor = ''
-        self.persona.textcolor = ''
-        self.persona.save()
-
-        data = self.persona.theme_data
-        assert data['accentcolor'] is None
-        assert data['textcolor'] is None
-
-        self.persona.accentcolor = None
-        self.persona.textcolor = None
-        self.persona.save()
-
-        data = self.persona.theme_data
-        assert data['accentcolor'] is None
-        assert data['textcolor'] is None
-
-    def test_image_urls_without_footer(self):
-        self.persona.footer = ''
-        self.persona.save()
-        assert self.persona.footer_url == ''
-
-    def test_json_data_without_footer(self):
-        self.persona.footer = ''
-        self.persona.save()
-        data = self.persona.theme_data
-        assert data['footerURL'] == ''
-        assert data['footer'] == ''
-
-    def test_theme_data_with_null_description(self):
-        addon = addon_factory(type=amo.ADDON_PERSONA, description=None)
-        assert addon.persona.theme_data['description'] is None
-
 
 class TestPreviewModel(BasePreviewMixin, TestCase):
     fixtures = ['base/previews']
 
     def get_object(self):
         return Preview.objects.get(pk=24)
+
+    def test_filename(self):
+        preview = self.get_object()
+        assert preview.thumbnail_path.endswith('.jpg')
+        assert preview.image_path.endswith('.png')
+        assert preview.original_path.endswith('.png')
+
+        # now set the format in .sizes. Set thumbnail_format to a weird one
+        # on purpose to make sure it's followed.
+        preview.update(sizes={'thumbnail_format': 'abc', 'image_format': 'gif'})
+        assert preview.thumbnail_path.endswith('.abc')
+        assert preview.image_path.endswith('.gif')
+        assert preview.original_path.endswith('.png')
+
+    def test_filename_in_url(self):
+        preview = self.get_object()
+        assert '.jpg?modified=' in preview.thumbnail_url
+        assert '.png?modified=' in preview.image_url
+
+        # now set the format in .sizes.
+        preview.update(sizes={'thumbnail_format': 'abc', 'image_format': 'gif'})
+        assert '.abc?modified=' in preview.thumbnail_url
+        assert '.gif?modified=' in preview.image_url
 
 
 class TestListedAddonTwoVersions(TestCase):
@@ -2176,203 +3252,177 @@ class TestListedAddonTwoVersions(TestCase):
         Addon.objects.get(id=2795)  # bug 563967
 
 
-class TestAddonFromUpload(UploadTest):
+class TestAddonFromUpload(UploadMixin, TestCase):
     fixtures = ['base/users']
 
+    @classmethod
+    def setUpTestData(self):
+        versions = {
+            amo.DEFAULT_WEBEXT_MIN_VERSION,
+            amo.DEFAULT_WEBEXT_MIN_VERSION_ANDROID,
+            amo.DEFAULT_WEBEXT_MAX_VERSION,
+        }
+        for version in versions:
+            AppVersion.objects.get_or_create(
+                application=amo.FIREFOX.id, version=version
+            )
+            AppVersion.objects.get_or_create(
+                application=amo.ANDROID.id, version=version
+            )
+
     def setUp(self):
-        super(TestAddonFromUpload, self).setUp()
-        u = UserProfile.objects.get(pk=999)
-        core.set_user(u)
+        super().setUp()
         self.selected_app = amo.FIREFOX.id
-        for version in ('3.0', '3.6.*'):
-            AppVersion.objects.create(application=1, version=version)
+        self.user = UserProfile.objects.get(pk=999)
+        self.user.update(last_login_ip='127.0.0.10')
         self.addCleanup(translation.deactivate)
 
         def _app(application):
-            return Extractor.App(
-                appdata=application, id=application.id,
-                min=AppVersion.objects.get_or_create(
-                    application=application.id, version='3.0')[0],
-                max=AppVersion.objects.get_or_create(
-                    application=application.id, version='3.6.*')[0])
+            return ApplicationsVersions(
+                application=application.id,
+                min=AppVersion.objects.get(
+                    application=application.id,
+                    version=amo.DEFAULT_WEBEXT_MIN_VERSION,
+                ),
+                max=AppVersion.objects.get(application=application.id, version='*'),
+            )
 
         self.dummy_parsed_data = {
-            'guid': 'guid@xpi',
-            'version': '0.1',
-            'apps': [_app(amo.FIREFOX)]
+            'manifest_version': 2,
+            'guid': '@webextension-guid',
+            'version': '0.0.1',
+            'apps': [_app(amo.FIREFOX)],
         }
 
     def manifest(self, basename):
         return os.path.join(
-            settings.ROOT, 'src', 'olympia', 'devhub', 'tests', 'addons',
-            basename)
+            settings.ROOT, 'src', 'olympia', 'devhub', 'tests', 'addons', basename
+        )
 
     def test_denied_guid(self):
-        """Add-ons that have been disabled by Mozilla are added toDeniedGuid
-        in order to prevent resubmission after deletion """
-        DeniedGuid.objects.create(guid='guid@xpi')
+        """Add-ons that have been disabled by Mozilla are added to DeniedGuid
+        in order to prevent resubmission after deletion"""
+        DeniedGuid.objects.create(guid='@webextension-guid')
         with self.assertRaises(forms.ValidationError) as e:
-            parse_addon(self.get_upload('extension.xpi'), user=Mock())
+            parse_addon(self.get_upload('webextension.xpi'), user=self.user)
         assert e.exception.messages == ['Duplicate add-on ID found.']
 
     def test_existing_guid(self):
         # Upload addon so we can delete it.
-        self.upload = self.get_upload('extension.xpi')
-        parsed_data = parse_addon(self.upload, user=Mock())
-        deleted = Addon.from_upload(self.upload, [self.selected_app],
-                                    parsed_data=parsed_data)
-        deleted.update(status=amo.STATUS_PUBLIC)
+        self.upload = self.get_upload('webextension.xpi')
+        parsed_data = parse_addon(self.upload, user=self.user)
+        deleted = Addon.from_upload(
+            self.upload, selected_apps=[self.selected_app], parsed_data=parsed_data
+        )
+        deleted.update(status=amo.STATUS_APPROVED)
         deleted.delete()
-        assert deleted.guid == 'guid@xpi'
+        assert deleted.guid == '@webextension-guid'
 
         # Now upload the same add-on again (so same guid).
         with self.assertRaises(forms.ValidationError) as e:
-            self.upload = self.get_upload('extension.xpi')
-            parse_addon(self.upload, user=Mock())
+            self.upload = self.get_upload('webextension.xpi')
+            parse_addon(self.upload, user=self.user)
         assert e.exception.messages == ['Duplicate add-on ID found.']
 
-    def test_existing_guid_same_author(self):
+    def test_existing_guid_same_author_still_forbidden(self):
         # Upload addon so we can delete it.
-        self.upload = self.get_upload('extension.xpi')
-        parsed_data = parse_addon(self.upload, user=Mock())
-        deleted = Addon.from_upload(self.upload, [self.selected_app],
-                                    parsed_data=parsed_data)
+        self.upload = self.get_upload('webextension.xpi')
+        parsed_data = parse_addon(self.upload, user=self.user)
+        deleted = Addon.from_upload(
+            self.upload, selected_apps=[self.selected_app], parsed_data=parsed_data
+        )
+        assert AddonGUID.objects.filter(guid='@webextension-guid').count() == 1
         # Claim the add-on.
-        AddonUser(addon=deleted, user=UserProfile.objects.get(pk=999)).save()
-        deleted.update(status=amo.STATUS_PUBLIC)
+        AddonUser(addon=deleted, user=self.user).save()
+        deleted.update(status=amo.STATUS_APPROVED)
         deleted.delete()
-        assert deleted.guid == 'guid@xpi'
+        assert deleted.guid == '@webextension-guid'
 
-        # Now upload the same add-on again (so same guid), checking no
-        # validationError is raised this time.
-        self.upload = self.get_upload('extension.xpi')
-        parsed_data = parse_addon(self.upload, user=Mock())
-        addon = Addon.from_upload(self.upload, [self.selected_app],
-                                  parsed_data=parsed_data)
-        deleted.reload()
-        assert addon.guid == 'guid@xpi'
-        assert deleted.guid == 'guid-reused-by-pk-%s' % addon.pk
+        # Now upload the same add-on again (so same guid). We're building
+        # parsed_data manually to avoid the ValidationError from parse_addon()
+        # because we're interested in the error coming after that.
+        self.upload = self.get_upload('webextension.xpi')
+        parsed_data = {
+            'guid': '@webextension-guid',
+            'type': 1,
+            'version': '0.0.1',
+            'name': 'My WebExtension Addon',
+            'summary': 'just a test addon with the manifest.json format',
+            'homepage': None,
+            'default_locale': None,
+            'manifest_version': 2,
+            'install_origins': [],
+            'apps': [],
+            'strict_compatibility': False,
+            'is_experiment': False,
+            'optional_permissions': [],
+            'permissions': [],
+            'content_scripts': [],
+        }
 
-    def test_old_soft_deleted_addons_and_upload_non_extension(self):
-        """We used to just null out GUIDs on soft deleted addons. This test
-        makes sure we don't fail badly when uploading an add-on which isn't an
-        extension (has no GUID).
-        See https://github.com/mozilla/addons-server/issues/1659."""
-        # Upload a couple of addons so we can pretend they were soft deleted.
-        deleted1 = Addon.from_upload(
-            self.get_upload('extension.xpi'), [self.selected_app],
-            parsed_data=self.dummy_parsed_data)
-        deleted2 = Addon.from_upload(
-            self.get_upload('alt-rdf.xpi'), [self.selected_app],
-            parsed_data=self.dummy_parsed_data)
-        AddonUser(addon=deleted1, user=UserProfile.objects.get(pk=999)).save()
-        AddonUser(addon=deleted2, user=UserProfile.objects.get(pk=999)).save()
-
-        # Soft delete them like they were before, by nullifying their GUIDs.
-        deleted1.update(status=amo.STATUS_PUBLIC, guid=None)
-        deleted2.update(status=amo.STATUS_PUBLIC, guid=None)
-
-        # Now upload a new add-on which isn't an extension, and has no GUID.
-        # This fails if we try to reclaim the GUID from deleted add-ons: the
-        # GUID is None, so it'll try to get the add-on that has a GUID which is
-        # None, but many are returned. So make sure we're not trying to reclaim
-        # the GUID.
-        self.upload = self.get_upload('search.xml')
-        parsed_data = parse_addon(self.upload, user=Mock())
-        Addon.from_upload(
-            self.upload, [self.selected_app], parsed_data=parsed_data)
+        with self.assertRaises(IntegrityError):
+            Addon.from_upload(
+                self.upload, selected_apps=[self.selected_app], parsed_data=parsed_data
+            )
 
     def test_xpi_attributes(self):
-        self.upload = self.get_upload('extension.xpi')
-        parsed_data = parse_addon(self.upload, user=Mock())
-        addon = Addon.from_upload(self.upload, [self.selected_app],
-                                  parsed_data=parsed_data)
-        assert addon.name == 'xpi name'
-        assert addon.guid == 'guid@xpi'
+        self.upload = self.get_upload('webextension.xpi')
+        parsed_data = parse_addon(self.upload, user=self.user)
+        addon = Addon.from_upload(
+            self.upload, selected_apps=[self.selected_app], parsed_data=parsed_data
+        )
+        assert addon.name == 'My WebExtension Addon'
+        assert addon.guid == '@webextension-guid'
         assert addon.type == amo.ADDON_EXTENSION
         assert addon.status == amo.STATUS_NULL
-        assert addon.homepage == 'http://homepage.com'
-        assert addon.summary == 'xpi description'
+        assert addon.homepage is None
+        assert addon.summary == 'just a test addon with the manifest.json format'
         assert addon.description is None
-        assert addon.slug == 'xpi-name'
+        assert addon.slug == 'my-webextension-addon'
 
     def test_xpi_version(self):
-        addon = Addon.from_upload(self.get_upload('extension.xpi'),
-                                  [self.selected_app],
-                                  parsed_data=self.dummy_parsed_data)
+        addon = Addon.from_upload(
+            self.get_upload('webextension.xpi'),
+            selected_apps=[self.selected_app],
+            parsed_data=self.dummy_parsed_data,
+        )
         version = addon.versions.get()
-        assert version.version == '0.1'
+        assert version.version == '0.0.1'
         assert len(version.compatible_apps.keys()) == 1
         assert list(version.compatible_apps.keys())[0].id == self.selected_app
-        assert version.files.get().platform == amo.PLATFORM_ALL.id
-        assert version.files.get().status == amo.STATUS_AWAITING_REVIEW
-
-    def test_platforms(self):
-        # We are defaulting to PLATFORM_ALL for all uploads as part of
-        # removing platforms in favour of ApplicationsVersions
-        # See #8572 for more details.
-        addon = Addon.from_upload(
-            self.get_upload('extension.xpi'),
-            [amo.FIREFOX.id, amo.ANDROID.id],
-            parsed_data=self.dummy_parsed_data)
-        version = addon.versions.get()
-        assert sorted([file_.platform for file_ in version.all_files]) == (
-            [amo.PLATFORM_ALL.id])
-
-    def test_search_attributes(self):
-        self.upload = self.get_upload('search.xml')
-        parsed_data = parse_addon(self.upload, user=Mock())
-        addon = Addon.from_upload(self.upload, [self.selected_app],
-                                  parsed_data=parsed_data)
-        assert addon.name == 'search tool'
-        assert addon.guid is None
-        assert addon.type == amo.ADDON_SEARCH
-        assert addon.status == amo.STATUS_NULL
-        assert addon.homepage is None
-        assert addon.description is None
-        assert addon.slug == 'search-tool'
-        assert addon.summary == 'Search Engine for Firefox'
-
-    def test_search_version(self):
-        self.upload = self.get_upload('search.xml')
-        parsed_data = parse_addon(self.upload, user=Mock())
-        addon = Addon.from_upload(
-            self.upload, [self.selected_app], parsed_data=parsed_data)
-        version = addon.versions.get()
-        assert version.version == datetime.now().strftime('%Y%m%d')
-        assert version.files.get().platform == amo.PLATFORM_ALL.id
-        assert version.files.get().status == amo.STATUS_AWAITING_REVIEW
-
-    def test_no_homepage(self):
-        addon = Addon.from_upload(
-            self.get_upload('extension-no-homepage.xpi'),
-            [self.selected_app],
-            parsed_data=self.dummy_parsed_data)
-        assert addon.homepage is None
+        assert version.file.status == amo.STATUS_AWAITING_REVIEW
 
     def test_default_locale(self):
         # Make sure default_locale follows the active translation.
+        self.dummy_parsed_data.pop('guid')
         addon = Addon.from_upload(
-            self.get_upload('search.xml'),
-            [self.selected_app], parsed_data=self.dummy_parsed_data)
+            self.get_upload('webextension_no_id.xpi'),
+            selected_apps=[self.selected_app],
+            parsed_data=self.dummy_parsed_data,
+        )
         assert addon.default_locale == 'en-US'
 
-        translation.activate('es')
+        translation.activate('es-ES')
+        self.dummy_parsed_data.pop('guid')
         addon = Addon.from_upload(
-            self.get_upload('search.xml'),
-            [self.selected_app], parsed_data=self.dummy_parsed_data)
-        assert addon.default_locale == 'es'
+            self.get_upload('webextension_no_id.xpi'),
+            selected_apps=[self.selected_app],
+            parsed_data=self.dummy_parsed_data,
+        )
+        assert addon.default_locale == 'es-ES'
 
     def test_validation_completes(self):
-        upload = self.get_upload('extension.xpi')
+        upload = self.get_upload('webextension.xpi')
         assert not upload.validation_timeout
         addon = Addon.from_upload(
-            upload, [self.selected_app], parsed_data=self.dummy_parsed_data)
-        assert not addon.needs_admin_code_review
+            upload,
+            selected_apps=[self.selected_app],
+            parsed_data=self.dummy_parsed_data,
+        )
         assert not addon.auto_approval_disabled
 
     def test_validation_timeout(self):
-        upload = self.get_upload('extension.xpi')
+        upload = self.get_upload('webextension.xpi')
         validation = json.loads(upload.validation)
         timeout_message = {
             'id': ['validator', 'unexpected_exception', 'validation_timeout'],
@@ -2381,34 +3431,41 @@ class TestAddonFromUpload(UploadTest):
         upload.validation = json.dumps(validation)
         assert upload.validation_timeout
         addon = Addon.from_upload(
-            upload, [self.selected_app], parsed_data=self.dummy_parsed_data)
-        assert addon.needs_admin_code_review
+            upload,
+            selected_apps=[self.selected_app],
+            parsed_data=self.dummy_parsed_data,
+        )
         assert not addon.auto_approval_disabled
 
     def test_mozilla_signed(self):
-        upload = self.get_upload('extension.xpi')
+        upload = self.get_upload('webextension.xpi')
         assert not upload.validation_timeout
         self.dummy_parsed_data['is_mozilla_signed_extension'] = True
         addon = Addon.from_upload(
-            upload, [self.selected_app], parsed_data=self.dummy_parsed_data)
-        assert addon.needs_admin_code_review
+            upload,
+            selected_apps=[self.selected_app],
+            parsed_data=self.dummy_parsed_data,
+        )
         assert addon.auto_approval_disabled
 
     def test_mozilla_signed_langpack(self):
-        upload = self.get_upload('extension.xpi')
+        upload = self.get_upload('webextension.xpi')
         assert not upload.validation_timeout
         self.dummy_parsed_data['is_mozilla_signed_extension'] = True
         self.dummy_parsed_data['type'] = amo.ADDON_LPAPP
         addon = Addon.from_upload(
-            upload, [self.selected_app], parsed_data=self.dummy_parsed_data)
-        assert not addon.needs_admin_code_review
+            upload,
+            selected_apps=[self.selected_app],
+            parsed_data=self.dummy_parsed_data,
+        )
         assert not addon.auto_approval_disabled
 
     def test_webextension_generate_guid(self):
         self.upload = self.get_upload('webextension_no_id.xpi')
-        parsed_data = parse_addon(self.upload, user=Mock())
+        parsed_data = parse_addon(self.upload, user=self.user)
         addon = Addon.from_upload(
-            self.upload, [self.selected_app], parsed_data=parsed_data)
+            self.upload, selected_apps=[self.selected_app], parsed_data=parsed_data
+        )
 
         assert addon.guid is not None
         assert addon.guid.startswith('{')
@@ -2416,9 +3473,10 @@ class TestAddonFromUpload(UploadTest):
 
         # Uploading the same addon without a id works.
         self.upload = self.get_upload('webextension_no_id.xpi')
-        parsed_data = parse_addon(self.upload, user=Mock())
+        parsed_data = parse_addon(self.upload, user=self.user)
         new_addon = Addon.from_upload(
-            self.upload, [self.selected_app], parsed_data=parsed_data)
+            self.upload, selected_apps=[self.selected_app], parsed_data=parsed_data
+        )
         assert new_addon.guid is not None
         assert new_addon.guid != addon.guid
         assert addon.guid.startswith('{')
@@ -2426,31 +3484,33 @@ class TestAddonFromUpload(UploadTest):
 
     def test_webextension_reuse_guid(self):
         self.upload = self.get_upload('webextension.xpi')
-        parsed_data = parse_addon(self.upload, user=Mock())
+        parsed_data = parse_addon(self.upload, user=self.user)
         addon = Addon.from_upload(
-            self.upload, [self.selected_app], parsed_data=parsed_data)
+            self.upload, selected_apps=[self.selected_app], parsed_data=parsed_data
+        )
 
         assert addon.guid == '@webextension-guid'
 
         # Uploading the same addon with pre-existing id fails
         with self.assertRaises(forms.ValidationError) as e:
             self.upload = self.get_upload('webextension.xpi')
-            parsed_data = parse_addon(self.upload, user=Mock())
-            Addon.from_upload(self.upload, [self.selected_app],
-                              parsed_data=parsed_data)
+            parsed_data = parse_addon(self.upload, user=self.user)
+            Addon.from_upload(
+                self.upload, selected_apps=[self.selected_app], parsed_data=parsed_data
+            )
         assert e.exception.messages == ['Duplicate add-on ID found.']
 
-    def test_webextension_resolve_translations(self):
+    def test_webext_resolve_translations(self):
         self.upload = self.get_upload('notify-link-clicks-i18n.xpi')
-        parsed_data = parse_addon(self.upload, user=Mock())
+        parsed_data = parse_addon(self.upload, user=self.user)
         addon = Addon.from_upload(
-            self.upload, [self.selected_app], parsed_data=parsed_data)
+            self.upload, selected_apps=[self.selected_app], parsed_data=parsed_data
+        )
 
         # Normalized from `en` to `en-US`
         assert addon.default_locale == 'en-US'
         assert addon.name == 'Notify link clicks i18n'
-        assert addon.summary == (
-            'Shows a notification when the user clicks on links.')
+        assert addon.summary == 'Shows a notification when the user clicks on links.'
 
         # Make sure we set the correct slug
         assert addon.slug == 'notify-link-clicks-i18n'
@@ -2458,25 +3518,99 @@ class TestAddonFromUpload(UploadTest):
         translation.activate('de')
         addon.reload()
         assert addon.name == 'Meine Beispielerweiterung'
-        assert addon.summary == u'Benachrichtigt den Benutzer über Linkklicks'
+        assert addon.summary == 'Benachrichtigt den Benutzer über Linkklicks'
+
+    @patch('olympia.addons.models.resolve_i18n_message', lambda *args, **kw: 'A' * 500)
+    def test_webext_resolve_translations_truncate_to_max_length(self):
+        self.upload = self.get_upload('notify-link-clicks-i18n.xpi')
+        parsed_data = parse_addon(self.upload, user=self.user)
+        addon = Addon.from_upload(
+            self.upload, selected_apps=[self.selected_app], parsed_data=parsed_data
+        )
+        assert len(str(addon.name)) == 50
+        assert len(str(addon.summary)) == 250
+        assert (
+            len(Translation.objects.get(locale='de', id=addon.name.id).localized_string)
+            == 50
+        )
+        assert (
+            len(
+                Translation.objects.get(
+                    locale='de', id=addon.summary.id
+                ).localized_string
+            )
+            == 250
+        )
+
+    def test_webext_resolve_translations_truncate_to_max_length_invalid_locale(self):
+        self.upload = self.get_upload('notify-link-clicks-i18n.xpi')
+        parsed_data = parse_addon(self.upload, user=self.user)
+        parsed_data['default_locale'] = 'xx'
+        parsed_data['name'] = 'A' * 500
+        parsed_data['summary'] = 'B' * 500
+        addon = Addon.from_upload(
+            self.upload, selected_apps=[self.selected_app], parsed_data=parsed_data
+        )
+        assert len(str(addon.name)) == 50
+        assert len(str(addon.summary)) == 250
+        # Translations were not imported because of the invalid default locale.
+        assert Translation.objects.filter(id=addon.name.id).count() == 1
+        assert Translation.objects.filter(id=addon.summary.id).count() == 1
+
+    def test_webext_resolve_translations_truncate_to_max_length_unknown_locale(self):
+        self.upload = self.get_upload('notify-link-clicks-i18n.xpi')
+        parsed_data = parse_addon(self.upload, user=self.user)
+        parsed_data['default_locale'] = 'sv'
+        parsed_data['name'] = 'A' * 500
+        parsed_data['summary'] = 'B' * 500
+        addon = Addon.from_upload(
+            self.upload, selected_apps=[self.selected_app], parsed_data=parsed_data
+        )
+        assert len(str(addon.name)) == 50
+        assert len(str(addon.summary)) == 250
+        assert (
+            len(Translation.objects.get(locale='de', id=addon.name.id).localized_string)
+            == 50
+        )
+        assert (
+            len(
+                Translation.objects.get(
+                    locale='de', id=addon.summary.id
+                ).localized_string
+            )
+            == 250
+        )
+
+    def test_webext_resolve_translations_truncate_to_max_length_untranslated(self):
+        self.upload = self.get_upload('webextension.xpi')
+        parsed_data = parse_addon(self.upload, user=self.user)
+        parsed_data['name'] = 'A' * 500
+        parsed_data['summary'] = 'B' * 500
+        addon = Addon.from_upload(
+            self.upload, selected_apps=[self.selected_app], parsed_data=parsed_data
+        )
+        assert len(str(addon.name)) == 50
+        assert len(str(addon.summary)) == 250
 
     def test_webext_resolve_translations_corrects_locale(self):
         """Make sure we correct invalid `default_locale` values"""
         parsed_data = {
-            'default_locale': u'sv',
-            'guid': u'notify-link-clicks-i18n@notzilla.org',
-            'name': u'__MSG_extensionName__',
-            'is_webextension': True,
+            'manifest_version': 2,
+            'default_locale': 'sv',
+            'guid': 'notify-link-clicks-i18n@notzilla.org',
+            'name': '__MSG_extensionName__',
             'type': 1,
             'apps': [],
-            'summary': u'__MSG_extensionDescription__',
-            'version': u'1.0',
-            'homepage': '...'
+            'summary': '__MSG_extensionDescription__',
+            'version': '1.0',
+            'homepage': '...',
         }
 
         addon = Addon.from_upload(
             self.get_upload('notify-link-clicks-i18n.xpi'),
-            [self.selected_app], parsed_data=parsed_data)
+            selected_apps=[self.selected_app],
+            parsed_data=parsed_data,
+        )
 
         # Normalized from `sv` to `sv-SE`
         assert addon.default_locale == 'sv-SE'
@@ -2486,30 +3620,94 @@ class TestAddonFromUpload(UploadTest):
         for invalid locales
         """
         parsed_data = {
-            'default_locale': u'xxx',
-            'guid': u'notify-link-clicks-i18n@notzilla.org',
-            'name': u'__MSG_extensionName__',
-            'is_webextension': True,
+            'manifest_version': 2,
+            'default_locale': 'xxx',
+            'guid': 'notify-link-clicks-i18n@notzilla.org',
+            'name': '__MSG_extensionName__',
             'type': 1,
             'apps': [],
-            'summary': u'__MSG_extensionDescription__',
-            'version': u'1.0',
-            'homepage': '...'
+            'summary': '__MSG_extensionDescription__',
+            'version': '1.0',
+            'homepage': '...',
         }
 
         addon = Addon.from_upload(
             self.get_upload('notify-link-clicks-i18n.xpi'),
-            [self.selected_app], parsed_data=parsed_data)
+            selected_apps=[self.selected_app],
+            parsed_data=parsed_data,
+        )
 
         # Normalized from `en` to `en-US`
         assert addon.default_locale == 'en-US'
 
+    def test_webext_resolve_translations_localized_dict_overrides(self):
+        """If we have a dict passed as the field value it is already localised so don't
+        try to localize further."""
+        parsed_data = {
+            'manifest_version': 2,
+            'default_locale': 'sv',
+            'guid': 'notify-link-clicks-i18n@notzilla.org',
+            'name': '__MSG_extensionName__',
+            'type': 1,
+            'apps': [],
+            'summary': {'en-US': 'some summary', 'fr': 'some óthér summary'},
+            'version': '1.0',
+            'homepage': '...',
+        }
 
-REDIRECT_URL = 'https://outgoing.prod.mozaws.net/v1/'
+        addon = Addon.from_upload(
+            self.get_upload('notify-link-clicks-i18n.xpi'),
+            selected_apps=[self.selected_app],
+            parsed_data=parsed_data,
+        )
+
+        # Normalized from `sv` to `sv-SE`
+        assert addon.summary == 'some summary'
+        with self.activate('fr'):
+            addon.reload()
+            assert addon.summary == 'some óthér summary'
+
+    def test_activity_log(self):
+        # Set current user as the task user, but use an upload that belongs to
+        # another, making sure the activity log belongs to them and not the
+        # task user.
+        core.set_user(UserProfile.objects.get(pk=settings.TASK_USER_ID))
+        self.upload = self.get_upload('webextension.xpi', user=self.user)
+        parsed_data = parse_addon(self.upload, user=self.user)
+        addon = Addon.from_upload(
+            self.upload, selected_apps=[self.selected_app], parsed_data=parsed_data
+        )
+        assert addon
+        assert (
+            ActivityLog.objects.for_addons(addon)
+            .filter(action=amo.LOG.CREATE_ADDON.id)
+            .count()
+            == 1
+        )
+        log = (
+            ActivityLog.objects.for_addons(addon)
+            .filter(action=amo.LOG.CREATE_ADDON.id)
+            .get()
+        )
+        assert log.user == self.user
+
+    def test_client_info(self):
+        self.upload = self.get_upload('webextension.xpi', user=self.user)
+        parsed_data = parse_addon(self.upload, user=self.user)
+        addon = Addon.from_upload(
+            self.get_upload('notify-link-clicks-i18n.xpi'),
+            selected_apps=[self.selected_app],
+            parsed_data=parsed_data,
+            client_info='Blâh/6',
+        )
+        assert addon
+        provenance = VersionProvenance.objects.get()
+        assert provenance.version == addon.current_version
+        assert provenance.source == self.upload.source
+        assert provenance.client_info == 'Blâh/6'
 
 
 class TestFrozenAddons(TestCase):
-
     def test_immediate_freeze(self):
         # Adding a FrozenAddon should immediately drop the addon's hotness.
         a = Addon.objects.create(type=1, hotness=22)
@@ -2518,73 +3716,32 @@ class TestFrozenAddons(TestCase):
 
 
 class TestRemoveLocale(TestCase):
-
     def test_remove(self):
         a = Addon.objects.create(type=1)
         a.name = {'en-US': 'woo', 'el': 'yeah'}
         a.description = {'en-US': 'woo', 'el': 'yeah', 'he': 'ola'}
         a.save()
         a.remove_locale('el')
-        qs = (Translation.objects.filter(localized_string__isnull=False)
-              .values_list('locale', flat=True))
+        qs = Translation.objects.filter(localized_string__isnull=False).values_list(
+            'locale', flat=True
+        )
         assert sorted(qs.filter(id=a.name_id)) == ['en-US']
         assert sorted(qs.filter(id=a.description_id)) == ['en-US', 'he']
 
     def test_remove_version_locale(self):
-        addon = Addon.objects.create(type=amo.ADDON_THEME)
+        addon = Addon.objects.create(type=amo.ADDON_DICT)
         version = Version.objects.create(addon=addon)
         version.release_notes = {'fr': 'oui'}
         version.save()
         addon.remove_locale('fr')
-        assert not (Translation.objects.filter(localized_string__isnull=False)
-                               .values_list('locale', flat=True))
-
-
-class TestAddonWatchDisabled(TestCase):
-
-    def setUp(self):
-        super(TestAddonWatchDisabled, self).setUp()
-        self.addon = Addon(type=amo.ADDON_THEME, disabled_by_user=False,
-                           status=amo.STATUS_PUBLIC)
-        self.addon.save()
-
-    @patch('olympia.addons.models.File.objects.filter')
-    def test_no_disabled_change(self, file_mock):
-        mock = Mock()
-        file_mock.return_value = [mock]
-        self.addon.save()
-        assert not mock.unhide_disabled_file.called
-        assert not mock.hide_disabled_file.called
-
-    @patch('olympia.addons.models.File.objects.filter')
-    def test_disable_addon(self, file_mock):
-        mock = Mock()
-        file_mock.return_value = [mock]
-        self.addon.update(disabled_by_user=True)
-        assert not mock.unhide_disabled_file.called
-        assert mock.hide_disabled_file.called
-
-    @patch('olympia.addons.models.File.objects.filter')
-    def test_admin_disable_addon(self, file_mock):
-        mock = Mock()
-        file_mock.return_value = [mock]
-        self.addon.update(status=amo.STATUS_DISABLED)
-        assert not mock.unhide_disabled_file.called
-        assert mock.hide_disabled_file.called
-
-    @patch('olympia.addons.models.File.objects.filter')
-    def test_enable_addon(self, file_mock):
-        mock = Mock()
-        file_mock.return_value = [mock]
-        self.addon.update(status=amo.STATUS_DISABLED)
-        mock.reset_mock()
-        self.addon.update(status=amo.STATUS_PUBLIC)
-        assert mock.unhide_disabled_file.called
-        assert not mock.hide_disabled_file.called
+        assert not (
+            Translation.objects.filter(localized_string__isnull=False).values_list(
+                'locale', flat=True
+            )
+        )
 
 
 class TestTrackAddonStatusChange(TestCase):
-
     def create_addon(self, **kwargs):
         return addon_factory(kwargs.pop('status', amo.STATUS_NULL), **kwargs)
 
@@ -2597,352 +3754,24 @@ class TestTrackAddonStatusChange(TestCase):
     def test_increment_updated_status(self):
         addon = self.create_addon()
         with patch('olympia.addons.models.track_addon_status_change') as mock_:
-            addon.update(status=amo.STATUS_PUBLIC)
+            addon.update(status=amo.STATUS_APPROVED)
 
         addon.reload()
-        mock_.call_args[0][0].status == addon.status
+        assert mock_.call_args[0][0].status == addon.status
 
     def test_ignore_non_status_changes(self):
         addon = self.create_addon()
         with patch('olympia.addons.models.track_addon_status_change') as mock_:
-            addon.update(type=amo.ADDON_THEME)
-        assert not mock_.called, (
-            'Unexpected call: {}'.format(self.mock_incr.call_args)
-        )
+            addon.update(type=amo.ADDON_DICT)
+        assert not mock_.called, f'Unexpected call: {self.mock_incr.call_args}'
 
     def test_increment_all_addon_statuses(self):
-        addon = self.create_addon(status=amo.STATUS_PUBLIC)
+        addon = self.create_addon(status=amo.STATUS_APPROVED)
         with patch('olympia.addons.models.statsd.incr') as mock_incr:
             track_addon_status_change(addon)
         mock_incr.assert_any_call(
-            'addon_status_change.all.status_{}'.format(amo.STATUS_PUBLIC)
+            f'addon_status_change.all.status_{amo.STATUS_APPROVED}'
         )
-
-
-class TestSearchSignals(amo.tests.ESTestCase):
-
-    def setUp(self):
-        super(TestSearchSignals, self).setUp()
-        self.addCleanup(self.cleanup)
-
-    def cleanup(self):
-        self.empty_index('default')
-
-    def test_no_addons(self):
-        assert Addon.search_public().count() == 0
-
-    def test_create(self):
-        addon = addon_factory(name='woo')
-        self.refresh()
-        assert Addon.search_public().count() == 1
-        assert Addon.search_public().query(name='woo')[0].id == addon.id
-
-    def test_update(self):
-        addon = addon_factory(name='woo')
-        self.refresh()
-        assert Addon.search_public().count() == 1
-
-        addon.name = 'yeah'
-        addon.save()
-        self.refresh()
-
-        assert Addon.search_public().count() == 1
-        assert Addon.search_public().query(name='woo').count() == 0
-        assert Addon.search_public().query(name='yeah')[0].id == addon.id
-
-    def test_user_disable(self):
-        """Test that add-ons are removed from search results after being
-        disabled by their developers."""
-        addon = addon_factory(name='woo')
-        self.refresh()
-        assert Addon.search_public().count() == 1
-
-        addon.update(disabled_by_user=True)
-        self.refresh()
-
-        assert Addon.search_public().count() == 0
-
-    def test_switch_to_unlisted(self):
-        """Test that add-ons are removed from search results after being
-        switched to unlisted."""
-        addon = addon_factory(name='woo')
-        self.refresh()
-        assert Addon.search_public().count() == 1
-
-        addon.current_version.update(channel=amo.RELEASE_CHANNEL_UNLISTED)
-        self.refresh()
-
-        assert Addon.search_public().count() == 0
-
-    def test_switch_to_listed(self):
-        """Test that add-ons created as unlisted do not appear in search
-        results until switched to listed."""
-        addon = addon_factory(
-            name='woo', version_kw={'channel': amo.RELEASE_CHANNEL_UNLISTED},
-            status=amo.STATUS_NULL)
-        self.refresh()
-        assert Addon.search_public().count() == 0
-
-        latest_version = addon.find_latest_version(
-            channel=amo.RELEASE_CHANNEL_UNLISTED)
-        latest_version.update(channel=amo.RELEASE_CHANNEL_LISTED)
-        addon.update(status=amo.STATUS_PUBLIC)
-        self.refresh()
-
-        assert Addon.search_public().count() == 1
-
-    def test_delete(self):
-        addon = addon_factory(name='woo')
-        self.refresh()
-        assert Addon.search_public().count() == 1
-
-        addon.delete('woo')
-        self.refresh()
-        assert Addon.search_public().count() == 0
-
-
-class TestLanguagePack(TestCase, amo.tests.AMOPaths):
-
-    def setUp(self):
-        super(TestLanguagePack, self).setUp()
-        self.addon = amo.tests.addon_factory(type=amo.ADDON_LPAPP,
-                                             status=amo.STATUS_PUBLIC)
-        self.platform_all = amo.PLATFORM_ALL.id
-        self.platform_mob = amo.PLATFORM_ANDROID.id
-        self.version = self.addon.current_version
-
-    def test_extract(self):
-        File.objects.create(platform=self.platform_mob, version=self.version,
-                            filename=self.xpi_path('langpack-localepicker'),
-                            status=amo.STATUS_PUBLIC)
-        assert self.addon.reload().get_localepicker()
-        assert 'title=Select a language' in self.addon.get_localepicker()
-
-    def test_extract_no_file(self):
-        File.objects.create(platform=self.platform_mob, version=self.version,
-                            filename=self.xpi_path('langpack'),
-                            status=amo.STATUS_PUBLIC)
-        assert self.addon.reload().get_localepicker() == ''
-
-    def test_extract_no_files(self):
-        assert self.addon.get_localepicker() == ''
-
-    def test_extract_not_language_pack(self):
-        File.objects.create(platform=self.platform_mob, version=self.version,
-                            filename=self.xpi_path('langpack-localepicker'),
-                            status=amo.STATUS_PUBLIC)
-        assert self.addon.reload().get_localepicker()
-        self.addon.update(type=amo.ADDON_EXTENSION)
-        assert self.addon.get_localepicker() == ''
-
-    def test_extract_not_platform_mobile(self):
-        File.objects.create(platform=self.platform_all, version=self.version,
-                            filename=self.xpi_path('langpack-localepicker'),
-                            status=amo.STATUS_PUBLIC)
-        assert self.addon.reload().get_localepicker() == ''
-
-
-class TestCompatOverride(TestCase):
-
-    def setUp(self):
-        super(TestCompatOverride, self).setUp()
-        self.app = amo.APP_IDS[1]
-
-        one = CompatOverride.objects.create(guid='one')
-        CompatOverrideRange.objects.create(compat=one, app=self.app.id)
-
-        two = CompatOverride.objects.create(guid='two')
-        CompatOverrideRange.objects.create(compat=two, app=self.app.id,
-                                           min_version='1', max_version='2')
-        CompatOverrideRange.objects.create(compat=two, app=self.app.id,
-                                           min_version='1', max_version='2',
-                                           min_app_version='3',
-                                           max_app_version='4')
-
-    def check(self, obj, **kw):
-        """Check that key/value pairs in kw match attributes of obj."""
-        for key, expected in kw.items():
-            actual = getattr(obj, key)
-            assert actual == expected
-
-    def test_is_hosted(self):
-        c = CompatOverride.objects.create(guid='a')
-        assert not c.is_hosted()
-
-        Addon.objects.create(type=1, guid='b')
-        c = CompatOverride.objects.create(guid='b')
-        assert c.is_hosted()
-
-    def test_override_type(self):
-        one = CompatOverride.objects.get(guid='one')
-
-        # The default is incompatible.
-        c = CompatOverrideRange.objects.create(compat=one, app=1)
-        assert c.override_type() == 'incompatible'
-
-        c = CompatOverrideRange.objects.create(compat=one, app=1, type=0)
-        assert c.override_type() == 'compatible'
-
-    def test_guid_match(self):
-        # We hook up the add-on automatically if we see a matching guid.
-        addon = Addon.objects.create(id=1, guid='oh yeah', type=1)
-        c = CompatOverride.objects.create(guid=addon.guid)
-        assert c.addon_id == addon.id
-
-        c = CompatOverride.objects.create(guid='something else')
-        assert c.addon is None
-
-    def test_transformer(self):
-        compats = list(CompatOverride.objects
-                       .transform(CompatOverride.transformer))
-        ranges = list(CompatOverrideRange.objects.all())
-        # If the transformer works then we won't have any more queries.
-        with self.assertNumQueries(0):
-            for c in compats:
-                assert c.compat_ranges == (
-                    [r for r in ranges if r.compat_id == c.id])
-
-    def test_collapsed_ranges(self):
-        # Test that we get back the right structures from collapsed_ranges().
-        c = CompatOverride.objects.get(guid='one')
-        r = c.collapsed_ranges()
-
-        assert len(r) == 1
-        compat_range = r[0]
-        self.check(compat_range, type='incompatible', min='0', max='*')
-
-        assert len(compat_range.apps) == 1
-        self.check(compat_range.apps[0], app=amo.FIREFOX, min='0', max='*')
-
-    def test_collapsed_ranges_multiple_versions(self):
-        c = CompatOverride.objects.get(guid='one')
-        CompatOverrideRange.objects.create(compat=c, app=1,
-                                           min_version='1', max_version='2',
-                                           min_app_version='3',
-                                           max_app_version='3.*')
-        r = c.collapsed_ranges()
-
-        assert len(r) == 2
-
-        self.check(r[0], type='incompatible', min='0', max='*')
-        assert len(r[0].apps) == 1
-        self.check(r[0].apps[0], app=amo.FIREFOX, min='0', max='*')
-
-        self.check(r[1], type='incompatible', min='1', max='2')
-        assert len(r[1].apps) == 1
-        self.check(r[1].apps[0], app=amo.FIREFOX, min='3', max='3.*')
-
-    def test_collapsed_ranges_different_types(self):
-        # If the override ranges have different types they should be separate
-        # entries.
-        c = CompatOverride.objects.get(guid='one')
-        CompatOverrideRange.objects.create(compat=c, app=1, type=0,
-                                           min_app_version='3',
-                                           max_app_version='3.*')
-        r = c.collapsed_ranges()
-
-        assert len(r) == 2
-
-        self.check(r[0], type='compatible', min='0', max='*')
-        assert len(r[0].apps) == 1
-        self.check(r[0].apps[0], app=amo.FIREFOX, min='3', max='3.*')
-
-        self.check(r[1], type='incompatible', min='0', max='*')
-        assert len(r[1].apps) == 1
-        self.check(r[1].apps[0], app=amo.FIREFOX, min='0', max='*')
-
-    def test_collapsed_ranges_multiple_apps(self):
-        c = CompatOverride.objects.get(guid='two')
-        r = c.collapsed_ranges()
-
-        assert len(r) == 1
-        compat_range = r[0]
-        self.check(compat_range, type='incompatible', min='1', max='2')
-
-        assert len(compat_range.apps) == 2
-        self.check(compat_range.apps[0], app=amo.FIREFOX, min='0', max='*')
-        self.check(compat_range.apps[1], app=amo.FIREFOX, min='3', max='4')
-
-    def test_collapsed_ranges_multiple_versions_and_apps(self):
-        c = CompatOverride.objects.get(guid='two')
-        CompatOverrideRange.objects.create(min_version='5', max_version='6',
-                                           compat=c, app=1)
-        r = c.collapsed_ranges()
-
-        assert len(r) == 2
-        self.check(r[0], type='incompatible', min='1', max='2')
-
-        assert len(r[0].apps) == 2
-        self.check(r[0].apps[0], app=amo.FIREFOX, min='0', max='*')
-        self.check(r[0].apps[1], app=amo.FIREFOX, min='3', max='4')
-
-        self.check(r[1], type='incompatible', min='5', max='6')
-        assert len(r[1].apps) == 1
-        self.check(r[1].apps[0], app=amo.FIREFOX, min='0', max='*')
-
-
-class TestIncompatibleVersions(TestCase):
-
-    def setUp(self):
-        super(TestIncompatibleVersions, self).setUp()
-        self.app = amo.APP_IDS[amo.FIREFOX.id]
-        self.addon = Addon.objects.create(guid='r@b', type=amo.ADDON_EXTENSION)
-
-    def test_signals_min(self):
-        assert IncompatibleVersions.objects.count() == 0
-
-        c = CompatOverride.objects.create(guid='r@b')
-        CompatOverrideRange.objects.create(compat=c, app=self.app.id,
-                                           min_version='0',
-                                           max_version='1.0')
-
-        # Test the max version matched.
-        version1 = Version.objects.create(id=2, addon=self.addon,
-                                          version='1.0')
-        assert IncompatibleVersions.objects.filter(
-            version=version1).count() == 1
-        assert IncompatibleVersions.objects.count() == 1
-
-        # Test the lower range.
-        version2 = Version.objects.create(id=1, addon=self.addon,
-                                          version='0.5')
-        assert IncompatibleVersions.objects.filter(
-            version=version2).count() == 1
-        assert IncompatibleVersions.objects.count() == 2
-
-        # Test delete signals.
-        version1.delete()
-        assert IncompatibleVersions.objects.count() == 1
-
-        version2.delete()
-        assert IncompatibleVersions.objects.count() == 0
-
-    def test_signals_max(self):
-        assert IncompatibleVersions.objects.count() == 0
-
-        c = CompatOverride.objects.create(guid='r@b')
-        CompatOverrideRange.objects.create(compat=c, app=self.app.id,
-                                           min_version='1.0',
-                                           max_version='*')
-
-        # Test the min_version matched.
-        version1 = Version.objects.create(addon=self.addon, version='1.0')
-        assert IncompatibleVersions.objects.filter(
-            version=version1).count() == 1
-        assert IncompatibleVersions.objects.count() == 1
-
-        # Test the upper range.
-        version2 = Version.objects.create(addon=self.addon, version='99.0')
-        assert IncompatibleVersions.objects.filter(
-            version=version2).count() == 1
-        assert IncompatibleVersions.objects.count() == 2
-
-        # Test delete signals.
-        version1.delete()
-        assert IncompatibleVersions.objects.count() == 1
-
-        version2.delete()
-        assert IncompatibleVersions.objects.count() == 0
 
 
 class TestAddonApprovalsCounter(TestCase):
@@ -2950,92 +3779,961 @@ class TestAddonApprovalsCounter(TestCase):
         self.addon = addon_factory()
 
     def test_increment_existing(self):
-        assert not AddonApprovalsCounter.objects.filter(
-            addon=self.addon).exists()
+        assert not AddonApprovalsCounter.objects.filter(addon=self.addon).exists()
         AddonApprovalsCounter.increment_for_addon(self.addon)
         approval_counter = AddonApprovalsCounter.objects.get(addon=self.addon)
         assert approval_counter.counter == 1
         self.assertCloseToNow(approval_counter.last_human_review)
         self.assertCloseToNow(approval_counter.last_content_review)
+        assert (
+            approval_counter.content_review_status
+            == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PASS
+        )
         approval_counter.update(
             last_human_review=self.days_ago(100),
-            last_content_review=self.days_ago(100))
+            last_content_review=self.days_ago(100),
+            content_review_status=AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.CHANGED,
+        )
         AddonApprovalsCounter.increment_for_addon(self.addon)
         approval_counter.reload()
         assert approval_counter.counter == 2
         self.assertCloseToNow(approval_counter.last_human_review)
         self.assertCloseToNow(approval_counter.last_content_review)
+        assert (
+            approval_counter.content_review_status
+            == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PASS
+        )
+
+        # But if the previous content reviewed failed, the status shouldn't be updated
+        # - the developer must request a review first
+        approval_counter.update(
+            content_review_status=AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.FAIL
+        )
+        AddonApprovalsCounter.increment_for_addon(self.addon)
+        approval_counter.reload()
+        assert approval_counter.counter == 3
+        self.assertCloseToNow(approval_counter.last_human_review)
+        self.assertCloseToNow(approval_counter.last_content_review)
+        assert (
+            approval_counter.content_review_status
+            == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.FAIL
+        )
 
     def test_increment_non_existing(self):
         approval_counter = AddonApprovalsCounter.objects.create(
-            addon=self.addon, counter=0)
+            addon=self.addon, counter=0
+        )
         AddonApprovalsCounter.increment_for_addon(self.addon)
         approval_counter.reload()
         assert approval_counter.counter == 1
         self.assertCloseToNow(approval_counter.last_human_review)
         self.assertCloseToNow(approval_counter.last_content_review)
+        assert (
+            approval_counter.content_review_status
+            == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PASS
+        )
 
     def test_reset_existing(self):
         approval_counter = AddonApprovalsCounter.objects.create(
-            addon=self.addon, counter=42,
+            addon=self.addon,
+            counter=42,
             last_content_review=self.days_ago(60),
-            last_human_review=self.days_ago(30))
+            last_human_review=self.days_ago(30),
+            content_review_status=AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PASS,
+        )
         AddonApprovalsCounter.reset_for_addon(self.addon)
         approval_counter.reload()
         assert approval_counter.counter == 0
-        # Dates were not touched.
+        # Dates and content review were not touched.
+        self.assertCloseToNow(approval_counter.last_human_review, now=self.days_ago(30))
         self.assertCloseToNow(
-            approval_counter.last_human_review, now=self.days_ago(30))
-        self.assertCloseToNow(
-            approval_counter.last_content_review, now=self.days_ago(60))
+            approval_counter.last_content_review, now=self.days_ago(60)
+        )
+        assert (
+            approval_counter.content_review_status
+            == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PASS
+        )
 
     def test_reset_non_existing(self):
-        assert not AddonApprovalsCounter.objects.filter(
-            addon=self.addon).exists()
+        assert not AddonApprovalsCounter.objects.filter(addon=self.addon).exists()
         AddonApprovalsCounter.reset_for_addon(self.addon)
         approval_counter = AddonApprovalsCounter.objects.get(addon=self.addon)
         assert approval_counter.counter == 0
-
-    def test_approve_content_non_existing(self):
-        assert not AddonApprovalsCounter.objects.filter(
-            addon=self.addon).exists()
-        AddonApprovalsCounter.approve_content_for_addon(self.addon)
-        approval_counter = AddonApprovalsCounter.objects.get(addon=self.addon)
-        assert approval_counter.counter == 0
-        assert approval_counter.last_human_review is None
-        self.assertCloseToNow(approval_counter.last_content_review)
+        assert (
+            approval_counter.content_review_status
+            == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.UNREVIEWED
+        )
 
     def test_approve_content_existing(self):
         approval_counter = AddonApprovalsCounter.objects.create(
-            addon=self.addon, counter=42,
+            addon=self.addon,
+            counter=42,
             last_content_review=self.days_ago(367),
-            last_human_review=self.days_ago(10))
+            last_human_review=self.days_ago(10),
+        )
         AddonApprovalsCounter.approve_content_for_addon(self.addon)
         approval_counter.reload()
         # This was updated to now.
         self.assertCloseToNow(approval_counter.last_content_review)
         # Those fields were not touched.
         assert approval_counter.counter == 42
-        self.assertCloseToNow(
-            approval_counter.last_human_review, now=self.days_ago(10))
+        self.assertCloseToNow(approval_counter.last_human_review, now=self.days_ago(10))
+        assert (
+            approval_counter.content_review_status
+            == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PASS
+        )
+
+    def test_approve_content_non_existing(self):
+        assert not AddonApprovalsCounter.objects.filter(addon=self.addon).exists()
+        AddonApprovalsCounter.approve_content_for_addon(self.addon)
+        approval_counter = AddonApprovalsCounter.objects.get(addon=self.addon)
+        assert approval_counter.counter == 0
+        assert approval_counter.last_human_review is None
+        self.assertCloseToNow(approval_counter.last_content_review)
+        assert (
+            approval_counter.content_review_status
+            == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PASS
+        )
+
+    def test_reject_content_existing(self):
+        approval_counter = AddonApprovalsCounter.objects.create(
+            addon=self.addon,
+            counter=42,
+            last_content_review=self.days_ago(367),
+            last_human_review=self.days_ago(10),
+        )
+        AddonApprovalsCounter.reject_content_for_addon(self.addon)
+
+        assert approval_counter.reload().last_content_review is None
+        assert approval_counter.counter == 42  # unchanged
+        self.assertCloseToNow(approval_counter.last_human_review, now=self.days_ago(10))
+        assert (
+            approval_counter.content_review_status
+            == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.FAIL
+        )
+
+    def test_reject_content_non_existing(self):
+        assert not AddonApprovalsCounter.objects.filter(addon=self.addon).exists()
+        AddonApprovalsCounter.reject_content_for_addon(self.addon)
+        approval_counter = AddonApprovalsCounter.objects.get(addon=self.addon)
+        assert approval_counter.counter == 0
+        assert approval_counter.last_human_review is None
+        assert (
+            approval_counter.content_review_status
+            == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.FAIL
+        )
+
+    def test_reset_content_existing(self):
+        approval_counter = AddonApprovalsCounter.objects.create(
+            addon=self.addon,
+            counter=42,
+            last_content_review=self.days_ago(367),
+            last_human_review=self.days_ago(10),
+            content_review_status=AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PASS,
+        )
+        AddonApprovalsCounter.reset_content_for_addon(self.addon)
+        assert approval_counter.reload().counter == 42  # unchanged
+        self.assertCloseToNow(approval_counter.last_human_review, now=self.days_ago(10))
+        assert approval_counter.last_content_review is None
+        assert (
+            approval_counter.content_review_status
+            == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.CHANGED
+        )
+
+        # But only when the previous status was PASS should we update to CHANGED
+        # We don't want to, for example, override a FAIL, or REQUESTED because we'd
+        # lose that it was rejected. Or to set CHANGED when it wasn't reviewed before.
+        for previous_status in AddonApprovalsCounter.CONTENT_REVIEW_STATUSES:
+            if previous_status == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PASS:
+                continue
+            approval_counter.update(
+                content_review_status=previous_status,
+            )
+            AddonApprovalsCounter.reset_content_for_addon(self.addon)
+            assert approval_counter.reload().content_review_status == previous_status
+
+    def test_reset_content_existing_status_ignored(self):
+        approval_counter = AddonApprovalsCounter.objects.create(
+            addon=self.addon,
+            counter=42,
+            last_content_review=self.days_ago(367),
+            last_human_review=self.days_ago(10),
+            content_review_status=AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PASS,
+        )
+        # should be ignored
+        AddonApprovalsCounter.reset_content_for_addon(
+            self.addon,
+            not_reviewed_status=AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.REQUESTED,
+        )
+        assert approval_counter.reload().counter == 42  # unchanged
+        self.assertCloseToNow(approval_counter.last_human_review, now=self.days_ago(10))
+        assert approval_counter.last_content_review is None
+        assert (
+            approval_counter.content_review_status
+            == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.CHANGED
+        )
+
+    def test_reset_content_non_existing(self):
+        assert not AddonApprovalsCounter.objects.filter(addon=self.addon).exists()
+        AddonApprovalsCounter.reset_content_for_addon(self.addon)
+        approval_counter = AddonApprovalsCounter.objects.get(addon=self.addon)
+        assert approval_counter.counter == 0
+        assert approval_counter.last_human_review is None
+        assert (
+            approval_counter.content_review_status
+            == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.UNREVIEWED
+        )
+
+    def test_reset_content_non_existing_with_not_reviewed_status(self):
+        assert not AddonApprovalsCounter.objects.filter(addon=self.addon).exists()
+        AddonApprovalsCounter.reset_content_for_addon(
+            self.addon,
+            not_reviewed_status=AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PENDING,
+        )
+        approval_counter = AddonApprovalsCounter.objects.get(addon=self.addon)
+        assert approval_counter.counter == 0
+        assert approval_counter.last_human_review is None
+        assert (
+            approval_counter.content_review_status
+            == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PENDING
+        )
+
+    def test_reset_content_existing_but_unreviewed_with_not_reviewed_status(self):
+        approval_counter = AddonApprovalsCounter.objects.create(
+            addon=self.addon,
+            counter=42,
+            last_content_review=self.days_ago(367),
+            last_human_review=self.days_ago(10),
+            content_review_status=AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.UNREVIEWED,
+        )
+        AddonApprovalsCounter.reset_content_for_addon(
+            self.addon,
+            not_reviewed_status=AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PENDING,
+        )
+        approval_counter = AddonApprovalsCounter.objects.get(addon=self.addon)
+        assert approval_counter.reload().counter == 42  # unchanged
+        self.assertCloseToNow(approval_counter.last_human_review, now=self.days_ago(10))
+        assert (
+            approval_counter.content_review_status
+            == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.PENDING
+        )
+
+    def test_request_review(self):
+        AddonApprovalsCounter.request_new_content_review_for_addon(self.addon)
+        approval_counter = AddonApprovalsCounter.objects.get(addon=self.addon)
+        assert approval_counter.last_content_review is None
+        assert (
+            approval_counter.content_review_status
+            == AddonApprovalsCounter.CONTENT_REVIEW_STATUSES.REQUESTED
+        )
 
 
 class TestMigratedLWTModel(TestCase):
     def setUp(self):
-        self.lwt = addon_factory(type=amo.ADDON_PERSONA)
-        self.lwt.persona.persona_id = 999
-        self.lwt.persona.save()
         self.static_theme = addon_factory(type=amo.ADDON_STATICTHEME)
         MigratedLWT.objects.create(
-            lightweight_theme=self.lwt,
-            static_theme=self.static_theme)
+            lightweight_theme_id=666, getpersonas_id=999, static_theme=self.static_theme
+        )
 
     def test_addon_id_lookup(self):
-        match = MigratedLWT.objects.get(lightweight_theme=self.lwt)
-        assert match.static_theme == self.static_theme
-        match = MigratedLWT.objects.get(lightweight_theme_id=self.lwt.id)
+        match = MigratedLWT.objects.get(lightweight_theme_id=666)
         assert match.static_theme == self.static_theme
 
     def test_getpersonas_id_lookup(self):
         match = MigratedLWT.objects.get(getpersonas_id=999)
         assert match.static_theme == self.static_theme
+
+
+class TestAddonAndDeniedGuid(TestCase):
+    def setUp(self):
+        # This is needed for the `ActivityLog`.
+        core.set_user(UserProfile.objects.create(pk=999))
+
+    def get_last_activity_log(self):
+        return ActivityLog.objects.order_by('id').last()
+
+    def test_is_guid_denied(self):
+        addon = addon_factory()
+        assert not addon.is_guid_denied
+        DeniedGuid.objects.create(guid=addon.guid)
+        assert addon.is_guid_denied
+
+    def test_deny_resubmission(self):
+        addon = addon_factory()
+        assert not DeniedGuid.objects.filter(guid=addon.guid).exists()
+        addon.deny_resubmission()
+        assert DeniedGuid.objects.filter(guid=addon.guid).exists()
+        last_activity = self.get_last_activity_log()
+        assert last_activity.action == amo.LOG.DENIED_GUID_ADDED.id
+
+    def test_deny_already_denied_guid(self):
+        addon = addon_factory()
+        addon.deny_resubmission()
+        with pytest.raises(GuidAlreadyDeniedError) as exc_info:
+            addon.deny_resubmission()
+        # Exception raised is also a child of the more generic RuntimeError.
+        assert isinstance(exc_info.value, RuntimeError)
+
+    def test_deny_empty_guid(self):
+        addon = addon_factory(guid=None)
+        with pytest.raises(RuntimeError):
+            addon.deny_resubmission()
+
+    def test_allow_resubmission(self):
+        addon = addon_factory()
+        addon.deny_resubmission()
+        assert DeniedGuid.objects.filter(guid=addon.guid).exists()
+        addon.allow_resubmission()
+        assert not DeniedGuid.objects.filter(guid=addon.guid).exists()
+        last_activity = self.get_last_activity_log()
+        assert last_activity.action == amo.LOG.DENIED_GUID_DELETED.id
+
+    def test_allow_resubmission_with_non_denied_guid(self):
+        addon = addon_factory()
+        with pytest.raises(RuntimeError):
+            addon.allow_resubmission()
+
+
+class TestExtensionsQueues(TestCase):
+    def setUp(self):
+        user_factory(pk=settings.TASK_USER_ID)
+
+    def test_pending_queue(self):
+        expected_addons = [
+            addon_factory(
+                name='Listed with auto-approval disabled',
+                status=amo.STATUS_NOMINATED,
+                file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+                reviewer_flags={
+                    'auto_approval_disabled': True,
+                },
+                needshumanreview_kw={
+                    'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+                },
+            ),
+            addon_factory(
+                name='Pure unlisted with auto-approval disabled',
+                status=amo.STATUS_NULL,
+                file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+                version_kw={'channel': amo.CHANNEL_UNLISTED},
+                reviewer_flags={
+                    'auto_approval_disabled_unlisted': True,
+                },
+                needshumanreview_kw={
+                    'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+                },
+            ),
+            version_factory(
+                addon=addon_factory(
+                    name='Mixed with auto-approval disabled for unlisted',
+                    reviewer_flags={
+                        'auto_approval_disabled_unlisted': True,
+                    },
+                ),
+                file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+                needshumanreview_kw={
+                    'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+                },
+                channel=amo.CHANNEL_UNLISTED,
+            ).addon,
+            version_factory(
+                addon=version_factory(
+                    addon=(
+                        addon_mixed_with_both_awaiting_review := addon_factory(
+                            name='Mixed channels awaiting review',
+                            reviewer_flags={
+                                'auto_approval_disabled_unlisted': True,
+                                'auto_approval_disabled': True,
+                            },
+                        )
+                    ),
+                    file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+                    needshumanreview_kw={
+                        'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+                    },
+                    channel=amo.CHANNEL_UNLISTED,
+                    due_date=datetime.now() + timedelta(hours=24),
+                ).addon,
+                file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+                needshumanreview_kw={
+                    'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+                },
+                due_date=datetime.now() + timedelta(hours=48),
+            ).addon,
+            version_factory(
+                addon=addon_factory(
+                    name='Listed already public with auto-approval disabled',
+                    reviewer_flags={'auto_approval_disabled': True},
+                ),
+                file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+                needshumanreview_kw={
+                    'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+                },
+            ).addon,
+            version_factory(
+                addon=version_factory(
+                    addon=(
+                        addon_auto_approval_delayed_for_listed := addon_factory(
+                            name='Auto-approval delayed for listed, disabled for '
+                            'unlisted',
+                            reviewer_flags={
+                                'auto_approval_delayed_until': datetime.now()
+                                + timedelta(hours=24),
+                                'auto_approval_disabled_unlisted': True,
+                            },
+                        )
+                    ),
+                    file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+                    needshumanreview_kw={
+                        'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+                    },
+                    channel=amo.CHANNEL_UNLISTED,
+                    due_date=datetime.now() + timedelta(hours=24),
+                ).addon,
+                file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+                needshumanreview_kw={
+                    'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+                },
+                due_date=datetime.now() + timedelta(hours=48),
+            ).addon,
+            version_factory(
+                addon=version_factory(
+                    addon=(
+                        addon_auto_approval_delayed_for_unlisted := addon_factory(
+                            name='Auto-approval delayed for unlisted, disabled for '
+                            'listed',
+                            reviewer_flags={
+                                'auto_approval_delayed_until_unlisted': datetime.now()
+                                + timedelta(hours=24),
+                                'auto_approval_disabled': True,
+                            },
+                        )
+                    ),
+                    file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+                    needshumanreview_kw={
+                        'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+                    },
+                    due_date=datetime.now() + timedelta(hours=24),
+                    channel=amo.CHANNEL_UNLISTED,
+                ).addon,
+                file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+                needshumanreview_kw={
+                    'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+                },
+                due_date=datetime.now() + timedelta(hours=48),
+            ).addon,
+        ]
+        deleted_addon_human_review = addon_factory(
+            name='Deleted add-on - human review',
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW, 'is_signed': True},
+            needshumanreview_kw={
+                'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+            },
+        )
+        deleted_addon_human_review.delete()
+        expected_addons.append(deleted_addon_human_review)
+        deleted_unlisted_version_human_review = addon_factory(
+            name='Deleted unlisted version - human review',
+            version_kw={'channel': amo.CHANNEL_UNLISTED},
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW, 'is_signed': True},
+            reviewer_flags={'auto_approval_disabled_unlisted': True},
+            needshumanreview_kw={
+                'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+            },
+        )
+        deleted_unlisted_version_human_review.versions.all()[0].delete()
+        expected_addons.append(deleted_unlisted_version_human_review)
+        deleted_listed_version_human_review = addon_factory(
+            name='Deleted listed version - human review',
+            version_kw={'channel': amo.CHANNEL_LISTED},
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW, 'is_signed': True},
+            reviewer_flags={'auto_approval_disabled': True},
+            needshumanreview_kw={
+                'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+            },
+        )
+        deleted_listed_version_human_review.versions.all()[0].delete()
+        expected_addons.append(deleted_listed_version_human_review)
+        disabled_with_human_review = addon_factory(
+            name='Disabled by Mozilla',
+            status=amo.STATUS_DISABLED,
+            file_kw={'status': amo.STATUS_DISABLED, 'is_signed': True},
+            needshumanreview_kw={
+                'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+            },
+        )
+        expected_addons.append(disabled_with_human_review)
+
+        # Add add-ons that should not appear. For some it's because of
+        # something we're explicitly filtering out, for others it's because of
+        # something that causes the factories not to generate a due date for
+        # them.
+        addon_factory(name='Fully Public Add-on')
+        addon_factory(
+            name='Pure unlisted',
+            status=amo.STATUS_NULL,
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+            version_kw={'channel': amo.CHANNEL_UNLISTED},
+        )
+        addon_factory(
+            name='Add-on that will be auto-approved',
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+        )
+        version_factory(
+            addon=addon_factory(name='Add-on with version that will be auto-approved'),
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+        )
+        addon_factory(
+            name='Theme',
+            type=amo.ADDON_STATICTHEME,
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+            reviewer_flags={'auto_approval_disabled': True},
+            needshumanreview_kw={
+                'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+            },
+        )
+        addon_factory(
+            name='Disabled by Mozilla',
+            status=amo.STATUS_DISABLED,
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+            reviewer_flags={'auto_approval_disabled': True},
+            needshumanreview_kw={
+                'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED,
+                'is_active': False,  # mimics force_disable()
+            },
+        )
+        version_review_flags_factory(
+            version=addon_factory(
+                name='Pending rejection',
+                file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+            ).current_version,
+            pending_rejection=datetime.now(),
+        )
+        addon_factory(
+            name='Deleted add-on',
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+            reviewer_flags={'auto_approval_disabled': True},
+            needshumanreview_kw={
+                'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+            },
+        ).delete()
+        addon_factory(
+            name='Deleted unlisted version',
+            version_kw={'channel': amo.CHANNEL_UNLISTED},
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+            reviewer_flags={'auto_approval_disabled_unlisted': True},
+            needshumanreview_kw={
+                'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+            },
+        ).versions.all()[0].delete()
+        addon_factory(
+            name='Deleted listed version',
+            version_kw={'channel': amo.CHANNEL_LISTED},
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+            reviewer_flags={'auto_approval_disabled': True},
+            needshumanreview_kw={
+                'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+            },
+        ).versions.all()[0].delete()
+
+        addons = Addon.unfiltered.get_queryset_for_pending_queues()
+        assert list(addons.order_by('pk')) == expected_addons
+
+        # Test that we picked the version with the oldest due date and that we
+        # added the first_pending_version property.
+        for addon in addons:
+            expected_version = (
+                addon.versions(manager='unfiltered_for_relations')
+                .exclude(due_date=None)
+                .order_by('due_date')
+                .first()
+            )
+            assert expected_version
+            assert addon.first_pending_version == expected_version
+
+        # If we show only upcoming - short due dates - most of the addons won't be
+        # included because our standard review time (3) is longer than the cut off (2)
+        addons = Addon.unfiltered.get_queryset_for_pending_queues(
+            show_only_upcoming=True
+        )
+        assert set(addons) == {
+            addon_auto_approval_delayed_for_listed,
+            addon_auto_approval_delayed_for_unlisted,
+            addon_mixed_with_both_awaiting_review,
+        }
+
+        addons = Addon.unfiltered.get_queryset_for_pending_queues(
+            admin_reviewer=True, show_only_upcoming=True
+        )
+        due_dates_within_2_days = {
+            addon_auto_approval_delayed_for_listed,
+            addon_auto_approval_delayed_for_unlisted,
+            addon_mixed_with_both_awaiting_review,
+        }
+        assert set(addons) == due_dates_within_2_days
+        # the upcoming days config can be overriden
+        set_config(amo.config_keys.UPCOMING_DUE_DATE_CUT_OFF_DAYS, '10')
+        addons = Addon.unfiltered.get_queryset_for_pending_queues(
+            admin_reviewer=True, show_only_upcoming=True
+        )
+        assert set(addons) == set(expected_addons)
+        # an invalid config value will default back to 2 again
+        set_config(amo.config_keys.UPCOMING_DUE_DATE_CUT_OFF_DAYS, '10.')
+        addons = Addon.unfiltered.get_queryset_for_pending_queues(
+            admin_reviewer=True, show_only_upcoming=True
+        )
+        assert set(addons) == due_dates_within_2_days
+
+        # If we pass show_temporarily_delayed=False, versions in a channel that
+        # is temporarily delayed should not be considered. We already have a
+        # couple add-ons with versions delayed, but they should show up since
+        # they also have a version non-delayed in another channel. Let's add
+        # some that shouldn't show up.
+        version_factory(
+            addon=version_factory(
+                addon=addon_factory(
+                    name='Auto-approval delayed for unlisted and listed',
+                    reviewer_flags={
+                        'auto_approval_delayed_until_unlisted': datetime.now()
+                        + timedelta(hours=24),
+                        'auto_approval_delayed_until': datetime.now()
+                        + timedelta(hours=24),
+                    },
+                ),
+                file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+                needshumanreview_kw={
+                    'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+                },
+                channel=amo.CHANNEL_UNLISTED,
+            ).addon,
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+            needshumanreview_kw={
+                'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+            },
+        )
+        addon_factory(
+            name='Pure unlisted with auto-approval delayed',
+            reviewer_flags={
+                'auto_approval_delayed_until_unlisted': datetime.now()
+                + timedelta(hours=24),
+            },
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+            needshumanreview_kw={
+                'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+            },
+            version_kw={'channel': amo.CHANNEL_UNLISTED},
+        )
+        addons = Addon.unfiltered.get_queryset_for_pending_queues(
+            show_temporarily_delayed=False
+        )
+        assert set(addons) == set(expected_addons)
+
+    def _test_pending_queue_needs_human_review_from(self, reason, annotated_field):
+        nhr_abuse = addon_factory(file_kw={'is_signed': True})
+        NeedsHumanReview.objects.create(
+            version=nhr_abuse.versions.latest('pk'),
+            reason=reason,
+        )
+        nhr_other = addon_factory(file_kw={'is_signed': True})
+        NeedsHumanReview.objects.create(version=nhr_other.versions.latest('pk'))
+        nhr_abuse_inactive = addon_factory(file_kw={'is_signed': True})
+        NeedsHumanReview.objects.create(
+            version=nhr_abuse_inactive.versions.latest('pk'),
+            reason=reason,
+            is_active=False,
+        )
+        NeedsHumanReview.objects.create(
+            version=nhr_abuse_inactive.versions.latest('pk')
+        )
+        nhr_without_due_date = addon_factory(file_kw={'is_signed': True})
+        NeedsHumanReview.objects.create(
+            version=nhr_without_due_date.versions.latest('pk'),
+            reason=reason,
+        )
+        nhr_without_due_date.versions.latest('pk').update(due_date=None)
+        NeedsHumanReview.objects.create(
+            version=version_factory(
+                addon=nhr_without_due_date, file_kw={'is_signed': True}
+            )
+        )
+
+        addons = {
+            addon.id: addon
+            for addon in Addon.unfiltered.get_queryset_for_pending_queues()
+        }
+
+        assert set(addons.values()) == {
+            nhr_abuse,
+            nhr_other,
+            nhr_without_due_date,
+            nhr_abuse_inactive,
+        }
+        assert getattr(addons[nhr_abuse.id], annotated_field)
+        if annotated_field != 'needs_human_review_other':
+            assert not getattr(addons[nhr_other.id], annotated_field)
+            assert not getattr(addons[nhr_without_due_date.id], annotated_field)
+            assert not getattr(addons[nhr_abuse_inactive.id], annotated_field)
+        else:
+            assert getattr(addons[nhr_other.id], annotated_field)
+            assert getattr(addons[nhr_without_due_date.id], annotated_field)
+            assert getattr(addons[nhr_abuse_inactive.id], annotated_field)
+
+    def test_pending_queue_needs_human_review_from_abuse(self):
+        self._test_pending_queue_needs_human_review_from(
+            NeedsHumanReview.REASONS.ABUSE_ADDON_VIOLATION,
+            'needs_human_review_abuse_addon_violation',
+        )
+
+    def test_pending_queue_needs_human_review_from_appeal(self):
+        self._test_pending_queue_needs_human_review_from(
+            NeedsHumanReview.REASONS.ADDON_REVIEW_APPEAL,
+            'needs_human_review_addon_review_appeal',
+        )
+
+    def test_pending_queue_needs_human_review_from_cinder_forwarded_abuse(self):
+        self._test_pending_queue_needs_human_review_from(
+            NeedsHumanReview.REASONS.CINDER_ESCALATION,
+            'needs_human_review_cinder_escalation',
+        )
+
+    def test_pending_queue_needs_human_review_from_cinder_forwarded_appeal(self):
+        self._test_pending_queue_needs_human_review_from(
+            NeedsHumanReview.REASONS.CINDER_APPEAL_ESCALATION,
+            'needs_human_review_cinder_appeal_escalation',
+        )
+
+    def test_pending_queue_needs_human_review_from_2nd_level_approval(self):
+        self._test_pending_queue_needs_human_review_from(
+            NeedsHumanReview.REASONS.SECOND_LEVEL_REQUEUE,
+            'needs_human_review_second_level_requeue',
+        )
+
+    def test_pending_queue_needs_human_scanner_action(self):
+        self._test_pending_queue_needs_human_review_from(
+            NeedsHumanReview.REASONS.SCANNER_ACTION, 'needs_human_review_scanner_action'
+        )
+
+    def test_get_queryset_for_pending_queues_for_specific_due_date_reasons(self):
+        expected_addons = [
+            version_factory(
+                addon=addon_factory(
+                    version_kw={
+                        'needshumanreview_kw': {
+                            'reason': NeedsHumanReview.REASONS.ABUSE_ADDON_VIOLATION
+                        },
+                        'due_date': self.days_ago(48),
+                        'version': '0.1',
+                    }
+                ),
+                needshumanreview_kw={
+                    'reason': NeedsHumanReview.REASONS.AUTO_APPROVAL_DISABLED
+                },
+                due_date=self.days_ago(15),
+                version='0.2',
+            ).addon,
+            addon_factory(
+                version_kw={
+                    'needshumanreview_kw': {
+                        'reason': NeedsHumanReview.REASONS.SCANNER_ACTION
+                    },
+                    'due_date': self.days_ago(16),
+                    'version': '666.0',
+                }
+            ),
+        ]
+        addon_factory(
+            version_kw={
+                'needshumanreview_kw': {
+                    'reason': NeedsHumanReview.REASONS.DEVELOPER_REPLY
+                },
+                'due_date': self.days_ago(234),
+            }
+        )  # Should not show up
+        addon_factory(
+            version_kw={
+                'needshumanreview_kw': {
+                    'reason': NeedsHumanReview.REASONS.DEVELOPER_REPLY
+                },
+                'due_date': self.days_ago(342),
+            }
+        ).current_version.needshumanreview_set.create(
+            reason=NeedsHumanReview.REASONS.SCANNER_ACTION, is_active=False
+        )  # Should not show up either (SCANNER_ACTION NHR is inactive)
+
+        addons = Addon.objects.get_queryset_for_pending_queues(
+            due_date_reasons_choices=NeedsHumanReview.REASONS.extract_subset(
+                'AUTO_APPROVAL_DISABLED', 'SCANNER_ACTION'
+            )
+        )
+        assert list(addons) == expected_addons
+        expected_version = expected_addons[0].versions.get(version='0.2')
+        assert addons[0].first_version_id == expected_version.pk
+        assert addons[0].first_pending_version == expected_version
+        assert addons[0].first_version_due_date == expected_version.due_date
+
+    def test_get_pending_rejection_queue(self):
+        expected_addons = [
+            version_review_flags_factory(
+                version=version_factory(
+                    addon=version_review_flags_factory(
+                        version=version_factory(addon=addon_factory()),
+                        pending_rejection=datetime.now() + timedelta(hours=24),
+                    ).version.addon,
+                ),
+                pending_rejection=datetime.now() + timedelta(hours=48),
+            ).version.addon,
+        ]
+        addon_factory()
+        addons = Addon.objects.get_pending_rejection_queue()
+        assert set(addons) == set(expected_addons)
+        # Test that we picked the version with the oldest due date and that we
+        # added the first_pending_version property.
+        for addon in addons:
+            expected_version = (
+                addon.versions(manager='unfiltered_for_relations')
+                .filter(reviewerflags__pending_rejection__isnull=False)
+                .order_by('reviewerflags__pending_rejection')
+                .first()
+            )
+            assert expected_version
+            assert addon.first_pending_version == expected_version
+
+
+class TestThemesPendingManualApprovalQueue(TestCase):
+    def setUp(self):
+        user_factory(pk=settings.TASK_USER_ID)
+
+    def test_basic(self):
+        expected = [
+            addon_factory(
+                type=amo.ADDON_STATICTHEME,
+                status=amo.STATUS_NOMINATED,
+                file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+            )
+        ]
+        addon_factory(
+            status=amo.STATUS_NOMINATED,
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+        )
+        qs = Addon.objects.get_queryset_for_pending_queues(theme_review=True).order_by(
+            'pk'
+        )
+        assert list(qs) == expected
+
+    def test_approved_theme_pending_version(self):
+        expected = [
+            addon_factory(
+                type=amo.ADDON_STATICTHEME,
+                file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+            )
+        ]
+        disabled_with_human_review = addon_factory(
+            name='Disabled by Mozilla',
+            status=amo.STATUS_DISABLED,
+            type=amo.ADDON_STATICTHEME,
+            file_kw={'status': amo.STATUS_DISABLED, 'is_signed': True},
+        )
+        NeedsHumanReview.objects.create(
+            version=disabled_with_human_review.versions.latest('pk')
+        )
+        expected.append(disabled_with_human_review)
+        rejected_version_with_human_review = addon_factory(
+            name='rejected version',
+            status=amo.STATUS_NULL,
+            type=amo.ADDON_STATICTHEME,
+            file_kw={'status': amo.STATUS_DISABLED, 'is_signed': True},
+        )
+        NeedsHumanReview.objects.create(
+            version=rejected_version_with_human_review.versions.latest('pk')
+        )
+        expected.append(rejected_version_with_human_review)
+
+        addon_factory(
+            type=amo.ADDON_STATICTHEME,
+            status=amo.STATUS_NOMINATED,
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+        )
+        addon_factory(type=amo.ADDON_STATICTHEME)
+        addon_factory(
+            status=amo.STATUS_NOMINATED,
+            file_kw={'status': amo.STATUS_AWAITING_REVIEW},
+        )
+        qs = (
+            Addon.objects.get_queryset_for_pending_queues(theme_review=True)
+            .exclude(status=amo.STATUS_NOMINATED)
+            .order_by('pk')
+        )
+        assert list(qs) == expected
+
+
+class TestAddonGUID(TestCase):
+    def test_creates_hashed_guid_on_save(self):
+        guid = '@exquisite-sandwich-1'
+        expected_hashed_guid = (
+            '983e300fe553f61e87adbf2f55be537fe79b0a0da324847ca2712274e2f352d9'
+        )
+
+        # This will create the AddonGUID instance.
+        addon = addon_factory(guid=guid)
+
+        addon_guid = AddonGUID.objects.get(addon=addon)
+        assert addon_guid.hashed_guid == expected_hashed_guid
+
+
+class TestAddonRegionalRestrictions(TestCase):
+    def test_clean(self):
+        arr = AddonRegionalRestrictions.objects.create(addon=addon_factory())
+        arr.excluded_regions = ['fr']
+        arr.clean()
+        assert arr.excluded_regions == ['FR']
+        arr.excluded_regions = ['FR', 'BR', 'cn']
+        arr.clean()
+        assert arr.excluded_regions == ['FR', 'BR', 'CN']
+
+
+class TestAddonListingInfo(TestCase):
+    def test_is_listing_noindexed_without_info(self):
+        addon = addon_factory()
+        # This shouldn't raise any exception.
+        assert not addon.is_listing_noindexed
+
+    def test_is_listing_noindexed(self):
+        addon = addon_factory()
+        # No noindex date set.
+        info = AddonListingInfo.objects.create(addon=addon)
+        assert not addon.is_listing_noindexed
+        # Noindex date set in the past means the listing should not longer be
+        # noindexed.
+        info.update(noindex_until=datetime.now() - timedelta(days=1))
+        assert not addon.is_listing_noindexed
+        # Noindex date set after the current date.
+        info.update(noindex_until=datetime.now() + timedelta(days=1))
+        assert addon.is_listing_noindexed
+
+    def test_maybe_mark_as_noindexed_skipped_for_oldish_addons(self):
+        addon = addon_factory(created=self.days_ago(91))
+        AddonListingInfo.maybe_mark_as_noindexed(addon)
+        assert AddonListingInfo.objects.count() == 0
+        assert not addon.is_listing_noindexed
+
+    def test_maybe_mark_as_noindexed_creates_a_record(self):
+        addon = addon_factory(created=self.days_ago(1))
+        AddonListingInfo.maybe_mark_as_noindexed(addon)
+        assert AddonListingInfo.objects.count() == 1
+        assert addon.is_listing_noindexed
+
+    def test_maybe_mark_as_noindexed_updates_existing_record(self):
+        addon = addon_factory(created=self.days_ago(1))
+
+        AddonListingInfo.maybe_mark_as_noindexed(addon)
+        assert AddonListingInfo.objects.count() == 1
+        first_date = AddonListingInfo.objects.first().noindex_until
+        assert addon.is_listing_noindexed
+
+        AddonListingInfo.maybe_mark_as_noindexed(addon)
+        assert AddonListingInfo.objects.count() == 1
+        second_date = AddonListingInfo.objects.first().noindex_until
+        assert addon.is_listing_noindexed
+
+        # The existing record should have been updated with a newer date.
+        assert second_date > first_date

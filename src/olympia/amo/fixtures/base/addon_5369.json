@@ -1,5 +1,4 @@
-[
-    {
+[{
         "pk": 93222,
         "model": "translations.translation",
         "fields": {
@@ -18,8 +17,6 @@
             "eula": null,
             "_current_version": 98198,
             "last_updated": "2010-03-03 16:15:03",
-            "view_source": false,
-            "total_downloads": 1861589,
             "disabled_by_user": false,
             "guid": "yslow@yahoo-inc.com",
             "weekly_downloads": 12628,
@@ -27,7 +24,6 @@
             "average_daily_users": 181569,
             "bayesian_rating": 3.5951499999999998,
             "support_email": null,
-            "public_stats": false,
             "status": 4,
             "privacy_policy": null,
             "default_locale": "en-US",
@@ -68,10 +64,10 @@
             "hash": "sha256:7234276dc6778efce3bf171f41bf942f0764ff7dfdf98048b1c311949e1c535c",
             "created": "2010-03-02 15:02:44",
             "modified": "2010-03-03 16:15:03",
-            "filename": "yslow-2.0.7-fx.xpi",
-            "platform": 1,
+            "file": "69/5369/5369/yslow-2.0.7.xpi",
             "version": 98198,
             "size": 220160,
+            "manifest_version": 2,
             "datestatuschanged": "2010-03-03 16:15:03"
         }
     },
@@ -137,16 +133,6 @@
             "version": 98198,
             "min": 233,
             "max": 291
-        }
-    },
-    {
-        "pk": 1211,
-        "model": "addons.appsupport",
-        "fields": {
-            "app": 1,
-            "addon": 5369,
-            "modified": "2010-10-04 13:05:21",
-            "created": "2010-10-04 13:05:21"
         }
     }
 ]

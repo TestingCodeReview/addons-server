@@ -1,13 +1,28 @@
+import json
 from collections import defaultdict
 from datetime import datetime
 
-from elasticsearch_dsl.response.hit import Hit
-from rest_framework.serializers import ModelSerializer
+from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 
-from .fields import ESTranslationSerializerField, TranslationSerializerField
+from elasticsearch.dsl.response.hit import Hit
+from rest_framework import serializers
+
+from olympia import amo
+from olympia.activity.models import ActivityLog
+from olympia.amo.utils import BaseModelSerializerAndFormMixin
+from olympia.translations.utils import (
+    fetch_translations_from_instance,
+    get_translation_differences,
+)
+from olympia.zadmin.models import Config
 
 
-class BaseESSerializer(ModelSerializer):
+class AMOModelSerializer(BaseModelSerializerAndFormMixin, serializers.ModelSerializer):
+    pass
+
+
+class BaseESSerializer(AMOModelSerializer):
     """
     A base deserializer that handles ElasticSearch data for a specific model.
 
@@ -16,26 +31,22 @@ class BaseESSerializer(ModelSerializer):
     the parent model serializer (e.g., AddonSerializer).
 
     """
+
     # In base classes add the field names we want converted to Python
     # datetime from the Elasticsearch datetime strings.
     datetime_fields = ()
 
-    def __init__(self, *args, **kwargs):
-        super(BaseESSerializer, self).__init__(*args, **kwargs)
-
-        # Set all fields as read_only just in case.
-        for field_name in self.fields:
-            self.fields[field_name].read_only = True
-
     def get_fields(self):
         """
-        Return all fields as normal, with one exception: replace every instance
-        of TranslationSerializerField with ESTranslationSerializerField.
+        Return all fields as normal, except if the class defines a `get_es_instance`
+        function - if it does then replace with the instance returned.
         """
-        fields = super(BaseESSerializer, self).get_fields()
+        fields = super().get_fields()
         for key, field in fields.items():
-            if isinstance(field, TranslationSerializerField):
-                fields[key] = ESTranslationSerializerField(source=field.source)
+            if hasattr(field, 'get_es_instance'):
+                fields[key] = field.get_es_instance()
+            # Set all fields as read_only just in case.
+            fields[key].read_only = True
         return fields
 
     def to_representation(self, data):
@@ -48,7 +59,7 @@ class BaseESSerializer(ModelSerializer):
 
         obj = self.fake_object(data)
         obj._es_meta = es_meta
-        result = super(BaseESSerializer, self).to_representation(obj)
+        result = super().to_representation(obj)
         return result
 
     def fake_object(self, data):
@@ -65,8 +76,7 @@ class BaseESSerializer(ModelSerializer):
         # Don't be picky about microseconds here. We get them some time
         # so we have to support them. So let's strip microseconds and handle
         # the datetime in a unified way.
-        value = value.partition('.')[0]
-        return datetime.strptime(value, u'%Y-%m-%dT%H:%M:%S')
+        return datetime.fromisoformat(value.partition('.')[0])
 
     def _attach_fields(self, obj, data, field_names):
         """Attach fields to fake instance."""
@@ -81,6 +91,83 @@ class BaseESSerializer(ModelSerializer):
         """Deserialize ES translation fields."""
         for field_name in field_names:
             if field_name in self.fields:
-                self.fields[field_name].attach_translations(
-                    obj, data, field_name)
+                self.fields[field_name].attach_translations(obj, data, field_name)
         return obj
+
+
+class SiteStatusSerializer(serializers.BaseSerializer):
+    def to_representation(self, obj):
+        notices = {
+            'notice': amo.config_keys.SITE_NOTICE,
+            'submit_notification_warning': amo.config_keys.SUBMIT_NOTIFICATION_WARNING,
+        }
+        configs = dict(
+            Config.objects.filter(
+                key__in=[config_key.key for config_key in notices.values()]
+            ).values_list('key', 'value')
+        )
+        return {
+            'read_only': settings.READ_ONLY,
+            **{
+                field: configs.get(config_key.key, config_key.default)
+                for field, config_key in notices.items()
+            },
+        }
+
+
+class PropertyUpdatedMixin:
+    ACTIVITY_LOG_ACTION = None  # defined by subclasses
+
+    def update(self, instance, validated_data):
+        if not self.ACTIVITY_LOG_ACTION:
+            raise ImproperlyConfigured(
+                'Subclasses of PropertyUpdatedMixin must define activity_log_action.'
+            )
+
+        user = self.context['request'].user
+        translated_fields = [
+            field
+            for field in self.Meta.fields
+            if self.fields.get(field).__class__.__name__ == 'TranslationSerializerField'
+        ]
+        old_values = {
+            field: str(getattr(instance, field) or '')
+            for field in self.Meta.fields
+            if field in validated_data
+            and not self.fields[field].write_only
+            and field not in translated_fields
+        }
+        old_values.update(fetch_translations_from_instance(instance, translated_fields))
+
+        instance = super().update(instance, validated_data)
+
+        new_values = {
+            field: str(getattr(instance, field) or '')
+            for field in old_values
+            if field not in translated_fields
+        }
+        new_values.update(fetch_translations_from_instance(instance, translated_fields))
+
+        for field, old_value in old_values.items():
+            if field in translated_fields:
+                differences = get_translation_differences(
+                    {field: old_value},
+                    {field: new_values[field]},
+                )
+                if differences:
+                    differences = differences[field]
+            elif old_value != new_values[field]:
+                differences = {'removed': old_value, 'added': new_values[field]}
+            else:
+                differences = None
+
+            if differences:
+                ActivityLog.objects.create(
+                    self.ACTIVITY_LOG_ACTION,
+                    instance,
+                    field,
+                    json.dumps(differences),
+                    user=user,
+                )
+
+        return instance

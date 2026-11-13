@@ -1,401 +1,334 @@
 import hashlib
 import json
 import os
-import posixpath
 import re
-import time
-import unicodedata
 import uuid
-import zipfile
+from urllib.parse import urljoin
 
+from django.conf import settings
+from django.core.files import File as DjangoFile
 from django.core.files.storage import default_storage as storage
 from django.db import models
 from django.dispatch import receiver
-from django.template.defaultfilters import slugify
-from django.utils.encoding import (
-    force_bytes, force_text, python_2_unicode_compatible)
+from django.urls import reverse
+from django.utils import timezone
+from django.utils.crypto import get_random_string
+from django.utils.encoding import force_str
 from django.utils.functional import cached_property
+from django.utils.text import slugify
+from django.utils.translation import gettext
 
-import six
-
-from django_extensions.db.fields.json import JSONField
 from django_statsd.clients import statsd
 
 import olympia.core.logger
-
-from olympia import amo
+from olympia import amo, core
 from olympia.amo.decorators import use_primary_db
+from olympia.amo.enum import EnumChoices
 from olympia.amo.fields import PositiveAutoField
 from olympia.amo.models import ManagerBase, ModelBase, OnChangeMixin
-from olympia.amo.storage_utils import copy_stored_file, move_stored_file
-from olympia.amo.templatetags.jinja_helpers import (
-    absolutify, urlparams, user_media_path, user_media_url)
-from olympia.amo.urlresolvers import reverse
-from olympia.applications.models import AppVersion
-from olympia.files.utils import SafeZip, get_sha256, write_crx_as_xpi
-from olympia.lib.cache import memoize
+from olympia.amo.utils import SafeStorage, id_to_path
+from olympia.files.utils import (
+    InvalidOrUnsupportedCrx,
+    ManifestJSONExtractor,
+    SafeZip,
+    get_sha256,
+    write_crx_as_xpi,
+)
 
 
 log = olympia.core.logger.getLogger('z.files')
 
 
-@python_2_unicode_compatible
+def files_upload_to_callback(instance, filename):
+    """upload_to callback for File instances.
+
+    When <File instance>.save() is called, that triggers a call to this
+    function if the underlying <File instance>.file had not yet been
+    "committed" to the filesystem - typically when we're assigned it but not
+    called saved yet.
+
+    For new uploads, the returned path is:
+    {directories}/{addon_slug}-{version}.{extension}, where {directories} is
+    {addon_id last 2 digits}/{addon_id last 4 digits}/{addon_id}. We drop all
+    non-ascii chars from the slug, and if the result is empty, fall back on the
+    addon id.
+
+    By convention, newly signed files after 2022-03-31 get a .xpi extension,
+    unsigned get .zip. This helps ensure CDN cache is busted when we sign
+    something.
+
+    Note that per Django requirements this gets passed the object instance and
+    a filename, but the filename is completely ignored here (it's meant to
+    represent the user-provided filename in user uploads).
+    """
+    # Start with the add-on slug, but make it go through django's slugify() to
+    # drop unicode characters.
+    name = (
+        instance.addon.slug and slugify(instance.addon.slug).replace('-', '_')
+    ) or str(instance.addon.pk)
+    parts = (name, instance.version.version)
+    file_extension = '.xpi' if instance.is_signed else '.zip'
+    return os.path.join(
+        id_to_path(instance.addon.pk, breadth=2), '-'.join(parts) + file_extension
+    )
+
+
+def files_storage():
+    return SafeStorage(root_setting='ADDONS_PATH')
+
+
+class FileManager(ManagerBase):
+    def disabled_that_would_be_renabled_with_addon(self):
+        return self.filter(
+            status=amo.STATUS_DISABLED,
+            status_disabled_reason=File.STATUS_DISABLED_REASONS.ADDON_DISABLE,
+        ).exclude(original_status=amo.STATUS_NULL)
+
+
 class File(OnChangeMixin, ModelBase):
     id = PositiveAutoField(primary_key=True)
     STATUS_CHOICES = amo.STATUS_CHOICES_FILE
 
-    version = models.ForeignKey(
-        'versions.Version', related_name='files',
-        on_delete=models.CASCADE)
-    platform = models.PositiveIntegerField(
-        choices=amo.SUPPORTED_PLATFORMS_CHOICES,
-        default=amo.PLATFORM_ALL.id,
-        db_column="platform_id"
+    class STATUS_DISABLED_REASONS(EnumChoices):
+        NONE = 0, 'None'
+        DEVELOPER = 1, 'Developer disabled'
+        ADDON_DISABLE = 2, 'Add-on disabled'
+        ADDON_DELETE = 3, 'Add-on deleted'
+        VERSION_DELETE = 4, 'Version deleted'
+
+    SUPPORTED_MANIFEST_VERSIONS = ((2, 'Manifest V2'), (3, 'Manifest V3'))
+
+    version = models.OneToOneField('versions.Version', on_delete=models.CASCADE)
+    file = models.FileField(
+        max_length=255,
+        default='',
+        db_column='filename',
+        storage=files_storage,
+        upload_to=files_upload_to_callback,
     )
-    filename = models.CharField(max_length=255, default='')
     size = models.PositiveIntegerField(default=0)  # In bytes.
     hash = models.CharField(max_length=255, default='')
     # The original hash of the file, before we sign it, or repackage it in
     # any other way.
     original_hash = models.CharField(max_length=255, default='')
-    jetpack_version = models.CharField(max_length=10, null=True, blank=True)
     status = models.PositiveSmallIntegerField(
-        choices=STATUS_CHOICES.items(), default=amo.STATUS_AWAITING_REVIEW)
-    datestatuschanged = models.DateTimeField(null=True, auto_now_add=True)
-    is_restart_required = models.BooleanField(default=False)
+        choices=STATUS_CHOICES.items(), default=amo.STATUS_AWAITING_REVIEW
+    )
+    datestatuschanged = models.DateTimeField(null=True, default=timezone.now)
     strict_compatibility = models.BooleanField(default=False)
-    # The XPI contains JS that calls require("chrome").
-    requires_chrome = models.BooleanField(default=False)
-    reviewed = models.DateTimeField(null=True, blank=True)
-    # The `binary` field is used to store the flags from amo-validator when it
-    # finds files with binary extensions or files that may contain binary
-    # content.
-    binary = models.BooleanField(default=False)
-    # The `binary_components` field is used to store the flag from
-    # amo-validator when it finds "binary-components" in the chrome manifest
-    # file, used for default to compatible.
-    binary_components = models.BooleanField(default=False, db_index=True)
+    approval_date = models.DateTimeField(null=True)
     # Serial number of the certificate use for the signature.
     cert_serial_num = models.TextField(blank=True)
     # Is the file signed by Mozilla?
     is_signed = models.BooleanField(default=False)
-    # Is the file a multi-package?
-    #     https://developer.mozilla.org/en-US/docs/Multiple_Item_Packaging
-    is_multi_package = models.BooleanField(default=False)
     # Is the file an experiment (see bug 1220097)?
     is_experiment = models.BooleanField(default=False)
-    # Is the file a WebExtension?
-    is_webextension = models.BooleanField(default=False)
     # Is the file a special "Mozilla Signed Extension"
     # see https://wiki.mozilla.org/Add-ons/InternalSigning
     is_mozilla_signed_extension = models.BooleanField(default=False)
-    # The user has disabled this file and this was its status.
-    # STATUS_NULL means the user didn't disable the File - i.e. Mozilla did.
-    original_status = models.PositiveSmallIntegerField(
-        default=amo.STATUS_NULL)
+    # The file status has been changed to DISABLED - this was its status before.
+    # STATUS_NULL means the status hasn't been changed
+    original_status = models.PositiveSmallIntegerField(default=amo.STATUS_NULL)
+    status_disabled_reason = models.PositiveSmallIntegerField(
+        choices=STATUS_DISABLED_REASONS.choices, default=STATUS_DISABLED_REASONS.NONE
+    )
+    # The manifest_version defined in manifest.json
+    manifest_version = models.SmallIntegerField(choices=SUPPORTED_MANIFEST_VERSIONS)
+
+    objects = FileManager()
 
     class Meta(ModelBase.Meta):
         db_table = 'files'
+        indexes = [
+            models.Index(fields=('created', 'version'), name='created_idx'),
+            models.Index(
+                fields=('datestatuschanged', 'version'), name='statuschanged_idx'
+            ),
+            models.Index(fields=('status',), name='status'),
+        ]
 
     def __str__(self):
-        return six.text_type(self.id)
-
-    def get_platform_display(self):
-        return force_text(amo.PLATFORMS[self.platform].name)
+        return str(self.id)
 
     @property
     def has_been_validated(self):
-        try:
-            self.validation
-        except FileValidation.DoesNotExist:
-            return False
-        else:
-            return True
+        return hasattr(self, 'validation')
 
-    @property
-    def automated_signing(self):
-        """True if this file is eligible for automated signing. This currently
-        means that either its version is unlisted."""
-        return self.version.channel == amo.RELEASE_CHANNEL_UNLISTED
-
-    def get_file_cdn_url(self, attachment=False):
-        """Return the URL for the file corresponding to this instance
-        on the CDN."""
+    def get_url_path(self, attachment=False):
+        # We allow requests to not specify a filename, but it's mandatory that
+        # we include it in our responses, because Fenix intercepts the
+        # downloads using a regex and expects the filename to be part of the
+        # URL - it even wants the filename to end with `.xpi` - though it
+        # doesn't care about what's after the path, so any query string is ok.
+        # See https://github.com/mozilla-mobile/fenix/blob/
+        # 07d43971c0767fc023996dc32eb73e3e37c6517a/app/src/main/java/org/mozilla/fenix/
+        # AppRequestInterceptor.kt#L173
+        kwargs = {'file_id': self.pk, 'filename': self.pretty_filename}
         if attachment:
-            host = posixpath.join(user_media_url('addons'), '_attachments')
-        else:
-            host = user_media_url('addons')
-
-        return posixpath.join(
-            *map(force_bytes, [host, self.version.addon.id, self.filename]))
-
-    def get_url_path(self, src, attachment=False):
-        return self._make_download_url(
-            'downloads.file', src, attachment=attachment)
-
-    def _make_download_url(self, view_name, src, attachment=False):
-        kwargs = {
-            'file_id': self.pk
-        }
-        if attachment:
-            kwargs['type'] = 'attachment'
-        url = os.path.join(reverse(view_name, kwargs=kwargs), self.filename)
-        return absolutify(urlparams(url, src=src))
+            kwargs['download_type'] = 'attachment'
+        return reverse('downloads.file', kwargs=kwargs)
 
     @classmethod
-    def from_upload(cls, upload, version, platform, parsed_data=None):
+    def from_upload(cls, upload, version, parsed_data=None):
         """
-        Create a File instance from a FileUpload, a Version, a platform id
-        and the parsed_data generated by parse_addon().
+        Create a File instance from a FileUpload, a Version and the parsed_data
+        generated by parse_addon().
 
         Note that it's the caller's responsability to ensure the file is valid.
         We can't check for that here because an admin may have overridden the
         validation results."""
         assert parsed_data is not None
 
-        file_ = cls(version=version, platform=platform)
-        upload.path = force_bytes(nfd_str(upload.path))
-        ext = force_text(os.path.splitext(upload.path)[1])
-        if ext == '.jar':
-            ext = '.xpi'
-        file_.filename = file_.generate_filename(extension=ext or '.xpi')
+        file_ = cls(version=version)
+        upload_path = force_str(upload.file_path)
         # Size in bytes.
-        file_.size = storage.size(upload.path)
-        file_.is_restart_required = parsed_data.get(
-            'is_restart_required', False)
-        file_.strict_compatibility = parsed_data.get(
-            'strict_compatibility', False)
-        file_.is_multi_package = parsed_data.get('is_multi_package', False)
+        file_.size = storage.size(upload_path)
+        file_.strict_compatibility = parsed_data.get('strict_compatibility', False)
         file_.is_experiment = parsed_data.get('is_experiment', False)
-        file_.is_webextension = parsed_data.get('is_webextension', False)
         file_.is_mozilla_signed_extension = parsed_data.get(
-            'is_mozilla_signed_extension', False)
-
-        file_.hash = file_.generate_hash(upload.path)
+            'is_mozilla_signed_extension', False
+        )
+        file_.is_signed = file_.is_mozilla_signed_extension
+        file_.hash = upload.hash
         file_.original_hash = file_.hash
+        file_.manifest_version = parsed_data.get('manifest_version')
+
+        # FileUpload.path is not a FileField, so we have to open() the path to
+        # make a DjangoFile in order to assign it to file_.file.
+        with open(upload_path, 'rb') as src:
+            file_.file = DjangoFile(src)
+            file_.save()  # This also saves the file to the filesystem.
+
+        log.info(f'New file: {file_!r} from {upload!r}')
+
+        FileManifest.objects.create(file=file_)
+
+        permissions = list(parsed_data.get('permissions', []))
+        if file_.manifest_version > 2:
+            permissions = [
+                perm
+                for perm in permissions
+                # This is the same regex that addons-frontend uses.
+                # See /src/amo/components/PermissionsCard/permissions.js#L93
+                if re.match(r'^(\w+)(?:\.(\w+)(?:\.\w+)*)?$', perm)
+            ]
+        optional_permissions = list(parsed_data.get('optional_permissions', []))
+        host_permissions = (
+            list(parsed_data.get('host_permissions', []))
+            if file_.manifest_version > 2
+            else []
+        )
+        data_collection_permissions = parsed_data.get('data_collection_permissions', [])
+        optional_data_collection_permissions = parsed_data.get(
+            'optional_data_collection_permissions', []
+        )
+
+        # devtools_page isn't in permissions block but treated as one
+        # if a custom devtools page is added by an addon
+        if 'devtools_page' in parsed_data:
+            permissions.append('devtools')
+
+        # Add content_scripts host matches too.
+        for script in parsed_data.get('content_scripts', []):
+            permissions.extend(script.get('matches', []))
+        if any(
+            [
+                permissions,
+                optional_permissions,
+                host_permissions,
+                data_collection_permissions,
+                optional_data_collection_permissions,
+            ]
+        ):
+            WebextPermission.objects.create(
+                permissions=permissions,
+                optional_permissions=optional_permissions,
+                host_permissions=host_permissions,
+                data_collection_permissions=data_collection_permissions,
+                optional_data_collection_permissions=optional_data_collection_permissions,
+                file=file_,
+            )
 
         if upload.validation:
             validation = json.loads(upload.validation)
-            if validation['metadata'].get('requires_chrome'):
-                file_.requires_chrome = True
-
-        file_.save()
-        if file_.is_webextension:
-            permissions = list(parsed_data.get('permissions', []))
-            # Add content_scripts host matches too.
-            for script in parsed_data.get('content_scripts', []):
-                permissions.extend(script.get('matches', []))
-            if permissions:
-                WebextPermission.objects.create(permissions=permissions,
-                                                file=file_)
-
-        log.debug('New file: %r from %r' % (file_, upload))
-
-        # Move the uploaded file from the temp location.
-        copy_stored_file(upload.path, file_.current_file_path)
-
-        if upload.validation:
             FileValidation.from_json(file_, validation)
 
         return file_
 
-    def generate_hash(self, filename=None):
-        """Generate a hash for a file."""
-        with open(filename or self.current_file_path, 'rb') as fobj:
-            return 'sha256:{}'.format(get_sha256(fobj))
-
-    def generate_filename(self, extension=None):
-        """
-        Files are in the format of:
-        {addon_name}-{version}-{apps}-{platform}
-        """
-        parts = []
-        addon = self.version.addon
-        # slugify drops unicode so we may end up with an empty string.
-        # Apache did not like serving unicode filenames (bug 626587).
-        extension = extension or '.xpi'
-        name = slugify(addon.name).replace('-', '_') or 'addon'
-        parts.append(name)
-        parts.append(self.version.version)
-
-        if addon.type not in amo.NO_COMPAT and self.version.compatible_apps:
-            apps = '+'.join(sorted([a.shortername for a in
-                                    self.version.compatible_apps]))
-            parts.append(apps)
-
-        if self.platform and self.platform != amo.PLATFORM_ALL.id:
-            parts.append(amo.PLATFORMS[self.platform].shortname)
-
-        self.filename = '-'.join(parts) + extension
-        return self.filename
-
-    _pretty_filename = re.compile(r'(?P<slug>[a-z0-7_]+)(?P<suffix>.*)')
-
-    def pretty_filename(self, maxlen=20):
-        """Displayable filename.
-
-        Truncates filename so that the slug part fits maxlen.
-        """
-        m = self._pretty_filename.match(self.filename)
-        if not m:
-            return self.filename
-        if len(m.group('slug')) < maxlen:
-            return self.filename
-        return u'%s...%s' % (m.group('slug')[0:(maxlen - 3)],
-                             m.group('suffix'))
-
-    def latest_xpi_url(self, attachment=False):
-        addon = self.version.addon
-        kw = {'addon_id': addon.slug}
-        if self.platform != amo.PLATFORM_ALL.id:
-            kw['platform'] = self.platform
-        if attachment:
-            kw['type'] = 'attachment'
-        return os.path.join(reverse('downloads.latest', kwargs=kw),
-                            'addon-%s-latest%s' % (addon.pk, self.extension))
-
-    def eula_url(self):
-        return reverse('addons.eula', args=[self.version.addon_id, self.id])
+    def generate_hash(self):
+        """Generate a hash for the File"""
+        return f'sha256:{get_sha256(self.file)}'
 
     @property
-    def file_path(self):
-        return os.path.join(user_media_path('addons'),
-                            str(self.version.addon_id),
-                            self.filename)
+    def pretty_filename(self):
+        """Displayable filename."""
+        return os.path.basename(self.file.name) if self.file else ''
+
+    def latest_xpi_url(self, attachment=False):
+        addon = self.addon
+        extension = os.path.splitext(self.file.name)[-1] or 'xpi'
+        kw = {
+            'addon_id': addon.slug,
+            'filename': f'addon-{addon.pk}-latest{extension}',
+        }
+        if attachment:
+            kw['download_type'] = 'attachment'
+        return reverse('downloads.latest', kwargs=kw)
 
     @property
     def addon(self):
         return self.version.addon
 
-    @property
-    def guarded_file_path(self):
-        return os.path.join(user_media_path('guarded_addons'),
-                            str(self.version.addon_id), self.filename)
-
-    @property
-    def current_file_path(self):
-        """Returns the current path of the file, whether or not it is
-        guarded."""
-
-        file_disabled = self.status == amo.STATUS_DISABLED
-        addon_disabled = self.addon.is_disabled
-        if file_disabled or addon_disabled:
-            return self.guarded_file_path
-        else:
-            return self.file_path
-
-    @property
-    def extension(self):
-        return os.path.splitext(self.filename)[-1]
-
-    def move_file(self, source, destination, log_message):
-        """Move a file from `source` to `destination`."""
-        # Make sure we are passing bytes to Python's io system.
-        source, destination = force_bytes(source), force_bytes(destination)
-
+    def _permissions_wrapper(self, prop):
+        """Wrapper around `self._webext_permissions.<prop>` meant to be used in
+        a cached_property, filtering out any non-strings and duplicated
+        permissions, as well as handling edge case where the related
+        WebextPermission object does not exist gracefully."""
         try:
-            if storage.exists(source):
-                log.info(log_message.format(
-                    source=source, destination=destination))
-                move_stored_file(source, destination)
-        except (UnicodeEncodeError, IOError):
-            msg = 'Move Failure: {} {}'.format(
-                force_bytes(source), force_bytes(destination))
-            log.exception(msg)
-
-    def hide_disabled_file(self):
-        """Move a disabled file to the guarded file path."""
-        if not self.filename:
-            return
-        src, dst = self.file_path, self.guarded_file_path
-        self.move_file(
-            src, dst, 'Moving disabled file: {source} => {destination}')
-
-    def unhide_disabled_file(self):
-        if not self.filename:
-            return
-        src, dst = self.guarded_file_path, self.file_path
-        self.move_file(
-            src, dst, 'Moving undisabled file: {source} => {destination}')
-
-    _get_localepicker = re.compile(r'^locale browser ([\w\-_]+) (.*)$', re.M)
-
-    @memoize(prefix='localepicker', timeout=None)
-    def get_localepicker(self):
-        """
-        For a file that is part of a language pack, extract
-        the chrome/localepicker.properties file and return as
-        a string.
-        """
-        start = time.time()
-
-        try:
-            zip_ = SafeZip(self.file_path)
-        except (zipfile.BadZipfile, IOError):
-            return ''
-
-        try:
-            manifest = force_text(zip_.read('chrome.manifest'))
-        except KeyError:
-            log.info('No file named: chrome.manifest in file: %s' % self.pk)
-            return ''
-
-        res = self._get_localepicker.search(manifest)
-        if not res:
-            log.error('Locale browser not in chrome.manifest: %s' % self.pk)
-            return ''
-
-        try:
-            path = res.groups()[1]
-            if 'localepicker.properties' not in path:
-                path = os.path.join(path, 'localepicker.properties')
-            res = zip_.extract_from_manifest(path)
-        except (zipfile.BadZipfile, IOError) as e:
-            log.error('Error unzipping: %s, %s in file: %s' % (
-                path, e, self.pk))
-            return ''
-        except (ValueError, KeyError) as e:
-            log.error('No file named: %s in file: %s' % (e, self.pk))
-            return ''
-
-        end = time.time() - start
-        log.info('Extracted localepicker file: %s in %.2fs' %
-                 (self.pk, end))
-        statsd.timing('files.extract.localepicker', (end * 1000))
-        return force_text(res)
-
-    @cached_property
-    def webext_permissions_list(self):
-        if not self.is_webextension:
-            return []
-        try:
-            # Filter out any errant non-strings included in the manifest JSON.
-            # Remove any duplicate permissions.
-            permissions = set()
-            permissions = [p for p in self._webext_permissions.permissions
-                           if isinstance(p, six.string_types) and not
-                           (p in permissions or permissions.add(p))]
-            return permissions
+            # We want to preserve order, so we can't just do list(set()) or
+            # something along those lines.
+            seen = set()
+            return [
+                permission
+                for permission in getattr(self._webext_permissions, prop)
+                if isinstance(permission, str)
+                and not (permission in seen or seen.add(permission))
+            ]
 
         except WebextPermission.DoesNotExist:
             return []
 
+    @cached_property
+    def permissions(self):
+        return self._permissions_wrapper('permissions')
 
-@receiver(models.signals.post_save, sender=File,
-          dispatch_uid='cache_localpicker')
-def cache_localepicker(sender, instance, **kw):
-    if kw.get('raw') or not kw.get('created'):
-        return
+    @cached_property
+    def optional_permissions(self):
+        return self._permissions_wrapper('optional_permissions')
 
-    try:
-        addon = instance.version.addon
-    except models.ObjectDoesNotExist:
-        return
+    @cached_property
+    def host_permissions(self):
+        return self._permissions_wrapper('host_permissions')
 
-    if addon.type == amo.ADDON_LPAPP and addon.status == amo.STATUS_PUBLIC:
-        log.info('Updating localepicker for file: %s, addon: %s' %
-                 (instance.pk, addon.pk))
-        instance.get_localepicker()
+    @cached_property
+    def data_collection_permissions(self):
+        return self._permissions_wrapper('data_collection_permissions')
+
+    @cached_property
+    def optional_data_collection_permissions(self):
+        return self._permissions_wrapper('optional_data_collection_permissions')
+
+    def get_review_status_display(self):
+        # Like .get_file_status_display but with logic to make the status more accurate
+        if self.status == amo.STATUS_DISABLED:
+            return (
+                gettext('Rejected')
+                if getattr(self, 'version', None) and self.version.human_review_date
+                else gettext('Unreviewed')
+            )
+        return self.STATUS_CHOICES.get(
+            self.status, gettext('[status:%s]') % self.status
+        )
 
 
 @use_primary_db
@@ -407,6 +340,7 @@ def update_status(sender, instance, **kw):
                 addon.update_status(ignore_version=instance.version)
             else:
                 addon.update_status()
+            instance.version.reset_due_date()
         except models.ObjectDoesNotExist:
             pass
 
@@ -417,40 +351,33 @@ def update_status_delete(sender, instance, **kw):
 
 
 models.signals.post_save.connect(
-    update_status, sender=File, dispatch_uid='version_update_status')
+    update_status, sender=File, dispatch_uid='version_update_status'
+)
 models.signals.post_delete.connect(
-    update_status_delete, sender=File, dispatch_uid='version_update_status')
+    update_status_delete, sender=File, dispatch_uid='version_update_status'
+)
 
 
-@receiver(models.signals.post_delete, sender=File,
-          dispatch_uid='cleanup_file')
+@receiver(models.signals.post_delete, sender=File, dispatch_uid='cleanup_file')
 def cleanup_file(sender, instance, **kw):
-    """ On delete of the file object from the database, unlink the file from
-    the file system """
-    if kw.get('raw') or not instance.filename:
-        return
-    # Use getattr so the paths are accessed inside the try block.
-    for path in ('file_path', 'guarded_file_path'):
-        try:
-            filename = getattr(instance, path)
-        except models.ObjectDoesNotExist:
+    """On delete of the file object from the database, unlink the file from
+    the file system"""
+    try:
+        if kw.get('raw') or not instance.file:
             return
-        if storage.exists(filename):
-            log.info('Removing filename: %s for file: %s'
-                     % (filename, instance.pk))
-            storage.delete(filename)
+        if storage.exists(instance.file.path):
+            log.info(
+                f'Removing filename: {instance.pretty_filename} for file: {instance.pk}'
+            )
+            instance.file.delete(save=False)
+    except models.ObjectDoesNotExist:
+        return
 
 
 @File.on_change
 def check_file(old_attr, new_attr, instance, sender, **kw):
     if kw.get('raw'):
         return
-    old, new = old_attr.get('status'), instance.status
-    if new == amo.STATUS_DISABLED and old != amo.STATUS_DISABLED:
-        instance.hide_disabled_file()
-    elif old == amo.STATUS_DISABLED and new != amo.STATUS_DISABLED:
-        instance.unhide_disabled_file()
-
     # Log that the hash has changed.
     old, new = old_attr.get('hash'), instance.hash
     if old != new:
@@ -458,21 +385,10 @@ def check_file(old_attr, new_attr, instance, sender, **kw):
             addon = instance.version.addon.pk
         except models.ObjectDoesNotExist:
             addon = 'unknown'
-        log.info('Hash changed for file: %s, addon: %s, from: %s to: %s' %
-                 (instance.pk, addon, old, new))
-
-
-@File.on_change
-def clear_d2c_version(old_attr, new_attr, instance, sender, **kw):
-    do_clear = False
-    fields = ['status', 'strict_compatibility', 'binary_components']
-
-    for field in fields:
-        if old_attr[field] != new_attr[field]:
-            do_clear = True
-
-    if do_clear:
-        instance.version.addon.invalidate_d2c_versions()
+        log.info(
+            'Hash changed for file: %s, addon: %s, from: %s to: %s'
+            % (instance.pk, addon, old, new)
+        )
 
 
 def track_new_status(sender, instance, *args, **kw):
@@ -483,9 +399,9 @@ def track_new_status(sender, instance, *args, **kw):
         track_file_status_change(instance)
 
 
-models.signals.post_save.connect(track_new_status,
-                                 sender=File,
-                                 dispatch_uid='track_new_file_status')
+models.signals.post_save.connect(
+    track_new_status, sender=File, dispatch_uid='track_new_file_status'
+)
 
 
 @File.on_change
@@ -501,95 +417,157 @@ def track_status_change(old_attr=None, new_attr=None, **kwargs):
 
 
 def track_file_status_change(file_):
-    statsd.incr('file_status_change.all.status_{}'.format(file_.status))
-
-    if (file_.jetpack_version and
-            not file_.is_restart_required and
-            not file_.requires_chrome):
-        statsd.incr('file_status_change.jetpack_sdk_only.status_{}'
-                    .format(file_.status))
+    statsd.incr(f'file_status_change.all.status_{file_.status}')
 
 
-@python_2_unicode_compatible
 class FileUpload(ModelBase):
     """Created when a file is uploaded for validation/submission."""
+
     uuid = models.UUIDField(default=uuid.uuid4, editable=False)
     path = models.CharField(max_length=255, default='')
-    name = models.CharField(max_length=255, default='',
-                            help_text="The user's original filename")
+    name = models.CharField(
+        max_length=255, default='', help_text="The user's original filename"
+    )
     hash = models.CharField(max_length=255, default='')
-    user = models.ForeignKey('users.UserProfile', null=True)
+    user = models.ForeignKey('users.UserProfile', on_delete=models.CASCADE)
     valid = models.BooleanField(default=False)
     validation = models.TextField(null=True)
-    automated_signing = models.BooleanField(default=False)
-    compat_with_app = models.PositiveIntegerField(
-        choices=amo.APPS_CHOICES, db_column="compat_with_app_id", null=True)
-    compat_with_appver = models.ForeignKey(
-        AppVersion, null=True, related_name='uploads_compat_for_appver')
+    channel = models.PositiveSmallIntegerField(choices=amo.CHANNEL_CHOICES.items())
     # Not all FileUploads will have a version and addon but it will be set
     # if the file was uploaded using the new API.
     version = models.CharField(max_length=255, null=True)
-    addon = models.ForeignKey('addons.Addon', null=True)
+    addon = models.ForeignKey('addons.Addon', null=True, on_delete=models.CASCADE)
+    access_token = models.CharField(max_length=40, null=True)
+    ip_address = models.CharField(max_length=45)
+    request_metadata = models.JSONField(default=dict, null=True)
+    source = models.PositiveSmallIntegerField(choices=amo.UPLOAD_SOURCE_CHOICES)
 
     objects = ManagerBase()
 
     class Meta(ModelBase.Meta):
         db_table = 'file_uploads'
+        constraints = [
+            models.UniqueConstraint(fields=('uuid',), name='uuid'),
+        ]
 
     def __str__(self):
-        return six.text_type(self.uuid.hex)
+        return str(self.uuid.hex)
 
     def save(self, *args, **kw):
-        if self.validation:
-            if self.load_validation()['errors'] == 0:
-                self.valid = True
-        super(FileUpload, self).save(*args, **kw)
+        if self.validation and self.load_validation()['errors'] == 0:
+            self.valid = True
+        if not self.access_token:
+            self.access_token = self.generate_access_token()
+        super().save(*args, **kw)
+
+    def write_data_to_path(self, chunks):
+        hash_obj = hashlib.sha256()
+        with storage.open(self.file_path, 'wb') as file_destination:
+            for chunk in chunks:
+                hash_obj.update(chunk)
+                file_destination.write(chunk)
+        return hash_obj
+
+    @classmethod
+    def generate_path(cls, ext='.zip'):
+        return os.path.join('temp', f'{uuid.uuid4().hex}{ext}')
+
+    @property
+    def file_path(self):
+        if self.path.startswith('/'):
+            return self.path
+        elif self.path:
+            return os.path.join(settings.ADDONS_PATH, self.path)
+        else:
+            return self.path
 
     def add_file(self, chunks, filename, size):
         if not self.uuid:
             self.uuid = self._meta.get_field('uuid')._create_uuid()
 
-        filename = force_text(u'{0}_{1}'.format(self.uuid.hex, filename))
-        loc = os.path.join(user_media_path('addons'), 'temp', uuid.uuid4().hex)
-        base, ext = os.path.splitext(filename)
-        is_crx = False
+        _base, ext = os.path.splitext(filename)
+        was_crx = ext == '.crx'
+        # Filename we'll expose (but not use for storage).
+        self.name = force_str(f'{self.uuid.hex}_{filename}')
 
-        # Change a ZIP to an XPI, to maintain backward compatibility
-        # with older versions of Firefox and to keep the rest of the XPI code
-        # path as consistent as possible for ZIP uploads.
-        # See: https://github.com/mozilla/addons-server/pull/2785
-        if ext == '.zip':
-            ext = '.xpi'
-
-        # If the extension is a CRX, we need to do some actual work to it
-        # before we just convert it to an XPI. We strip the header from the
-        # CRX, then it's good; see more about the CRX file format here:
-        # https://developer.chrome.com/extensions/crx
-        if ext == '.crx':
-            ext = '.xpi'
-            is_crx = True
-
+        # Final path on our filesystem. If it had a valid extension we change
+        # it to .zip (CRX files are converted before validation, so they will
+        # be treated as normal .zip for validation). If somehow this is
+        # not a valid archive or the extension is invalid parse_addon() will
+        # eventually complain at validation time or before even reaching the
+        # linter.
         if ext in amo.VALID_ADDON_FILE_EXTENSIONS:
-            loc += ext
+            ext = '.zip'
+        self.path = self.generate_path(ext)
 
-        log.info('UPLOAD: %r (%s bytes) to %r' % (filename, size, loc))
-        if is_crx:
-            hash_func = write_crx_as_xpi(chunks, loc)
-        else:
-            hash_func = hashlib.sha256()
-            with storage.open(loc, 'wb') as file_destination:
-                for chunk in chunks:
-                    hash_func.update(chunk)
-                    file_destination.write(chunk)
-        self.path = loc
-        self.name = filename
-        self.hash = 'sha256:%s' % hash_func.hexdigest()
+        hash_obj = None
+        if was_crx:
+            try:
+                hash_obj = write_crx_as_xpi(chunks, self.file_path)
+            except InvalidOrUnsupportedCrx:
+                # We couldn't convert the crx file. Write it to the filesystem
+                # normally, the validation process should reject this with a
+                # proper error later.
+                pass
+        if hash_obj is None:
+            hash_obj = self.write_data_to_path(chunks)
+        self.hash = 'sha256:%s' % hash_obj.hexdigest()
+
+        # The following log statement is used by foxsec-pipeline.
+        log.info(
+            f'UPLOAD: {self.name!r} ({size} bytes) to {self.path!r}',
+            extra={
+                'email': (self.user.email or ''),
+                'upload_hash': self.hash,
+            },
+        )
         self.save()
 
+    def generate_access_token(self):
+        """
+        Returns an access token used to secure download URLs.
+        """
+        return get_random_string(40)
+
+    def get_authenticated_download_url(self):
+        """
+        Returns a download URL containing an access token bound to this file.
+        """
+        absolute_url = urljoin(
+            settings.EXTERNAL_SITE_URL,
+            reverse('files.serve_file_upload', kwargs={'uuid': self.uuid.hex}),
+        )
+        return f'{absolute_url}?access_token={self.access_token}'
+
     @classmethod
-    def from_post(cls, chunks, filename, size, **params):
-        upload = FileUpload(**params)
+    def from_post(
+        cls,
+        chunks,
+        *,
+        filename,
+        size,
+        user,
+        source,
+        channel,
+        addon=None,
+        version=None,
+    ):
+        max_ip_length = cls._meta.get_field('ip_address').max_length
+        ip_address = (core.get_remote_addr() or '')[:max_ip_length]
+        upload = FileUpload(
+            addon=addon,
+            user=user,
+            source=source,
+            channel=channel,
+            ip_address=ip_address,
+            request_metadata=core.get_request_metadata(),
+            version=version,
+        )
         upload.add_file(chunks, filename, size)
+
+        # The following log statement is used by foxsec-pipeline.
+        log.info('FileUpload created: %s' % upload.uuid.hex)
+
         return upload
 
     @property
@@ -597,13 +575,15 @@ class FileUpload(ModelBase):
         return bool(self.valid or self.validation)
 
     @property
+    def submitted(self):
+        return bool(self.addon)
+
+    @property
     def validation_timeout(self):
         if self.processed:
             validation = self.load_validation()
-            messages = validation['messages']
-            timeout_id = ['validator',
-                          'unexpected_exception',
-                          'validation_timeout']
+            messages = validation.get('messages', [])
+            timeout_id = ['validator', 'unexpected_exception', 'validation_timeout']
             return any(msg['id'] == timeout_id for msg in messages)
         else:
             return False
@@ -616,19 +596,15 @@ class FileUpload(ModelBase):
             from olympia.devhub.utils import process_validation
 
             validation = self.load_validation()
-            is_compatibility = self.compat_with_app is not None
 
-            return process_validation(
-                validation,
-                is_compatibility=is_compatibility,
-                file_hash=self.hash)
+            return process_validation(validation)
 
     @property
     def passed_all_validations(self):
         return self.processed and self.valid
 
     def load_validation(self):
-        return json.loads(self.validation)
+        return json.loads(self.validation or '{}')
 
     @property
     def pretty_name(self):
@@ -640,7 +616,9 @@ class FileUpload(ModelBase):
 
 class FileValidation(ModelBase):
     id = PositiveAutoField(primary_key=True)
-    file = models.OneToOneField(File, related_name='validation')
+    file = models.OneToOneField(
+        File, related_name='validation', on_delete=models.CASCADE
+    )
     valid = models.BooleanField(default=False)
     errors = models.IntegerField(default=0)
     warnings = models.IntegerField(default=0)
@@ -652,16 +630,8 @@ class FileValidation(ModelBase):
 
     @classmethod
     def from_json(cls, file, validation):
-        if isinstance(validation, six.string_types):
+        if isinstance(validation, str):
             validation = json.loads(validation)
-
-        if 'metadata' in validation:
-            if (validation['metadata'].get('contains_binary_extension') or
-                    validation['metadata'].get('contains_binary_content')):
-                file.update(binary=True)
-
-            if validation['metadata'].get('binary_components'):
-                file.update(binary_components=True)
 
         # Delete any past results.
         # We most often wind up with duplicate results when multiple requests
@@ -675,31 +645,54 @@ class FileValidation(ModelBase):
             errors=validation['errors'],
             warnings=validation['warnings'],
             notices=validation['notices'],
-            valid=validation['errors'] == 0)
+            valid=validation['errors'] == 0,
+        )
 
     @property
     def processed_validation(self):
         """Return processed validation results as expected by the frontend."""
         # Import loop.
         from olympia.devhub.utils import process_validation
+
         return process_validation(
             json.loads(self.validation),
-            file_hash=self.file.original_hash,
-            channel=self.file.version.channel)
+            channel=self.file.version.channel,
+        )
 
 
 class WebextPermission(ModelBase):
-    NATIVE_MESSAGING_NAME = u'nativeMessaging'
-    permissions = JSONField(default={})
-    file = models.OneToOneField('File', related_name='_webext_permissions',
-                                on_delete=models.CASCADE)
+    NATIVE_MESSAGING_NAME = 'nativeMessaging'
+    permissions = models.JSONField(default=dict)
+    optional_permissions = models.JSONField(default=dict)
+    host_permissions = models.JSONField(default=dict)
+    data_collection_permissions = models.JSONField(default=dict)
+    optional_data_collection_permissions = models.JSONField(default=dict)
+    file = models.OneToOneField(
+        'File', related_name='_webext_permissions', on_delete=models.CASCADE
+    )
 
     class Meta:
         db_table = 'webext_permissions'
 
 
-def nfd_str(u):
-    """Uses NFD to normalize unicode strings."""
-    if isinstance(u, six.text_type):
-        return unicodedata.normalize('NFD', u).encode('utf-8')
-    return u
+class FileManifest(ModelBase):
+    file = models.OneToOneField(
+        'File',
+        related_name='file_manifest',
+        on_delete=models.CASCADE,
+        primary_key=True,
+    )
+    manifest_data = models.JSONField(default=dict)
+
+    def save(self, *args, **kwargs):
+        # <Model>.objects.create() sets force_insert=True, it's more reliable
+        # than self.pk given our pk is the OneToOneField and should always be
+        # set.
+        if kwargs.get('force_insert') and not self.manifest_data:
+            self.manifest_data = ManifestJSONExtractor(
+                # file is the (AMO) File object
+                # file.file is the FieldFile object
+                # file.file.file is the (Django) File object
+                SafeZip(self.file.file.file).read('manifest.json')
+            ).data
+        return super().save(*args, **kwargs)

@@ -1,20 +1,19 @@
-import mock
+from unittest import mock
 
+from django.core import mail
 from django.db import IntegrityError
-
-from six import text_type
 
 from olympia.amo.tests import TestCase
 from olympia.users.models import UserProfile
 
-from ..models import SYMMETRIC_JWT_TYPE, APIKey
+from ..models import SYMMETRIC_JWT_TYPE, APIKey, APIKeyConfirmation
 
 
 class TestAPIKey(TestCase):
     fixtures = ['base/addon_3615', 'base/users']
 
     def setUp(self):
-        super(TestAPIKey, self).setUp()
+        super().setUp()
         self.user = UserProfile.objects.get(email='del@icio.us')
 
     def test_new_jwt_credentials(self):
@@ -27,10 +26,10 @@ class TestAPIKey(TestCase):
 
     def test_string_representation(self):
         credentials = APIKey.new_jwt_credentials(self.user)
-        str_creds = text_type(credentials)
+        str_creds = str(credentials)
         assert credentials.key in str_creds
         assert credentials.secret not in str_creds
-        assert text_type(credentials.user) in str_creds
+        assert str(credentials.user) in str_creds
 
     def test_cant_have_two_active_keys_for_same_user(self):
         APIKey.new_jwt_credentials(self.user)
@@ -39,7 +38,7 @@ class TestAPIKey(TestCase):
 
     def test_generate_new_unique_keys(self):
         last_key = None
-        for counter in range(3):
+        for _counter in range(3):
             credentials = APIKey.new_jwt_credentials(self.user)
             assert credentials.key != last_key
             last_key = credentials.key
@@ -57,7 +56,7 @@ class TestAPIKey(TestCase):
         mock_filter.return_value.exists.return_value = True
 
         with self.assertRaises(RuntimeError):
-            for counter in range(max + 1):
+            for _counter in range(max + 1):
                 APIKey.get_unique_key('key-prefix-', max_tries=max)
 
     def test_generate_secret(self):
@@ -77,3 +76,36 @@ class TestAPIKey(TestCase):
         active_key.update(created=self.days_ago(1))
         fetched_key = APIKey.get_jwt_key(user=self.user)
         assert fetched_key == active_key
+
+
+class TestAPIKeyConfirmation(TestCase):
+    def test_generate_token(self):
+        token = APIKeyConfirmation.generate_token()
+        assert len(token) == 20
+        assert token != APIKeyConfirmation.generate_token()
+        assert token != APIKeyConfirmation.generate_token()
+
+    def test_is_token_valid(self):
+        confirmation = APIKeyConfirmation()
+        confirmation.token = APIKeyConfirmation.generate_token()
+        assert confirmation.is_token_valid(confirmation.token)
+        assert not confirmation.is_token_valid(confirmation.token[:19])
+        assert not confirmation.is_token_valid(confirmation.token[1:])
+        assert not confirmation.is_token_valid('a' * 20)
+
+    def test_send_confirmation_email(self):
+        token = 'abcdefghijklmnopqrst'
+        confirmation = APIKeyConfirmation()
+        confirmation.token = token
+        confirmation.user = UserProfile(email='foo@bar.com', display_name='Fô')
+        assert len(mail.outbox) == 0
+        confirmation.send_confirmation_email()
+        assert len(mail.outbox) == 1
+        message = mail.outbox[0]
+        expected_url = (
+            f'http://testserver/en-US/developers/addon/api/key/?token={token}'
+        )
+        assert message.to == ['foo@bar.com']
+        assert message.from_email == 'Mozilla Add-ons <nobody@mozilla.org>'
+        assert message.subject == 'Confirmation for developer API keys'
+        assert expected_url in message.body

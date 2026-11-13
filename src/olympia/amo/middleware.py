@@ -1,37 +1,70 @@
 import contextlib
+import os
 import re
-import socket
+import time
 import uuid
+from urllib.parse import quote
 
 from django.conf import settings
+from django.contrib.auth import SESSION_KEY
 from django.contrib.auth.middleware import AuthenticationMiddleware
 from django.contrib.auth.models import AnonymousUser
 from django.contrib.sessions.middleware import SessionMiddleware
+from django.core.exceptions import ImproperlyConfigured
 from django.db import transaction
-from django.urls import is_valid_path
 from django.http import (
-    HttpResponsePermanentRedirect, HttpResponseRedirect,
-    JsonResponse)
+    Http404,
+    HttpResponse,
+    HttpResponsePermanentRedirect,
+    HttpResponseRedirect,
+    JsonResponse,
+)
 from django.middleware import common
-from django.utils.cache import patch_cache_control, patch_vary_headers
+from django.template.response import TemplateResponse
+from django.urls import is_valid_path
+from django.utils.cache import (
+    add_never_cache_headers,
+    get_max_age,
+    patch_cache_control,
+    patch_vary_headers,
+)
+from django.utils.crypto import constant_time_compare
 from django.utils.deprecation import MiddlewareMixin
-from django.utils.encoding import force_text, iri_to_uri
-from django.utils.translation import activate, ugettext_lazy as _
-
-from rest_framework import permissions
-from six.moves.urllib.parse import quote
+from django.utils.encoding import force_str, iri_to_uri
+from django.utils.http import MAX_URL_LENGTH
+from django.utils.translation import activate, gettext_lazy as _
 
 import MySQLdb as mysql
-from corsheaders.middleware import CorsMiddleware as _CorsMiddleware
+import waffle
+from csp.middleware import CSPMiddleware as CSPMiddlewareUpstream
+from django_statsd.clients import statsd
+from django_statsd.middleware import (
+    GraphiteRequestTimingMiddleware as GraphiteRequestTimingMiddlewareUpstream,
+)
+from rest_framework import permissions
 
+import olympia.core.logger
 from olympia import amo
-from olympia.amo.utils import render
+from olympia.accounts.decorators import reprompt_for_2fa_if_necessary
+from olympia.accounts.utils import redirect_for_login
+from olympia.accounts.verify import (
+    IdentificationError,
+    check_and_update_fxa_access_token,
+)
 
 from . import urlresolvers
+from .reverse import set_url_prefix
 from .templatetags.jinja_helpers import urlparams
 
 
-auth_path = re.compile('%saccounts/authenticate/?$' % settings.DRF_API_REGEX)
+log = olympia.core.logger.getLogger('amo.middleware')
+
+auth_path = re.compile(
+    f'{settings.DRF_API_REGEX}accounts/authenticate/?$|^/api/auth/authenticated-restore-post/$'
+)
+
+# Name of the header used to expose/propagate the request id across services.
+REQUEST_ID_HEADER = 'X-AMO-Request-ID'
 
 
 class LocaleAndAppURLMiddleware(MiddlewareMixin):
@@ -42,41 +75,51 @@ class LocaleAndAppURLMiddleware(MiddlewareMixin):
     4. strip them from the URL so we can do stuff
     """
 
+    def redirect(self, redirect_to):
+        from .utils import HttpResponseURITooLong
+
+        # Always use a 302 redirect to avoid users being stuck in case of accidental
+        # misconfiguration. We need to account for `MAX_URL_LENGTH` to match
+        # `django.shortcuts.redirect()`'s behavior, see:
+        # https://github.com/django/django/commit/c880530ddd4fabd5939bab0e148bebe36699432a
+        if len(redirect_to) > MAX_URL_LENGTH:
+            return HttpResponseURITooLong()
+        else:
+            return HttpResponseRedirect(redirect_to)
+
     def process_request(self, request):
         # Find locale, app
         prefixer = urlresolvers.Prefixer(request)
 
-        # Always use a 302 redirect to avoid users being stuck in case of
-        # accidental misconfiguration.
-        redirect_type = HttpResponseRedirect
-
-        urlresolvers.set_url_prefix(prefixer)
+        set_url_prefix(prefixer)
         full_path = prefixer.fix(prefixer.shortened_path)
 
-        if (prefixer.app == amo.MOBILE.short and
-                request.path.rstrip('/').endswith('/' + amo.MOBILE.short)):
-            return redirect_type(request.path.replace('/mobile', '/android'))
+        if prefixer.app == amo.MOBILE.short and request.path.rstrip('/').endswith(
+            '/' + amo.MOBILE.short
+        ):
+            return self.redirect(request.path.replace('/mobile', '/android'))
 
-        if ('lang' in request.GET and not re.match(
-                settings.SUPPORTED_NONAPPS_NONLOCALES_REGEX,
-                prefixer.shortened_path)):
-            # Blank out the locale so that we can set a new one.  Remove lang
-            # from query params so we don't have an infinite loop.
+        if ('lang' in request.GET or 'app' in request.GET) and not re.match(
+            settings.SUPPORTED_NONAPPS_NONLOCALES_REGEX, prefixer.shortened_path
+        ):
+            # Blank out the locale so that we can set a new one.  Remove
+            # lang/app from query params so we don't have an infinite loop.
             prefixer.locale = ''
             new_path = prefixer.fix(prefixer.shortened_path)
             query = request.GET.dict()
-            query.pop('lang')
-            return redirect_type(urlparams(new_path, **query))
+            query.pop('app', None)
+            query.pop('lang', None)
+            return self.redirect(urlparams(new_path, **query))
 
         if full_path != request.path:
             query_string = request.META.get('QUERY_STRING', '')
             full_path = quote(full_path.encode('utf-8'))
 
             if query_string:
-                query_string = force_text(query_string, errors='ignore')
-                full_path = u'%s?%s' % (full_path, query_string)
+                query_string = force_str(query_string, errors='ignore')
+                full_path = f'{full_path}?{query_string}'
 
-            response = redirect_type(full_path)
+            response = self.redirect(full_path)
             # Cache the redirect for a year.
             if not settings.DEBUG:
                 patch_cache_control(response, max_age=60 * 60 * 24 * 365)
@@ -96,12 +139,6 @@ class LocaleAndAppURLMiddleware(MiddlewareMixin):
         request.path_info = '/' + prefixer.shortened_path
         request.LANG = prefixer.locale or prefixer.get_language()
         activate(request.LANG)
-        request.APP = amo.APPS.get(prefixer.app, amo.FIREFOX)
-
-        # Match legacy api requests too - IdentifyAPIRequestMiddleware is v3+
-        # TODO - remove this when legacy_api goes away
-        # https://github.com/mozilla/addons-server/issues/9274
-        request.is_legacy_api = request.path_info.startswith('/api/')
 
 
 class AuthenticationMiddlewareWithoutAPI(AuthenticationMiddleware):
@@ -109,14 +146,12 @@ class AuthenticationMiddlewareWithoutAPI(AuthenticationMiddleware):
     Like AuthenticationMiddleware, but disabled for the API, which uses its
     own authentication mechanism.
     """
+
     def process_request(self, request):
-        legacy_or_drf_api = request.is_api or request.is_legacy_api
-        if legacy_or_drf_api and not auth_path.match(request.path):
+        if request.is_api and not auth_path.match(request.path):
             request.user = AnonymousUser()
         else:
-            return super(
-                AuthenticationMiddlewareWithoutAPI,
-                self).process_request(request)
+            return super().process_request(request)
 
 
 class NoVarySessionMiddleware(SessionMiddleware):
@@ -125,10 +160,8 @@ class NoVarySessionMiddleware(SessionMiddleware):
     request.session is accessed indirectly anytime request.user is touched.
     We always touch request.user to see if the user is authenticated, so every
     request would be sending vary, so we'd get no caching.
-
-    We skip the cache in Zeus if someone has an AMOv3+ cookie, so varying on
-    Cookie at this level only hurts us.
     """
+
     def process_response(self, request, response):
         if settings.READ_ONLY:
             return response
@@ -139,9 +172,7 @@ class NoVarySessionMiddleware(SessionMiddleware):
         if hasattr(response, 'get'):
             vary = response.get('Vary', None)
 
-        new_response = (
-            super(NoVarySessionMiddleware, self)
-            .process_response(request, response))
+        new_response = super().process_response(request, response)
 
         if vary:
             new_response['Vary'] = vary
@@ -159,10 +190,12 @@ class RemoveSlashMiddleware(MiddlewareMixin):
     """
 
     def process_response(self, request, response):
-        if (response.status_code == 404 and
-                request.path_info.endswith('/') and
-                not is_valid_path(request.path_info) and
-                is_valid_path(request.path_info[:-1])):
+        if (
+            response.status_code == 404
+            and request.path_info.endswith('/')
+            and not is_valid_path(request.path_info)
+            and is_valid_path(request.path_info[:-1])
+        ):
             # Use request.path because we munged app/locale in path_info.
             newurl = request.path[:-1]
             if request.GET:
@@ -190,10 +223,9 @@ def safe_query_string(request):
 
 
 class CommonMiddleware(common.CommonMiddleware):
-
     def process_request(self, request):
         with safe_query_string(request):
-            return super(CommonMiddleware, self).process_request(request)
+            return super().process_request(request)
 
 
 class NonAtomicRequestsForSafeHttpMethodsMiddleware(MiddlewareMixin):
@@ -201,6 +233,7 @@ class NonAtomicRequestsForSafeHttpMethodsMiddleware(MiddlewareMixin):
     Middleware to make the view non-atomic if the HTTP method used is safe,
     in order to avoid opening and closing a useless transaction.
     """
+
     def process_view(self, request, view_func, view_args, view_kwargs):
         # This uses undocumented django APIS:
         # - transaction.get_connection() followed by in_atomic_block property,
@@ -215,7 +248,6 @@ class NonAtomicRequestsForSafeHttpMethodsMiddleware(MiddlewareMixin):
         is_method_safe = request.method in ('HEAD', 'GET', 'OPTIONS', 'TRACE')
         if is_method_safe and not transaction.get_connection().in_atomic_block:
             transaction._non_atomic_requests(view_func, using='default')
-        return None
 
 
 class ReadOnlyMiddleware(MiddlewareMixin):
@@ -224,10 +256,23 @@ class ReadOnlyMiddleware(MiddlewareMixin):
 
     Supports issuing `Retry-After` header.
     """
+
     ERROR_MSG = _(
-        u'Some features are temporarily disabled while we '
-        u'perform website maintenance. We\'ll be back to '
-        u'full capacity shortly.')
+        'Some features are temporarily disabled while we '
+        "perform website maintenance. We'll be back to "
+        'full capacity shortly.'
+    )
+
+    def render_html_error(self, request):
+        response = TemplateResponse(request, 'amo/read-only.html', status=503)
+        # render() is normally called behind the scenes by django's base
+        # handler inside get_response(), but here we might be bypassing that,
+        # so we need to force the rendering ourselves.
+        response.render()
+        return response
+
+    def render_readonly_api_error(self, request):
+        return JsonResponse({'error': self.ERROR_MSG}, status=503)
 
     def process_request(self, request):
         if not settings.READ_ONLY:
@@ -236,9 +281,9 @@ class ReadOnlyMiddleware(MiddlewareMixin):
         if request.is_api:
             writable_method = request.method not in permissions.SAFE_METHODS
             if writable_method:
-                return JsonResponse({'error': self.ERROR_MSG}, status=503)
+                return self.render_readonly_api_error(request)
         elif request.method == 'POST':
-            return render(request, 'amo/read-only.html', status=503)
+            return self.render_html_error(request)
 
     def process_exception(self, request, exception):
         if not settings.READ_ONLY:
@@ -246,67 +291,62 @@ class ReadOnlyMiddleware(MiddlewareMixin):
 
         if isinstance(exception, mysql.OperationalError):
             if request.is_api:
-                return self._render_api_error()
-            return render(request, 'amo/read-only.html', status=503)
+                return self.render_readonly_api_error(request)
+            return self.render_html_error(request)
 
 
 class SetRemoteAddrFromForwardedFor(MiddlewareMixin):
     """
-    Set request.META['REMOTE_ADDR'] from request.META['HTTP_X_FORWARDED_FOR'].
+    Set REMOTE_ADDR from HTTP_X_FORWARDED_FOR if necessary.
 
-    Our application servers should always be behind a load balancer that sets
-    this header correctly.
+    See https://mozilla.github.io/addons-server/topics/remote_addr.html.
     """
-    def is_valid_ip(self, ip):
-        for af in (socket.AF_INET, socket.AF_INET6):
-            try:
-                socket.inet_pton(af, ip)
-                return True
-            except socket.error:
-                pass
-        return False
+
+    def is_request_from_cdn(self, request):
+        return settings.SECRET_CDN_TOKEN and constant_time_compare(
+            request.META.get('HTTP_X_REQUEST_VIA_CDN'), settings.SECRET_CDN_TOKEN
+        )
+
+    def is_request_from_gcp_environement(self, request):
+        return os.environ.get('DEPLOY_PLATFORM') == 'gcp'
+
+    def is_request_shielded(self, request):
+        """Return True if the request was shielded. Only use if
+        is_request_from_cdn() returns True.
+
+        The header this method depends on is explicitly set by Fastly and
+        explicitly not forwarded by CloudFront, guaranteeing it was not
+        provided by the client if the request is coming from either CDN.
+        """
+        # This is a straight header, not a META parameter set by uwsgi.
+        return request.headers.get('x-amo-request-shielded') == 'true'
 
     def process_request(self, request):
-        ips = []
-
-        if 'HTTP_X_FORWARDED_FOR' in request.META:
-            xff = [i.strip() for i in
-                   request.META['HTTP_X_FORWARDED_FOR'].split(',')]
-            ips = [ip for ip in xff if self.is_valid_ip(ip)]
-        else:
-            return
-
-        ips.append(request.META['REMOTE_ADDR'])
-
-        known = getattr(settings, 'KNOWN_PROXIES', [])
-        ips.reverse()
-
-        for ip in ips:
-            request.META['REMOTE_ADDR'] = ip
-            if ip not in known:
-                break
-
-
-class ScrubRequestOnException(MiddlewareMixin):
-    """
-    Hide sensitive information so they're not recorded in error logging.
-    * passwords in request.POST
-    * sessionid in request.COOKIES
-    """
-
-    def process_exception(self, request, exception):
-        # Get a copy so it's mutable.
-        request.POST = request.POST.copy()
-        for key in request.POST:
-            if 'password' in key.lower():
-                request.POST[key] = '******'
-
-        # Remove session id from cookies
-        if settings.SESSION_COOKIE_NAME in request.COOKIES:
-            request.COOKIES[settings.SESSION_COOKIE_NAME] = '******'
-            # Clearing out all cookies in request.META. They will already
-            # be sent with request.COOKIES.
-            request.META['HTTP_COOKIE'] = '******'
+        """Set REMOTE_ADDR to the client IP in a specific position in
+        HTTP_X_FORWARDED_FOR depending on what the request went through."""
+        position = 1
+        x_forwarded_for_header = request.META.get('HTTP_X_FORWARDED_FOR')
+        if x_forwarded_for_header:
+            if self.is_request_from_cdn(request):
+                position += 1
+                if self.is_request_shielded(request):
+                    position += 1
+            if self.is_request_from_gcp_environement(request):
+                position += 1
+            # If position is greater than 1 then we need to fix REMOTE_ADDR by
+            # looking into HTTP_X_FORWARDED_FOR, otherwise we should ignore it.
+            if position > 1:
+                try:
+                    value = x_forwarded_for_header.rsplit(sep=',', maxsplit=position)[
+                        -position
+                    ].strip()
+                    if not value:
+                        raise IndexError
+                    request.META['REMOTE_ADDR'] = value
+                except IndexError as exc:
+                    # Shouldn't happen, must be a misconfiguration, raise an error
+                    # rather than potentially use/record incorrect IPs.
+                    raise ImproperlyConfigured('Invalid HTTP_X_FORWARDED_FOR') from exc
 
 
 class RequestIdMiddleware(MiddlewareMixin):
@@ -316,23 +356,199 @@ class RequestIdMiddleware(MiddlewareMixin):
     e.g to correlate logs with sentry exceptions.
 
     We are exposing this request id in the `X-AMO-Request-ID` response header.
+
+    If the incoming request already carries an `X-AMO-Request-ID` header that
+    looks like a valid UUID, we reuse it instead of generating a new one.
     """
 
     def process_request(self, request):
-        request.request_id = uuid.uuid4().hex
+        request_id = request.headers.get(REQUEST_ID_HEADER)
+        if request_id:
+            try:
+                uuid.UUID(request_id)
+            except ValueError:
+                # The header is present but isn't a valid UUID, ignore it.
+                request_id = None
+        request.request_id = request_id or uuid.uuid4().hex
 
     def process_response(self, request, response):
         request_id = getattr(request, 'request_id', None)
 
         if request_id:
-            response['X-AMO-Request-ID'] = request.request_id
+            response[REQUEST_ID_HEADER] = request.request_id
 
         return response
 
 
-class CorsMiddleware(_CorsMiddleware, MiddlewareMixin):
-    """Wrapper to allow old style Middleware to work with django 1.10+.
-    Will be unneeded once
-    https://github.com/mstriemer/django-cors-headers/pull/3 is merged and a
-    new release of django-cors-headers-multi is available."""
-    pass
+class CacheControlMiddleware:
+    """Middleware to add Cache-Control: max-age=xxx header to responses that
+    should be cached, Cache-Control: s-maxage:0 to responses that should not.
+
+    The only responses that should be cached are API, unauthenticated responses
+    from "safe" HTTP verbs, or responses that already had a max-age set before
+    being processed by this middleware. In that last case, the Cache-Control
+    header already present is left intact.
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        max_age_from_response = get_max_age(response)
+        request_conditions = (
+            request.is_api
+            and request.method in ('GET', 'HEAD')
+            and 'HTTP_AUTHORIZATION' not in request.META
+            and 'disable_caching' not in request.GET
+        )
+        response_conditions = (
+            not response.cookies
+            and response.status_code >= 200
+            and response.status_code < 400
+            and not max_age_from_response
+        )
+        if request_conditions and response_conditions:
+            if request.META['SERVER_NAME'] == settings.SERVICES_DOMAIN:
+                max_age = settings.API_CACHE_DURATION_SERVICES
+            else:
+                max_age = settings.API_CACHE_DURATION
+            patch_cache_control(response, max_age=max_age)
+        elif max_age_from_response is None:
+            patch_cache_control(response, s_maxage=0)
+        return response
+
+
+class HeartbeatMiddleware:
+    """Middleware to capture request to /__lbheartbeat__ and
+    __heartbeat__ and return a 200.
+    Must be placed above CommonMiddleware to work with ELB.
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        if request.path in ('/__lbheartbeat__', '/__heartbeat__'):
+            response = HttpResponse(status=200)
+            add_never_cache_headers(response)
+            return response
+        return self.get_response(request)
+
+
+class TokenValidMiddleware:
+    """Middleware to check the FxA auth tokens haven't expired, and refresh if
+    necessary.
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        # API requests are validated in SessionIDAuthentication
+        if not getattr(request, 'is_api', False):
+            if SESSION_KEY not in request.session:
+                # Without SESSION_KEY the session is definately anonymous so assume that
+                request.user = AnonymousUser()
+            else:
+                try:
+                    check_and_update_fxa_access_token(request)
+                except IdentificationError:
+                    log.info(f'Failed refreshing access_token for {request.user.id}')
+                    return redirect_for_login(request)
+        return self.get_response(request)
+
+
+class GraphiteMiddlewareNoAuth(MiddlewareMixin):
+    """Like django-statsd's GraphiteMiddleware, but without the request.auth.*
+    pings that would force us to evaluate request.user."""
+
+    def process_response(self, request, response):
+        statsd.incr('response.%s' % response.status_code)
+        return response
+
+    def process_exception(self, request, exception):
+        if not isinstance(exception, Http404):
+            statsd.incr('response.500')
+
+
+class GraphiteRequestTimingMiddleware(GraphiteRequestTimingMiddlewareUpstream):
+    """Like django-statsd's GraphiteRequestTimingMiddleware but handles class
+    based views correctly in Django 4.2, leveraging view_class attribute.
+
+    Inspired from Django's <HttpRequest>.resolver_match._func_path"""
+
+    def process_view(self, request, view_func, view_args, view_kwargs):
+        view = view_func
+        if hasattr(view, 'view_class'):
+            view = view.view_class
+        if not hasattr(view, '__name__'):
+            # A class-based view
+            view = view.__class__
+
+        request._view_module = view.__module__
+        request._view_name = view.__name__
+        request._start_time = time.time()
+
+
+class CSPMiddleware(CSPMiddlewareUpstream):
+    """Like django-csp's middleware, but with custom script-src directive for
+    the admin."""
+
+    def get_policy_parts(self, request, response, report_only=False):
+        policy_parts = super().get_policy_parts(request, response, report_only)
+
+        # We set path_info in LocaleAndAppURLMiddleware to not include the
+        # locale part.
+        if request.path_info.startswith('/admin/models/'):
+            policy_parts.update = {
+                'script-src': f'{settings.SITE_URL}/{request.LANG}/admin/models/jsi18n/'
+            }
+
+        return policy_parts
+
+
+class AdminStepUpMiddleware(MiddlewareMixin):
+    """Middleware to force admins to be reprompted for 2FA when doing POST
+    requests. Should be called last when processing views."""
+
+    def process_view(self, request, view_func, view_args, view_kwargs):
+        if (
+            # We set path_info in LocaleAndAppURLMiddleware to not include the
+            # locale part.
+            request.path_info.startswith('/admin/')
+            and request.method == 'POST'
+            and SESSION_KEY in request.session
+        ):
+            # Django documentation mention that accessing request.POST inside
+            # middleware before the view runs or in process_view() will prevent
+            # any view running after the middleware from being able to modify
+            # the upload handlers for the request, and should normally be
+            # avoided. reprompt_for_2fa_if_necessary() does access request.POST
+            # if reprompting for 2FA ends up being necessary, but in that case,
+            # the view would not be called anyway because it means we're
+            # redirecting the user to re-auth.
+            return reprompt_for_2fa_if_necessary(request)
+        return None
+
+
+class PinguinoSwitchMiddleware:
+    """Middleware to switch to pinguino rather than old devhub.
+    Must be called after LocaleAndAppURLMiddleware"""
+
+    ENABLED = '1'
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        if (
+            request.path_info.startswith('/developers/')
+            and request.COOKIES.get('PINGUINO') == self.ENABLED
+            and waffle.flag_is_active(request, 'pinguino-switch')
+        ):
+            request.urlconf = 'olympia.urls_pinguino'
+
+        response = self.get_response(request)
+
+        return response

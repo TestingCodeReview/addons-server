@@ -1,14 +1,11 @@
 {% extends "includes/forms.html" %}
 
-{% macro some_html_tip(title=None) %}
-<p class="html-support">
-{# L10n: %s is a list of HTML tags. #}
-<span class="tooltip" title="{% if title %}{{ title }}{% else %}{{
-      _('Allowed HTML: %(allowed_html)s', allowed_html='<a href title> <abbr title> <acronym title> <b>
-                             <blockquote> <code> <em> <i> <li> <ol> <strong> <ul>')|safe
-    }}{% endif %}">{{ _('Some HTML supported.') }}</span>
+{% macro supported_syntax_link(settings) %}
+<p class="syntax-support">
+  <a href="{{ settings.EXTENSION_WORKSHOP_URL }}/documentation/develop/create-an-appealing-listing/#make-use-of-markdown" target="_blank" rel="noopener noreferrer">{{ _('Some Markdown supported.') }}</a>
 </p>
 {% endmacro %}
+
 
 {% macro empty_unless(truthy) %}
   {% if truthy %}
@@ -23,7 +20,7 @@
     <div>
       {{ element }}
       {{ element.errors }}
-      <label for="id_{{ element.html_name }}">{{ text }}
+      <label for="id_{{ element.html_name }}">{{ text }}</label>
     </div>
   {% elif element %}
     {{ text }}
@@ -40,7 +37,6 @@
     <td class="select">
       <div>
         <label>{{ form.min.label }}</label> {{ form.min }}
-        {{ form.non_field_errors() }}
         {{ form.min.errors }}
       </div>
       <div><span class="range">&ndash;</span></div>
@@ -48,31 +44,29 @@
         <label>{{ form.max.label }}</label> {{ form.max }}
         {{ form.max.errors }}
       </div>
+      {{ form.non_field_errors() }}
     </td>
-    {% if form.DELETE %}
     <td class="remove">
       <div>
-        <label>{{ form.DELETE.label }} {{ form.DELETE }}</label>
         {{ form.application }}
         {{ form.id }}
-        <a href="#" class="remove"
-           title="{{ _('Remove this application') }}">x</a>
+        {% if form.DELETE %}
+          <label>{{ form.DELETE.label }} {{ form.DELETE }}</label>
+          <a href="#" class="remove" title="{{ _('Remove this application') }}">x</a>
+        {% endif %}
       </div>
     </td>
-    {% endif %}
   </tr>
 {% endmacro %}
 
-{% macro select_cats(max, form) %}
+{% macro select_cats(form) %}
   <div class="addon-app-cats">
     <label>
-      {# L10n: {0} is the maximum number of add-on categories allowed.
-               {1} is the application name. #}
-      {{ ngettext('Select <b>up to {0}</b> {1} category for this add-on:',
-                  'Select <b>up to {0}</b> {1} categories for this add-on:',
-                  max)|format_html(max, form.app.pretty if form.app else '') }}
+      {# L10n: {0} is the maximum number of add-on categories allowed #}
+      {{ ngettext('Select a category for this add-on:',
+                  'Select <b>up to {0}</b> categories for this add-on:',
+                  form.max_categories)|format_html(form.max_categories) }}
     </label>
-    {{ form.application }}
     {{ form.categories }}
     {{ form.categories.errors }}
   </div>

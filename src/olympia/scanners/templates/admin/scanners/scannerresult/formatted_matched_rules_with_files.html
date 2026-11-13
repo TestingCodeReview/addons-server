@@ -1,0 +1,51 @@
+{% load admin_urls %}
+{% load assay %}
+{% load scanners %}
+
+{# This template can be used for scanner results and scanner query results, #}
+{# in the admin or in reviewer tools. Keep it generic.                      #}
+{# Note that this is a django template and not jinja2!                      #}
+
+<div>
+  {% if display_scanner %}
+  <div class="scanner-result">
+    <a class="result-link" href="{% url 'admin:scanners_scannerresult_change' obj.pk %}">{{ obj }}</a>
+  </div>
+  {% endif %}
+  {% for rule in matched_rules %}
+  <div class="matched-rules">
+    <div class="matched-rules-rule">
+      <strong>Rule:</strong> <a class="rule-link" href="{% url rule_change_urlname rule.pk %}" title="{{ rule.description }}">{{ rule.name }}</a>
+    </div>
+    <div class="matched-rules-files">
+      {% if display_data %}<details>{% endif %}
+      <ul>
+      {% for item in rule.files_and_data %}
+        <li>
+        {% if file_id and item.filename %}
+        <div>
+          <a href="{% assay_url addon_guid addon_version filepath=item.filename %}">
+            {{ item.filename }}
+          </a>
+        </div>
+        {% elif 'filename' in item %}
+          {{ item.filename }}
+        {% else %}
+          {{ item|format_scanners_data }}
+        {% endif %}
+        </li>
+        {% if display_data and item.data %}
+          <li class="extra_data">
+            {{ item.data|format_scanners_data }}
+          </li>
+        {% endif %}
+      {% endfor %}
+      {% if rule.files_not_shown > 0 %}
+        <li>…and {{ rule.files_not_shown }} more files</li>
+      {% endif %}
+      </ul>
+      {% if display_data %}</details>{% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>

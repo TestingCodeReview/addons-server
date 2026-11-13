@@ -1,39 +1,28 @@
-# -*- coding: utf-8 -*-
 import mimetypes
 import os
-
 from datetime import datetime, timedelta
-from six.moves.urllib_parse import urljoin
+from unittest.mock import Mock, patch
 
 from django.conf import settings
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.urls import NoReverseMatch
 from django.test.client import RequestFactory
-from django.test.utils import override_settings
-from django.utils import translation
+from django.urls import NoReverseMatch
 from django.utils.encoding import force_bytes
 
 import pytest
 
-from mock import Mock, patch
-from pyquery import PyQuery
-
 import olympia
-
 from olympia import amo
 from olympia.amo import urlresolvers, utils
+from olympia.amo.reverse import set_url_prefix
 from olympia.amo.templatetags import jinja_helpers
-from olympia.amo.tests import TestCase, reverse_ns
+from olympia.amo.tests import SQUOTE_ESCAPED, reverse_ns
 from olympia.amo.utils import ImageCheck
-from olympia.versions.models import License
 
 
 ADDONS_TEST_FILES = os.path.join(
-    os.path.dirname(olympia.__file__),
-    'devhub', 'tests', 'addons')
-
-
-pytestmark = pytest.mark.django_db
+    os.path.dirname(olympia.__file__), 'devhub', 'tests', 'addons'
+)
 
 
 def render(s, context=None):
@@ -41,11 +30,6 @@ def render(s, context=None):
         context = {}
     t = utils.from_string(s)
     return t.render(context)
-
-
-def test_strip_controls():
-    # We want control codes like \x0c to disappear.
-    assert 'I ove you' == jinja_helpers.strip_controls('I \x0cove you')
 
 
 def test_finalize():
@@ -62,33 +46,26 @@ def test_slugify_spaces():
 
 def test_page_title():
     request = Mock()
-    request.APP = amo.ANDROID
     title = 'Oh hai!'
     s = render('{{ page_title("%s") }}' % title, {'request': request})
-    assert s == '%s :: Add-ons for Firefox for Android' % title
-
-    # pages without app should show a default
-    request.APP = None
-    s = render('{{ page_title("%s") }}' % title, {'request': request})
-    assert s == '%s :: Add-ons' % title
+    assert s == '%s :: Add-ons for Firefox' % title
 
     # Check the dirty unicodes.
-    request.APP = amo.FIREFOX
-    s = render('{{ page_title(x) }}',
-               {'request': request,
-                'x': force_bytes(u'\u05d0\u05d5\u05e1\u05e3')})
+    s = render(
+        '{{ page_title(x) }}',
+        {'request': request, 'x': force_bytes('\u05d0\u05d5\u05e1\u05e3')},
+    )
 
 
 def test_page_title_markup():
     """If the title passed to page_title is a jinja2 Markup object, don't cast
     it back to a string or it'll get double escaped. See issue #1062."""
     request = Mock()
-    request.APP = amo.FIREFOX
     # Markup isn't double escaped.
     res = render(
-        '{{ page_title("{0}"|format_html("It\'s all text")) }}',
-        {'request': request})
-    assert res == 'It&#39;s all text :: Add-ons for Firefox'
+        '{{ page_title("{0}"|format_html("It\'s all text")) }}', {'request': request}
+    )
+    assert res == f'It{SQUOTE_ESCAPED}s all text :: Add-ons for Firefox'
 
 
 def test_template_escaping():
@@ -102,64 +79,64 @@ def test_template_escaping():
     # Simple HTML in a translatable string, with |format_html works
     # as expected
     expected = '<a href="...">This is a test</a>'
-    original = (
-        '{{ _(\'<a href="...">{0}</a>\')|format_html("This is a test") }}')
+    original = '{{ _(\'<a href="...">{0}</a>\')|format_html("This is a test") }}'
     assert render(original) == expected
 
     # The html provided in the translatable string won't be escaped
     # but all arguments are.
     expected = '<a href="...">This is a &lt;h1&gt;test&lt;/h1&gt;</a>'
     original = (
-        '{{ _(\'<a href="...">{0}</a>\')|format_html('
-        '"This is a <h1>test</h1>") }}')
+        '{{ _(\'<a href="...">{0}</a>\')|format_html("This is a <h1>test</h1>") }}'
+    )
     assert render(original) == expected
 
     # Unless marked explicitly as safe
     expected = '<a href="...">This is a <h1>test</h1></a>'
     original = (
-        '{{ _(\'<a href="...">{0}</a>\')'
-        '|format_html("This is a <h1>test</h1>"|safe) }}')
+        '{{ _(\'<a href="...">{0}</a>\')|format_html("This is a <h1>test</h1>"|safe) }}'
+    )
     assert render(original) == expected
 
     # Document how newstyle gettext behaves, everything that get's passed in
     # like that needs to be escaped!
     expected = '&lt;script&gt;&lt;/script&gt;'
     assert render('{{ _(foo) }}', {'foo': '<script></script>'}) != expected
-    assert render(
-        '{{ _(foo|escape) }}', {'foo': '<script></script>'}) == expected
+    assert render('{{ _(foo|escape) }}', {'foo': '<script></script>'}) == expected
 
     # Various tests for gettext related helpers and make sure they work
     # properly just as `_()` does.
     expected = '<b>5 users</b>'
-    assert render(
-        '{{ ngettext(\'<b>{0} user</b>\', \'<b>{0} users</b>\', 2)'
-        '|format_html(5) }}'
-    ) == expected
+    assert (
+        render(
+            "{{ ngettext('<b>{0} user</b>', '<b>{0} users</b>', 2)|format_html(5) }}"
+        )
+        == expected
+    )
 
     # You could also mark the whole output as |safe but note that this
     # still escapes the arguments of |format_html unless explicitly
     # marked as safe
     expected = '<b>&lt;script&gt; users</b>'
-    assert render(
-        '{{ ngettext(\'<b>{0} user</b>\', \'<b>{0} users</b>\', 2)'
-        '|format_html("<script>")|safe }}'
-    ) == expected
+    assert (
+        render(
+            "{{ ngettext('<b>{0} user</b>', '<b>{0} users</b>', 2)"
+            '|format_html("<script>")|safe }}'
+        )
+        == expected
+    )
 
 
-@patch('olympia.amo.templatetags.jinja_helpers.urlresolvers.reverse')
+@patch('olympia.amo.templatetags.jinja_helpers.reverse')
 def test_url(mock_reverse):
     render('{{ url("viewname", 1, z=2) }}')
-    mock_reverse.assert_called_with('viewname', args=(1,), kwargs={'z': 2},
-                                    add_prefix=True)
+    mock_reverse.assert_called_with(
+        'viewname', args=(1,), kwargs={'z': 2}, add_prefix=True
+    )
 
     render('{{ url("viewname", 1, z=2, host="myhost") }}')
-    mock_reverse.assert_called_with('viewname', args=(1,), kwargs={'z': 2},
-                                    add_prefix=True)
-
-
-def test_url_src():
-    fragment = render('{{ url("addons.detail", "a3615", src="xxx") }}')
-    assert fragment.endswith('?src=xxx')
+    mock_reverse.assert_called_with(
+        'viewname', args=(1,), kwargs={'z': 2}, add_prefix=True
+    )
 
 
 def test_drf_url():
@@ -170,7 +147,8 @@ def test_drf_url():
     rendered = render(fragment, context={'request': request})
     # As no /vX/ in the request, RESTFRAMEWORK['DEFAULT_VERSION'] is used.
     assert rendered == jinja_helpers.absolutify(
-        reverse_ns('addon-detail', args=['a3615']))
+        reverse_ns('addon-detail', args=['a3615'])
+    )
 
     with pytest.raises(NoReverseMatch):
         # Without a request it can't resolve the name correctly.
@@ -179,10 +157,13 @@ def test_drf_url():
 
 def test_urlparams():
     url = '/en-US/firefox/themes/category'
-    c = {'base': url,
-         'base_frag': url + '#hash',
-         'base_query': url + '?x=y',
-         'sort': 'name', 'frag': 'frag'}
+    c = {
+        'base': url,
+        'base_frag': url + '#hash',
+        'base_query': url + '?x=y',
+        'sort': 'name',
+        'frag': 'frag',
+    }
 
     # Adding a query.
     s = render('{{ base_frag|urlparams(sort=sort) }}', c)
@@ -202,7 +183,7 @@ def test_urlparams():
 
     # Adding query with existing params.
     s = render('{{ base_query|urlparams(frag, sort=sort) }}', c)
-    amo.tests.assert_url_equal(s, '%s?sort=name&amp;x=y#frag' % url)
+    amo.tests.assert_url_equal(s, '%s?sort=name&x=y#frag' % url)
 
     # Replacing a query param.
     s = render('{{ base_query|urlparams(frag, x="z") }}', c)
@@ -217,8 +198,24 @@ def test_urlparams():
     assert s == url
 
 
+def test_urlparams_multiple_values():
+    url = 'https://example.com/?foo=one&foo=two'
+    assert (
+        utils.urlparams(url, bar='extra')
+        == 'https://example.com/?foo=one&foo=two&bar=extra'
+    )
+
+    # Replacing value for existing param with multiple values
+    url = 'https://example.com/?foo=one&foo=two'
+    assert utils.urlparams(url, foo='newvalue') == 'https://example.com/?foo=newvalue'
+
+    # Removing existing param with multiple values
+    url = 'https://example.com/?foo=one&foo=two'
+    assert utils.urlparams(url, foo=None) == 'https://example.com/'
+
+
 def test_urlparams_unicode():
-    url = u'/xx?evil=reco\ufffd\ufffd\ufffd\u02f5'
+    url = '/xx?evil=reco\ufffd\ufffd\ufffd\u02f5'
     utils.urlparams(url)
 
 
@@ -226,14 +223,13 @@ def test_urlparams_returns_safe_string():
     s = render('{{ "https://foo.com/"|urlparams(param="help+me") }}', {})
     assert s == 'https://foo.com/?param=help%2Bme'
 
-    s = render(
-        u'{{ "https://foo.com/"|urlparams(param="obiwankénobi") }}', {})
+    s = render('{{ "https://foo.com/"|urlparams(param="obiwankénobi") }}', {})
     assert s == 'https://foo.com/?param=obiwank%C3%A9nobi'
 
-    s = render(u'{{ "https://foo.com/"|urlparams(param=42) }}', {})
+    s = render('{{ "https://foo.com/"|urlparams(param=42) }}', {})
     assert s == 'https://foo.com/?param=42'
 
-    s = render(u'{{ "https://foo.com/"|urlparams(param="") }}', {})
+    s = render('{{ "https://foo.com/"|urlparams(param="") }}', {})
     assert s == 'https://foo.com/?param='
 
     s = render('{{ "https://foo.com/"|urlparams(param="help%2Bme") }}', {})
@@ -242,8 +238,29 @@ def test_urlparams_returns_safe_string():
     s = render('{{ "https://foo.com/"|urlparams(param="a%20b") }}', {})
     assert s == 'https://foo.com/?param=a+b'
 
-    s = render('{{ "https://foo.com/"|urlparams(param="%AAA") }}', {})
-    assert s == 'https://foo.com/?param=%AAA'
+    s = render('{{ "https://foo.com/"|urlparams(param="%40something") }}', {})
+    assert s == 'https://foo.com/?param=%40something'
+
+    string = render(
+        '{{ unsafe_url|urlparams }}',
+        {
+            'unsafe_url': "http://url.with?foo=<script>alert('awesome')</script>"
+            '&baa=that'
+        },
+    )
+    assert string == (
+        'http://url.with?foo=%3Cscript%3Ealert%28%27awesome%27%29%3C%2Fscript%3E'
+        '&baa=that'
+    )
+
+    string = render(
+        '{{ "http://safe.url?baa=that"|urlparams(foo=unsafe_param) }}',
+        {'unsafe_param': "<script>alert('awesome')</script>"},
+    )
+    assert string == (
+        'http://safe.url?baa=that'
+        '&foo=%3Cscript%3Ealert%28%27awesome%27%29%3C%2Fscript%3E'
+    )
 
 
 def test_isotime():
@@ -254,19 +271,11 @@ def test_isotime():
     assert s == ''
 
 
-def test_epoch():
-    time = datetime(2009, 12, 25, 10, 11, 12)
-    s = render('{{ d|epoch }}', {'d': time})
-    assert s == '1261735872'
-    s = render('{{ d|epoch }}', {'d': None})
-    assert s == ''
-
-
 def test_locale_url():
     rf = RequestFactory()
     request = rf.get('/de', SCRIPT_NAME='/z')
     prefixer = urlresolvers.Prefixer(request)
-    urlresolvers.set_url_prefix(prefixer)
+    set_url_prefix(prefixer)
     s = render('{{ locale_url("mobile") }}')
     assert s == '/z/de/mobile'
 
@@ -286,186 +295,68 @@ def test_external_url():
         settings.REDIRECT_SECRET_KEY = secretkey
 
 
-@patch(
-    'olympia.amo.templatetags.jinja_helpers.urlresolvers.'
-    'get_outgoing_url')
+@patch('olympia.amo.templatetags.jinja_helpers.urlresolvers.get_outgoing_url')
 def test_linkify_bounce_url_callback(mock_get_outgoing_url):
     mock_get_outgoing_url.return_value = 'bar'
 
-    res = urlresolvers.linkify_bounce_url_callback({(None, 'href'): 'foo'})
+    class DummyNode:
+        attrs: dict
+
+        def __init__(self, attrs):
+            self.attrs = attrs
+
+    node = DummyNode({'href': 'foo'})
+    urlresolvers.linkify_bounce_url_callback(node)
 
     # Make sure get_outgoing_url was called.
-    assert res == {(None, 'href'): 'bar'}
+    assert node.attrs['href'] == 'bar'
     mock_get_outgoing_url.assert_called_with('foo')
 
 
-@patch(
-    'olympia.amo.templatetags.jinja_helpers.urlresolvers.'
-    'linkify_bounce_url_callback')
-def test_linkify_with_outgoing_text_links(mock_linkify_bounce_url_callback):
-    def side_effect(attrs, new=False):
-        attrs[(None, 'href')] = 'bar'
-        return attrs
-
-    mock_linkify_bounce_url_callback.side_effect = side_effect
-
-    res = urlresolvers.linkify_with_outgoing('a text http://example.com link')
-    # Use PyQuery because the attributes could be rendered in any order.
-    doc = PyQuery(res)
-    assert doc('a[href="bar"][rel="nofollow"]')[0].text == 'http://example.com'
-
-
-@patch(
-    'olympia.amo.templatetags.jinja_helpers.urlresolvers.'
-    'linkify_bounce_url_callback')
-def test_linkify_with_outgoing_markup_links(mock_linkify_bounce_url_callback):
-    def side_effect(attrs, new=False):
-        attrs[(None, 'href')] = 'bar'
-        return attrs
-
-    mock_linkify_bounce_url_callback.side_effect = side_effect
-
-    res = urlresolvers.linkify_with_outgoing(
-        'a markup <a href="http://example.com">link</a> with text')
-    # Use PyQuery because the attributes could be rendered in any order.
-    doc = PyQuery(res)
-    assert doc('a[href="bar"][rel="nofollow"]')[0].text == 'link'
-
-
-class TestLicenseLink(TestCase):
-
-    def test_license_link(self):
-        mit = License.objects.create(
-            name='MIT/X11 License', builtin=6, url='http://m.it')
-        copyright = License.objects.create(
-            name='All Rights Reserved', icons='copyr', builtin=7)
-        cc = License.objects.create(
-            name='Creative Commons', url='http://cre.at', builtin=8,
-            some_rights=True, icons='cc-attrib cc-noncom cc-share')
-        cc.save()
-        expected = {
-            mit: (
-                '<ul class="license"><li class="text">'
-                '<a href="http://m.it">MIT/X11 License</a></li></ul>'),
-            copyright: (
-                '<ul class="license"><li class="icon copyr"></li>'
-                '<li class="text">All Rights Reserved</li></ul>'),
-            cc: (
-                '<ul class="license"><li class="icon cc-attrib"></li>'
-                '<li class="icon cc-noncom"></li><li class="icon cc-share">'
-                '</li><li class="text"><a href="http://cre.at" '
-                'title="Creative Commons">Some rights reserved</a></li></ul>'),
-        }
-        for lic, ex in expected.items():
-            res = render('{{ license_link(lic) }}', {'lic': lic})
-            res = ''.join([s.strip() for s in res.split('\n')])
-            assert res == ex
-
-    def test_theme_license_link(self):
-        s = render('{{ license_link(lic) }}', {'lic': amo.LICENSE_COPYRIGHT})
-
-        ul = PyQuery(s)('.license')
-        assert ul.find('.icon').length == 1
-        assert ul.find('.icon.copyr').length == 1
-
-        text = ul.find('.text')
-        assert text.find('a').length == 0
-        assert text.text() == 'All Rights Reserved'
-
-        s = render('{{ license_link(lic) }}', {'lic': amo.LICENSE_CC_BY_NC_SA})
-
-        ul = PyQuery(s)('.license')
-        assert ul.find('.icon').length == 3
-        assert ul.find('.icon.cc-attrib').length == 1
-        assert ul.find('.icon.cc-noncom').length == 1
-        assert ul.find('.icon.cc-share').length == 1
-
-        link = ul.find('.text a')
-        assert link.find('a').length == 0
-        assert link.text() == 'Some rights reserved'
-        assert link.attr('href') == amo.LICENSE_CC_BY_NC_SA.url
-
-    def test_license_link_xss(self):
-        mit = License.objects.create(
-            name='<script>', builtin=6, url='<script>')
-        copyright = License.objects.create(
-            name='<script>', icons='<script>', builtin=7)
-        cc = License.objects.create(
-            name='<script>', url='<script>', builtin=8,
-            some_rights=True, icons='<script> cc-noncom cc-share')
-        cc.save()
-        expected = {
-            mit: (
-                '<ul class="license"><li class="text">'
-                '<a href="&lt;script&gt;">&lt;script&gt;</a></li></ul>'),
-            copyright: (
-                '<ul class="license"><li class="icon &lt;script&gt;"></li>'
-                '<li class="text">&lt;script&gt;</li></ul>'),
-            cc: (
-                '<ul class="license"><li class="icon &lt;script&gt;"></li>'
-                '<li class="icon cc-noncom"></li><li class="icon cc-share">'
-                '</li><li class="text"><a href="&lt;script&gt;" '
-                'title="&lt;script&gt;">Some rights reserved</a></li></ul>'),
-        }
-        for lic, ex in expected.items():
-            res = render('{{ license_link(lic) }}', {'lic': lic})
-            res = ''.join([s.strip() for s in res.split('\n')])
-            assert res == ex
-
-
 def get_image_path(name):
-    return os.path.join(
-        settings.ROOT, 'src', 'olympia', 'amo', 'tests', 'images', name)
+    return os.path.join(settings.ROOT, 'src', 'olympia', 'amo', 'tests', 'images', name)
 
 
 def get_uploaded_file(name):
-    data = open(get_image_path(name), mode='rb').read()
-    return SimpleUploadedFile(name, data,
-                              content_type=mimetypes.guess_type(name)[0])
+    with open(get_image_path(name), mode='rb') as f:
+        data = f.read()
+    return SimpleUploadedFile(name, data, content_type=mimetypes.guess_type(name)[0])
 
 
 def get_addon_file(name):
     return os.path.join(ADDONS_TEST_FILES, name)
 
 
-class TestAnimatedImages(TestCase):
-
-    def test_animated_images(self):
-        img = ImageCheck(open(get_image_path('animated.png'), mode='rb'))
-        assert img.is_animated()
-        img = ImageCheck(open(get_image_path('non-animated.png'), mode='rb'))
-        assert not img.is_animated()
-
-        img = ImageCheck(open(get_image_path('animated.gif'), mode='rb'))
-        assert img.is_animated()
-        img = ImageCheck(open(get_image_path('non-animated.gif'), mode='rb'))
-        assert not img.is_animated()
-
-    def test_junk(self):
-        img = ImageCheck(open(__file__, 'rb'))
-        assert not img.is_image()
-        img = ImageCheck(open(get_image_path('non-animated.gif'), mode='rb'))
-        assert img.is_image()
+VALID_IMAGE_TYPES_WITH_GIF = amo.VALID_IMAGE_TYPES + ('image/gif',)
 
 
-@pytest.mark.needs_locales_compilation
-def test_site_nav():
-    request = Mock()
-    request.APP = amo.FIREFOX
-    request.LANG = 'en-US'
-    content = jinja_helpers.site_nav({'request': request})
-    assert 'id="site-nav"' in content
+@patch.object(amo, 'VALID_IMAGE_TYPES', VALID_IMAGE_TYPES_WITH_GIF)
+def test_image_checker_animated_images():
+    with open(get_image_path('animated.png'), mode='rb') as f:
+        assert ImageCheck(f).is_valid_image()
+        assert ImageCheck(f).is_animated()
+    with open(get_image_path('non-animated.png'), mode='rb') as f:
+        assert ImageCheck(f).is_valid_image()
+        assert not ImageCheck(f).is_animated()
+    with open(get_image_path('animated.gif'), mode='rb') as f:
+        assert ImageCheck(f).is_valid_image()
+        assert ImageCheck(f).is_animated()
+    with open(get_image_path('non-animated.gif'), mode='rb') as f:
+        assert ImageCheck(f).is_valid_image()
+        assert not ImageCheck(f).is_animated()
 
-    assert 'Extensions' in content
 
-    with translation.override('de'):
-        request.LANG = 'de'
-        content_de = jinja_helpers.site_nav({'request': request})
-        assert 'id="site-nav"' in content_de
+@patch.object(amo, 'VALID_IMAGE_TYPES', VALID_IMAGE_TYPES_WITH_GIF)
+def test_image_checker_junk():
+    with open(__file__, 'rb') as f:
+        assert not ImageCheck(f).is_valid_image()
+    with open(get_image_path('non-animated.gif'), mode='rb') as f:
+        assert ImageCheck(f).is_valid_image()
 
-    assert content_de != content
 
-    assert 'Erweiterungen' in content_de
+def test_image_checker_unsupported_format():
+    with open(get_image_path('non-animated.gif'), mode='rb') as f:
+        assert not ImageCheck(f).is_valid_image()
 
 
 def test_jinja_trans_monkeypatch():
@@ -476,44 +367,73 @@ def test_jinja_trans_monkeypatch():
     render('{% trans come_on=1 %}%(come_on)z{% endtrans %}')
 
 
-def test_absolutify():
-    assert jinja_helpers.absolutify('/woo'), urljoin(
-        settings.SITE_URL == '/woo')
-    assert jinja_helpers.absolutify('https://addons.mozilla.org') == (
-        'https://addons.mozilla.org')
+@pytest.mark.parametrize(
+    'url,site,expected',
+    [
+        ('', None, settings.EXTERNAL_SITE_URL),
+        ('', '', settings.EXTERNAL_SITE_URL),
+        (None, None, settings.EXTERNAL_SITE_URL),
+        ('foo', None, f'{settings.EXTERNAL_SITE_URL}/foo'),
+        ('foobar', 'http://amo.com', 'http://amo.com/foobar'),
+        ('abc', 'https://localhost', 'https://localhost/abc'),
+        ('http://addons.mozilla.org', None, 'http://addons.mozilla.org'),
+        ('https://addons.mozilla.org', None, 'https://addons.mozilla.org'),
+        ('https://amo.com', 'https://addons.mozilla.org', 'https://amo.com'),
+        ('woo', 'www', 'woo'),
+    ],
+)
+def test_absolutify(url, site, expected):
+    """Make sure we correct join a base URL and a possibly relative URL."""
+    assert jinja_helpers.absolutify(url, site) == expected
 
 
 def test_timesince():
-    month_ago = datetime.now() - timedelta(days=30)
-    assert jinja_helpers.timesince(month_ago) == u'1 month ago'
-    assert jinja_helpers.timesince(None) == u''
+    month_ago = datetime.now() - timedelta(days=31, seconds=0.001)
+    assert jinja_helpers.timesince(month_ago) == '1 month ago'
+    two_weeks_ago = datetime.now() - timedelta(days=14, seconds=0.001)
+    assert jinja_helpers.timesince(two_weeks_ago) == '2 weeks ago'
+    assert jinja_helpers.timesince(None) == ''
+
+
+def test_timeuntil():
+    a_month_in_the_future = datetime.now() + timedelta(days=31, seconds=0.001)
+    assert jinja_helpers.timeuntil(a_month_in_the_future) == '1 month'
+    two_weeks_in_the_future = datetime.now() + timedelta(days=14, hours=1)
+    assert jinja_helpers.timeuntil(two_weeks_in_the_future) == '2 weeks'
 
 
 def test_format_unicode():
     # This makes sure there's no UnicodeEncodeError when doing the string
     # interpolation.
-    assert render(u'{{ "foo {0}"|format_html("baré") }}') == u'foo baré'
+    assert render('{{ "foo {0}"|format_html("baré") }}') == 'foo baré'
 
 
-class TestStoragePath(TestCase):
+SPACELESS_TEMPLATE = """
+<div>    <div>outside</div>
 
-    @override_settings(ADDONS_PATH=None, MEDIA_ROOT="/path/")
-    def test_without_settings(self):
-        del settings.ADDONS_PATH
-        path = jinja_helpers.user_media_path('addons')
-        assert path == '/path/addons'
+    <b>tag</b>   <em>is fine</em>
+    {% spaceless %}
+    <div prop="   inside props is left alone   ">not</div>
 
-    @override_settings(ADDONS_PATH="/another/path/")
-    def test_with_settings(self):
-        path = jinja_helpers.user_media_path('addons')
-        assert path == '/another/path/'
+    <i>space </i>   <span>between
+    </span>
+
+    {% endspaceless %}
+<div>outside again </div>
+
+</div>
+"""
 
 
-class TestMediaUrl(TestCase):
+SPACELESS_RESULT = """
+<div>    <div>outside</div>
 
-    @override_settings(USERPICS_URL=None)
-    def test_without_settings(self):
-        del settings.USERPICS_URL
-        settings.MEDIA_URL = '/mediapath/'
-        url = jinja_helpers.user_media_url('userpics')
-        assert url == '/mediapath/userpics/'
+    <b>tag</b>   <em>is fine</em>
+    <div prop="   inside props is left alone   ">not</div><i>space </i><span>between
+    </span><div>outside again </div>
+
+</div>"""
+
+
+def test_spaceless_extension():
+    assert render(SPACELESS_TEMPLATE) == SPACELESS_RESULT

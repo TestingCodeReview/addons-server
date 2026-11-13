@@ -1,4 +1,4 @@
-{% extends "devhub/base_impala.html" %}
+{% extends "devhub/base.html" %}
 
 
 {% set title = _('Manage My Submissions') %}
@@ -6,7 +6,7 @@
 {% block title %}{{ dev_page_title(title) }}{% endblock %}
 
 {% block content %}
-  <section class="primary">
+  <section>
     <header class="hero">
       <h1>{{ title }}</h1>
 
@@ -24,13 +24,8 @@
        class="button prominent">{{ _('Submit a New Add-on') }}</a>
   </p>
   <p class="submit-theme submit-cta">
-    {% if waffle.switch('disable-lwt-uploads') %}
-    <a href="{{ url('devhub.submit.agreement') }}"
+    <a href="{{ url('devhub.submit.theme.agreement') }}"
        class="button prominent">{{ _('Submit a New Theme') }}</a>
-    {% else %}
-        <a href="{{ url('devhub.themes.submit') }}"
-       class="button prominent">{{ _('Submit a New Theme') }}</a>
-    {% endif %}
   </p>
   <div class="item recent-activity">
     <h3>
@@ -44,7 +39,7 @@
           <li class="item">
             {{ item }}
             <span class="activity-timestamp">
-            {% trans user=item.user|user_link, ago=item.created|timesince %}
+            {% trans user=item.user.name, ago=item.created|timesince %}
             {{ ago }} by {{ user }}
             {% endtrans %}
             </span>
@@ -63,11 +58,13 @@
   {% include "addons/includes/dashboard_tabs.html" %}
   <section class="dashboard primary" role="main">
     <div class="listing island hero c">
-      {{ impala_addon_listing_header(request.get_full_path(), search_filter=filter) }}
+      {{ addon_listing_header(request.get_full_path(), search_filter=filter) }}
       <div class="items">
         {{ dev_addon_listing_items(addons.object_list) }}
       </div>
-      {{ addons|impala_paginator }}
+      {% if addons.paginator.num_pages > 1 %}
+        {{ addons|paginator }}
+      {% endif %}
     </div>
   </section>
 {% endif %}
@@ -81,11 +78,13 @@
     </h2>
     {% include "addons/includes/dashboard_tabs.html" %}
     <div class="listing island hero c">
-      {{ impala_addon_listing_header(request.get_full_path(), search_filter=filter) }}
+      {{ addon_listing_header(request.get_full_path(), search_filter=filter) }}
       <div class="items">
         {{ dev_addon_listing_items(themes.object_list) }}
       </div>
-      {{ themes|impala_paginator }}
+      {% if themes.paginator.num_pages > 1 %}
+        {{ themes|paginator }}
+      {% endif %}
     </div>
   </section>
 {% endif %}

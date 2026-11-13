@@ -1,18 +1,18 @@
 Hello,
 
-{{ author }}, a reviewer at addons.mozilla.org, found an issue when reviewing version {{ number }} of the add-on {{ name }} and requests additional information. You are receiving this email because {{ email_reason }}.
+Thanks for your work on {{ name }}. A reviewer from the addons.mozilla.org team has taken a look at version {{ number }} and would like to share some feedback with you. You are receiving this email because {{ email_reason }}.
 
-*********
-{{ author }} wrote:
+Here is what {{ author }} shared:
 
 {{ comments|safe }}
 
-*********
+{% if has_attachment %}
+They have also attached a file. You can review it and reply by visiting {{ url }}.
+{% else %}
+When you are ready, simply reply to this email or visit {{ url }} to respond.
+{% endif %}
 
-To respond, please reply to this email or visit {{ url }}. {% if is_info_request and number_of_days_left %}If we do not hear from you within {{ number_of_days_left }} of this notification, this listing may be removed from addons.mozilla.org.{% endif %}
-
-
-Thank you for your attention.
+We are grateful for the time and care you put into your add-on, and we are here to help if anything is unclear.
 
 -- 
 Mozilla Add-ons

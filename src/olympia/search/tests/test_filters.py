@@ -1,135 +1,204 @@
-# -*- coding: utf-8 -*-
 import copy
+from datetime import date, datetime, timedelta
+from unittest.mock import Mock, patch
 
+from django.test import SimpleTestCase
 from django.test.client import RequestFactory
 from django.utils import translation
+from django.utils.http import urlsafe_base64_encode
 
-import six
-
-from elasticsearch_dsl import Search
-from mock import Mock, patch
+import time_machine
+from elasticsearch.dsl import Search
 from rest_framework import serializers
 
 from olympia import amo
-from olympia.amo.tests import TestCase
 from olympia.constants.categories import CATEGORIES
+from olympia.constants.promoted import BADGED_GROUPS, RECOMMENDED_API_NAME
 from olympia.search.filters import (
-    ReviewedContentFilter, SearchParameterFilter, SearchQueryFilter,
-    SortingFilter)
+    AddonCreatedQueryParam,
+    AddonRatingQueryParam,
+    AddonUpdatedQueryParam,
+    AddonUsersQueryParam,
+    ReviewedContentFilter,
+    SearchParameterFilter,
+    SearchQueryFilter,
+    SortingFilter,
+)
 
 
-class FilterTestsBase(TestCase):
+class FilterTestsBase(SimpleTestCase):
     # Base TestCase class - Does not need to inherit from ESTestCase as the
     # queries will never actually be executed.
 
     def setUp(self):
-        super(FilterTestsBase, self).setUp()
-        self.req = RequestFactory().get('/')
+        super().setUp()
         self.view_class = Mock()
 
     def _filter(self, req=None, data=None):
-        req = req or RequestFactory().get('/', data=data or {})
+        if not req:
+            req = RequestFactory().get('/api/v5/', data=data or {})
+            req.version = 'v5'
         queryset = Search()
         for filter_class in self.filter_classes:
-            queryset = filter_class().filter_queryset(req, queryset,
-                                                      self.view_class)
+            queryset = filter_class().filter_queryset(req, queryset, self.view_class)
         return queryset.to_dict()
 
 
 class TestQueryFilter(FilterTestsBase):
-
     filter_classes = [SearchQueryFilter]
 
-    def _test_q(self, qs):
-        # Spot check a few queries.
+    def _test_q(self, qs, query):
         should = qs['query']['function_score']['query']['bool']['should']
 
-        expected = {
+        assert len(should) == 8
+
+        assert should[0] == {
+            'dis_max': {
+                '_name': 'DisMax(Term(name.raw), Term(name_l10n_en-us.raw), '
+                'Term(name_l10n_en-ca.raw), '
+                'Term(name_l10n_en-gb.raw))',
+                'boost': 100.0,
+                'queries': [
+                    {'term': {'name.raw': query}},
+                    {'term': {'name_l10n_en-us.raw': query}},
+                    {'term': {'name_l10n_en-ca.raw': query}},
+                    {'term': {'name_l10n_en-gb.raw': query}},
+                ],
+            }
+        }
+
+        assert should[1] == {
+            'multi_match': {
+                '_name': 'MultiMatch(name_l10n_en-us,name_l10n_en-ca,name_l10n_en-gb)',
+                'analyzer': 'english',
+                'boost': 5.0,
+                'fields': ['name_l10n_en-us', 'name_l10n_en-ca', 'name_l10n_en-gb'],
+                'operator': 'and',
+                'query': query,
+            }
+        }
+
+        assert should[2] == {
             'match_phrase': {
                 'name': {
-                    'query': 'tea pot', 'boost': 8.0, 'slop': 1,
                     '_name': 'MatchPhrase(name)',
+                    'boost': 8.0,
+                    'query': query,
+                    'slop': 1,
                 }
             }
         }
-        assert expected in should
 
-        expected = {
-            'prefix': {
-                'name': {
-                    'boost': 3.0, 'value': 'tea pot',
-                    '_name': 'Prefix(name)',
-                }
-            }
-        }
-        assert expected in should
-
-        expected = {
+        assert should[3] == {
             'match': {
-                'name_l10n_english': {
-                    'query': 'tea pot', 'boost': 5.0,
-                    'analyzer': 'english',
+                'name': {
+                    '_name': 'Match(name)',
+                    'analyzer': 'standard',
+                    'query': query,
+                    'boost': 6.0,
                     'operator': 'and',
-                    '_name': 'Match(name_l10n_english)',
                 }
             }
         }
-        assert expected in should
 
-        expected = {
+        assert should[4] == {
+            'prefix': {'name': {'_name': 'Prefix(name)', 'value': query, 'boost': 3.0}}
+        }
+
+        assert should[5] == {
+            'dis_max': {
+                '_name': 'DisMax(FuzzyMatch(name), Match(name.trigrams))',
+                'boost': 4.0,
+                'queries': [
+                    {
+                        'match': {
+                            'name': {
+                                'fuzziness': 'AUTO',
+                                'minimum_should_match': '2<2 3<-25%',
+                                'prefix_length': 2,
+                                'query': query,
+                            }
+                        }
+                    },
+                    {
+                        'match': {
+                            'name.trigrams': {
+                                'minimum_should_match': '75%',
+                                'query': query,
+                            }
+                        }
+                    },
+                ],
+            }
+        }
+
+        assert should[6] == {
             'multi_match': {
-                '_name': (
-                    'MultiMatch(Match(summary),Match(summary_l10n_english))'),
-                'query': 'tea pot',
-                'operator': 'and',
-                'fields': ['summary', 'summary_l10n_english'],
+                '_name': 'MultiMatch(Match(summary), '
+                'Match(summary_l10n_en-us), '
+                'Match(summary_l10n_en-ca), '
+                'Match(summary_l10n_en-gb))',
+                'query': query,
+                'fields': [
+                    'summary',
+                    'summary_l10n_en-us',
+                    'summary_l10n_en-ca',
+                    'summary_l10n_en-gb',
+                ],
                 'boost': 3.0,
-            }
-        }
-        assert expected in should
-
-        expected = {
-            'multi_match': {
-                '_name': (
-                    'MultiMatch(Match(description),'
-                    'Match(description_l10n_english))'),
-                'query': 'tea pot',
                 'operator': 'and',
-                'fields': ['description', 'description_l10n_english'],
-                'boost': 2.0,
             }
         }
-        assert expected in should
+
+        assert should[7] == {
+            'multi_match': {
+                '_name': 'MultiMatch(Match(description), '
+                'Match(description_l10n_en-us), '
+                'Match(description_l10n_en-ca), '
+                'Match(description_l10n_en-gb))',
+                'query': query,
+                'fields': [
+                    'description',
+                    'description_l10n_en-us',
+                    'description_l10n_en-ca',
+                    'description_l10n_en-gb',
+                ],
+                'boost': 2.0,
+                'operator': 'and',
+            }
+        }
 
         functions = qs['query']['function_score']['functions']
-        assert len(functions) == 2
+        assert len(functions) == 3
         assert functions[0] == {
-            'field_value_factor': {
-                'field': 'average_daily_users', 'modifier': 'log2p'
-            }
+            'field_value_factor': {'field': 'average_daily_users', 'modifier': 'log2p'}
         }
         assert functions[1] == {
             'filter': {
                 'bool': {
                     'must': [
                         {'term': {'is_experimental': False}},
-                        {'terms': {'status': (4,)}},
+                        {'terms': {'status': [4]}},
                         {'exists': {'field': 'current_version'}},
-                        {'term': {'is_disabled': False}}
+                        {'term': {'is_disabled': False}},
                     ]
                 }
             },
-            'weight': 4.0
+            'weight': 4.0,
+        }
+        assert functions[2] == {
+            'field_value_factor': {'field': 'ranking_bump', 'missing': 1}
         }
         return qs
 
     def test_no_rescore_if_not_sorting_by_relevance(self):
-        qs = self._test_q(
-            self._filter(data={'q': 'tea pot', 'sort': 'rating'}))
+        query = 'tea pot'
+        qs = self._test_q(self._filter(data={'q': query, 'sort': 'ratings'}), query)
         assert 'rescore' not in qs
 
     def test_q(self):
-        qs = self._test_q(self._filter(data={'q': 'tea pot'}))
+        query = 'tea pot'
+        qs = self._test_q(self._filter(data={'q': query}), query)
 
         expected_rescore = {
             'bool': {
@@ -137,38 +206,58 @@ class TestQueryFilter(FilterTestsBase):
                     {
                         'multi_match': {
                             '_name': (
-                                'MultiMatch(MatchPhrase(summary),'
-                                'MatchPhrase(summary_l10n_english))'),
+                                'MultiMatch(MatchPhrase(summary), '
+                                'MatchPhrase(summary_l10n_en-us), '
+                                'MatchPhrase(summary_l10n_en-ca), '
+                                'MatchPhrase(summary_l10n_en-gb))'
+                            ),
                             'query': 'tea pot',
                             'slop': 10,
                             'type': 'phrase',
-                            'fields': ['summary', 'summary_l10n_english'],
+                            'fields': [
+                                'summary',
+                                'summary_l10n_en-us',
+                                'summary_l10n_en-ca',
+                                'summary_l10n_en-gb',
+                            ],
                             'boost': 3.0,
                         },
                     },
                     {
                         'multi_match': {
                             '_name': (
-                                'MultiMatch(MatchPhrase(description),'
-                                'MatchPhrase(description_l10n_english))'),
+                                'MultiMatch(MatchPhrase(description), '
+                                'MatchPhrase(description_l10n_en-us), '
+                                'MatchPhrase(description_l10n_en-ca), '
+                                'MatchPhrase(description_l10n_en-gb))'
+                            ),
                             'query': 'tea pot',
                             'slop': 10,
                             'type': 'phrase',
-                            'fields': ['description',
-                                       'description_l10n_english'],
+                            'fields': [
+                                'description',
+                                'description_l10n_en-us',
+                                'description_l10n_en-ca',
+                                'description_l10n_en-gb',
+                            ],
                             'boost': 2.0,
                         },
-                    }
+                    },
                 ]
             }
         }
 
         assert qs['rescore'] == {
             'window_size': 10,
-            'query': {
-                'rescore_query': expected_rescore
-            }
+            'query': {'rescore_query': expected_rescore},
         }
+
+    def test_q_single_word_no_phrase(self):
+        qs = self._filter(data={'q': 'blah'})
+        should = qs['query']['function_score']['query']['bool']['should']
+        assert len(should) == 7
+        for conditions in should:
+            assert 'match_phrase' not in conditions
 
     def test_q_too_long(self):
         with self.assertRaises(serializers.ValidationError):
@@ -194,13 +283,13 @@ class TestQueryFilter(FilterTestsBase):
                         'match': {
                             'name.trigrams': {
                                 'query': 'blah',
-                                'minimum_should_match': '66%',
+                                'minimum_should_match': '75%',
                             }
                         }
                     },
                 ],
                 'boost': 4.0,
-                '_name': 'DisMax(FuzzyMatch(name), Match(name.trigrams))'
+                '_name': 'DisMax(FuzzyMatch(name), Match(name.trigrams))',
             }
         }
         assert expected in should
@@ -225,13 +314,13 @@ class TestQueryFilter(FilterTestsBase):
                         'match': {
                             'name.trigrams': {
                                 'query': 'search terms',
-                                'minimum_should_match': '66%',
+                                'minimum_should_match': '75%',
                             }
                         }
                     },
                 ],
                 'boost': 4.0,
-                '_name': 'DisMax(FuzzyMatch(name), Match(name.trigrams))'
+                '_name': 'DisMax(FuzzyMatch(name), Match(name.trigrams))',
             }
         }
         assert expected in should
@@ -261,21 +350,20 @@ class TestQueryFilter(FilterTestsBase):
                         'match': {
                             'name.trigrams': {
                                 'query': 'this search query is too long.',
-                                'minimum_should_match': '66%',
+                                'minimum_should_match': '75%',
                             }
                         }
                     },
                 ],
                 'boost': 4.0,
-                '_name': 'DisMax(FuzzyMatch(name), Match(name.trigrams))'
+                '_name': 'DisMax(FuzzyMatch(name), Match(name.trigrams))',
             }
         }
         assert expected not in should
 
         # Re-do the same test but mocking the limit to a higher value, the
         # fuzzy query should be present.
-        with patch.object(
-                SearchQueryFilter, 'MAX_QUERY_LENGTH_FOR_FUZZY_SEARCH', 100):
+        with patch.object(SearchQueryFilter, 'MAX_QUERY_LENGTH_FOR_FUZZY_SEARCH', 100):
             should = do_test()
             assert expected in should
 
@@ -285,12 +373,16 @@ class TestQueryFilter(FilterTestsBase):
 
         expected = {
             'dis_max': {
-                'queries': [
-                    {'term': {'name.raw': u'adblock plus'}},
-                    {'term': {'name_l10n_english.raw': u'adblock plus'}},
-                ],
+                '_name': 'DisMax(Term(name.raw), Term(name_l10n_en-us.raw), '
+                'Term(name_l10n_en-ca.raw), '
+                'Term(name_l10n_en-gb.raw))',
                 'boost': 100.0,
-                '_name': 'DisMax(Term(name.raw), Term(name_l10n_english.raw))'
+                'queries': [
+                    {'term': {'name.raw': 'adblock plus'}},
+                    {'term': {'name_l10n_en-us.raw': 'adblock plus'}},
+                    {'term': {'name_l10n_en-ca.raw': 'adblock plus'}},
+                    {'term': {'name_l10n_en-gb.raw': 'adblock plus'}},
+                ],
             }
         }
 
@@ -306,8 +398,9 @@ class TestQueryFilter(FilterTestsBase):
         expected = {
             'term': {
                 'name.raw': {
-                    'boost': 100, 'value': u'adblock plus',
-                    '_name': 'Term(name.raw)'
+                    'boost': 100,
+                    'value': 'adblock plus',
+                    '_name': 'Term(name.raw)',
                 }
             }
         }
@@ -316,21 +409,19 @@ class TestQueryFilter(FilterTestsBase):
 
 
 class TestReviewedContentFilter(FilterTestsBase):
-
     filter_classes = [ReviewedContentFilter]
 
     def test_status(self):
-        qs = self._filter(self.req)
+        qs = self._filter()
         assert 'must' not in qs['query']['bool']
         filter_ = qs['query']['bool']['filter']
 
-        assert {'terms': {'status': amo.REVIEWED_STATUSES}} in filter_
+        assert {'terms': {'status': list(amo.APPROVED_STATUSES)}} in filter_
         assert {'exists': {'field': 'current_version'}} in filter_
         assert {'term': {'is_disabled': False}} in filter_
 
 
 class TestSortingFilter(FilterTestsBase):
-
     filter_classes = [SortingFilter]
 
     def _reformat_order(self, key):
@@ -344,15 +435,27 @@ class TestSortingFilter(FilterTestsBase):
         assert qs['sort'] == [self._reformat_order('_score')]
 
         qs = self._filter()
-        assert qs['sort'] == [self._reformat_order('-weekly_downloads')]
+        assert qs['sort'] == [
+            self._reformat_order('-is_recommended'),
+            self._reformat_order('-average_daily_users'),
+        ]
 
     def test_sort_query(self):
         SORTING_PARAMS = copy.copy(SortingFilter.SORTING_PARAMS)
         SORTING_PARAMS.pop('random')  # Tested separately below.
+        SORTING_PARAMS.pop('recommended')  # Tested separately below.
 
-        for param in SORTING_PARAMS:
+        for param, es in SORTING_PARAMS.items():
             qs = self._filter(data={'sort': param})
-            assert qs['sort'] == [self._reformat_order(SORTING_PARAMS[param])]
+            if param == 'relevance':
+                # relevance without q is ignored so default sort is used
+                expected = [
+                    self._reformat_order('-is_recommended'),
+                    self._reformat_order('-average_daily_users'),
+                ]
+            else:
+                expected = [self._reformat_order(es)]
+            assert qs['sort'] == expected
         # Having a search query does not change anything, the requested sort
         # takes precedence.
         for param in SORTING_PARAMS:
@@ -370,13 +473,17 @@ class TestSortingFilter(FilterTestsBase):
         assert context.exception.detail == ['Invalid "sort" parameter.']
 
     def test_sort_query_multiple(self):
-        qs = self._filter(data={'sort': ['rating,created']})
-        assert qs['sort'] == [self._reformat_order('-bayesian_rating'),
-                              self._reformat_order('-created')]
+        qs = self._filter(data={'sort': ['ratings,created']})
+        assert qs['sort'] == [
+            self._reformat_order('-bayesian_rating'),
+            self._reformat_order('-created'),
+        ]
 
-        qs = self._filter(data={'sort': 'created,rating'})
-        assert qs['sort'] == [self._reformat_order('-created'),
-                              self._reformat_order('-bayesian_rating')]
+        qs = self._filter(data={'sort': 'created,ratings'})
+        assert qs['sort'] == [
+            self._reformat_order('-created'),
+            self._reformat_order('-bayesian_rating'),
+        ]
 
         # If the sort query is wrong.
         with self.assertRaises(serializers.ValidationError) as context:
@@ -387,7 +494,7 @@ class TestSortingFilter(FilterTestsBase):
         expected = 'The "random" "sort" parameter can not be combined.'
 
         with self.assertRaises(serializers.ValidationError) as context:
-            self._filter(data={'sort': ['rating,random']})
+            self._filter(data={'sort': ['ratings,random']})
         assert context.exception.detail == [expected]
 
         with self.assertRaises(serializers.ValidationError) as context:
@@ -395,27 +502,124 @@ class TestSortingFilter(FilterTestsBase):
         assert context.exception.detail == [expected]
 
     def test_sort_random_restrictions(self):
-        expected = ('The "sort" parameter "random" can only be specified when '
-                    'the "featured" parameter is also present, and the "q" '
-                    'parameter absent.')
+        expected = (
+            'The "sort" parameter "random" can only be specified when '
+            'the "featured" or "promoted" parameter is also '
+            'present, and the "q" parameter absent.'
+        )
 
         with self.assertRaises(serializers.ValidationError) as context:
             self._filter(data={'q': 'something', 'sort': 'random'})
         assert context.exception.detail == [expected]
 
         with self.assertRaises(serializers.ValidationError) as context:
-            self._filter(
-                data={'q': 'something', 'featured': 'true', 'sort': 'random'})
+            self._filter(data={'q': 'something', 'featured': 'true', 'sort': 'random'})
         assert context.exception.detail == [expected]
 
-    def test_sort_random(self):
+        with self.assertRaises(serializers.ValidationError) as context:
+            self._filter(data={'q': 'something', 'promoted': 'line', 'sort': 'random'})
+        assert context.exception.detail == [expected]
+
+    @time_machine.travel('2023-12-24', tick=False)
+    def test_sort_random_featured(self):
         qs = self._filter(data={'featured': 'true', 'sort': 'random'})
         # Note: this test does not call AddonFeaturedQueryParam so it won't
         # apply the featured filtering. That's tested below in
         # TestCombinedFilter.test_filter_featured_sort_random
         assert qs['sort'] == ['_score']
         assert qs['query']['function_score']['functions'] == [
-            {'random_score': {}}
+            {'random_score': {'seed': 17733072, 'field': 'id'}}
+        ]
+
+    def test_sort_random_seed(self):
+        with time_machine.travel('2023-12-24', tick=False) as frozen_time:
+            qs = self._filter(data={'featured': 'true', 'sort': 'random'})
+            assert qs['sort'] == ['_score']
+            assert qs['query']['function_score']['functions'] == [
+                {'random_score': {'seed': 17733072, 'field': 'id'}}
+            ]
+
+            # Stable within the hour
+            frozen_time.shift(delta=timedelta(minutes=59, seconds=59))
+            qs = self._filter(data={'featured': 'true', 'sort': 'random'})
+            assert qs['sort'] == ['_score']
+            assert qs['query']['function_score']['functions'] == [
+                {'random_score': {'seed': 17733072, 'field': 'id'}}
+            ]
+
+            # Changes once hour changes.
+            frozen_time.shift(delta=timedelta(seconds=1))
+            qs = self._filter(data={'featured': 'true', 'sort': 'random'})
+            assert qs['sort'] == ['_score']
+            assert qs['query']['function_score']['functions'] == [
+                {'random_score': {'seed': 17733073, 'field': 'id'}}
+            ]
+
+            # Stays stable again until next hour.
+            frozen_time.shift(delta=timedelta(minutes=59))
+            qs = self._filter(data={'featured': 'true', 'sort': 'random'})
+            assert qs['sort'] == ['_score']
+            assert qs['query']['function_score']['functions'] == [
+                {'random_score': {'seed': 17733073, 'field': 'id'}}
+            ]
+
+            # Changes again once hour changes again.
+            frozen_time.shift(delta=timedelta(minutes=1))
+            qs = self._filter(data={'featured': 'true', 'sort': 'random'})
+            assert qs['sort'] == ['_score']
+            assert qs['query']['function_score']['functions'] == [
+                {'random_score': {'seed': 17733074, 'field': 'id'}}
+            ]
+
+            # Next day means seed is incremented by 24 compared to original.
+            frozen_time.move_to('2023-12-25')
+            qs = self._filter(data={'featured': 'true', 'sort': 'random'})
+            assert qs['sort'] == ['_score']
+            assert qs['query']['function_score']['functions'] == [
+                {'random_score': {'seed': 17733072 + 24, 'field': 'id'}}
+            ]
+
+    @time_machine.travel('2023-12-24', tick=False)
+    def test_sort_random(self):
+        qs = self._filter(data={'promoted': RECOMMENDED_API_NAME, 'sort': 'random'})
+        # Note: this test does not call AddonPromotedQueryParam so it won't
+        # apply the recommended filtering. That's tested below in
+        # TestCombinedFilter.test_filter_promoted_sort_random
+        assert qs['sort'] == ['_score']
+        assert qs['query']['function_score']['functions'] == [
+            {'random_score': {'seed': 17733072, 'field': 'id'}}
+        ]
+
+    def test_sort_ratings(self):
+        # "ratings" sort parameter is the officially supported one, for consistency.
+        qs = self._filter(data={'sort': 'ratings'})
+        assert qs['sort'] == [self._reformat_order('-bayesian_rating')]
+
+        # "rating" sort parameter is still supported for backwards compatibility.
+        qs = self._filter(data={'sort': 'rating'})
+        assert qs['sort'] == [self._reformat_order('-bayesian_rating')]
+
+    def test_sort_recommended_only(self):
+        # If you try to sort by just recommended it gets ignored
+        qs = self._filter(data={'q': 'something', 'sort': 'recommended'})
+        assert qs['sort'] == [self._reformat_order('_score')]
+
+        qs = self._filter(data={'sort': 'recommended'})
+        assert qs['sort'] == [
+            self._reformat_order('-is_recommended'),
+            self._reformat_order('-average_daily_users'),
+        ]
+
+    def test_sort_recommended_and_relevance(self):
+        # with a q, recommended with relevance sort, recommended is ignored.
+        qs = self._filter(data={'q': 'something', 'sort': 'recommended,relevance'})
+        assert qs['sort'] == [self._reformat_order('_score')]
+
+        # except if you don't specify a query, then it falls back to default
+        qs = self._filter(data={'sort': 'recommended,relevance'})
+        assert qs['sort'] == [
+            self._reformat_order('-is_recommended'),
+            self._reformat_order('-average_daily_users'),
         ]
 
 
@@ -424,25 +628,24 @@ class TestSearchParameterFilter(FilterTestsBase):
 
     def test_search_by_type_invalid(self):
         with self.assertRaises(serializers.ValidationError) as context:
-            self._filter(
-                data={'type': six.text_type(amo.ADDON_EXTENSION + 666)})
+            self._filter(data={'type': str(amo.ADDON_EXTENSION + 666)})
 
         with self.assertRaises(serializers.ValidationError) as context:
             self._filter(data={'type': 'nosuchtype'})
         assert context.exception.detail == ['Invalid "type" parameter.']
 
     def test_search_by_type_id(self):
-        qs = self._filter(data={'type': six.text_type(amo.ADDON_EXTENSION)})
+        qs = self._filter(data={'type': str(amo.ADDON_EXTENSION)})
         assert 'must' not in qs['query']['bool']
         assert 'must_not' not in qs['query']['bool']
         filter_ = qs['query']['bool']['filter']
         assert {'terms': {'type': [amo.ADDON_EXTENSION]}} in filter_
 
-        qs = self._filter(data={'type': six.text_type(amo.ADDON_PERSONA)})
+        qs = self._filter(data={'type': str(amo.ADDON_STATICTHEME)})
         assert 'must' not in qs['query']['bool']
         assert 'must_not' not in qs['query']['bool']
         filter_ = qs['query']['bool']['filter']
-        assert {'terms': {'type': [amo.ADDON_PERSONA]}} in filter_
+        assert {'terms': {'type': [amo.ADDON_STATICTHEME]}} in filter_
 
     def test_search_by_type_string(self):
         qs = self._filter(data={'type': 'extension'})
@@ -451,36 +654,76 @@ class TestSearchParameterFilter(FilterTestsBase):
         filter_ = qs['query']['bool']['filter']
         assert {'terms': {'type': [amo.ADDON_EXTENSION]}} in filter_
 
-        qs = self._filter(data={'type': 'persona'})
+        qs = self._filter(data={'type': 'statictheme'})
         assert 'must' not in qs['query']['bool']
         assert 'must_not' not in qs['query']['bool']
         filter_ = qs['query']['bool']['filter']
-        assert {'terms': {'type': [amo.ADDON_PERSONA]}} in filter_
+        assert {'terms': {'type': [amo.ADDON_STATICTHEME]}} in filter_
 
-        qs = self._filter(data={'type': 'persona,extension'})
+        qs = self._filter(data={'type': 'statictheme,extension'})
         assert 'must' not in qs['query']['bool']
         assert 'must_not' not in qs['query']['bool']
         filter_ = qs['query']['bool']['filter']
-        assert (
-            {'terms': {'type': [amo.ADDON_PERSONA, amo.ADDON_EXTENSION]}}
-            in filter_)
+        assert {
+            'terms': {'type': [amo.ADDON_STATICTHEME, amo.ADDON_EXTENSION]}
+        } in filter_
+
+    def test_basic_guid_search(self):
+        qs = self._filter(data={'guid': '@foobar'})
+        assert 'must' not in qs['query']['bool']
+        assert 'must_not' not in qs['query']['bool']
+        filter_ = qs['query']['bool']['filter']
+        assert {'terms': {'guid': ['@foobar']}} in filter_
+
+        qs = self._filter(
+            data={'guid': '@foobar,{28568f6a-0604-4654-a001-e7bf57a35af7}'}
+        )
+        assert 'must' not in qs['query']['bool']
+        assert 'must_not' not in qs['query']['bool']
+        filter_ = qs['query']['bool']['filter']
+        assert {
+            'terms': {'guid': ['@foobar', '{28568f6a-0604-4654-a001-e7bf57a35af7}']}
+        } in filter_
+
+    @patch('olympia.search.filters.switch_is_active', lambda s: s == 'return-to-amo')
+    def test_return_to_amo(self):
+        param = 'rta:{}'.format(urlsafe_base64_encode(b'@foobar'))
+        qs = self._filter(data={'guid': param})
+        assert 'must' not in qs['query']['bool']
+        assert 'must_not' not in qs['query']['bool']
+        filter_ = qs['query']['bool']['filter']
+        assert {'terms': {'guid': ['@foobar']}} in filter_
+        assert {'terms': {'promoted.category': BADGED_GROUPS}} in filter_
+
+    @patch(
+        'olympia.search.filters.switch_is_active',
+        lambda s: s.startswith('return-to-amo'),
+    )
+    def test_return_to_amo_for_all_listed(self):
+        param = 'rta:{}'.format(urlsafe_base64_encode(b'@foobar'))
+        qs = self._filter(data={'guid': param})
+        assert 'must' not in qs['query']['bool']
+        assert 'must_not' not in qs['query']['bool']
+        filter_ = qs['query']['bool']['filter']
+        assert {'terms': {'guid': ['@foobar']}} in filter_
+        assert {'terms': {'promoted.category': BADGED_GROUPS}} not in filter_
 
     def test_search_by_app_invalid(self):
         with self.assertRaises(serializers.ValidationError) as context:
-            self._filter(data={'app': six.text_type(amo.FIREFOX.id + 666)})
+            self._filter(data={'app': str(amo.FIREFOX.id + 666)})
 
         with self.assertRaises(serializers.ValidationError) as context:
             self._filter(data={'app': 'nosuchapp'})
         assert context.exception.detail == ['Invalid "app" parameter.']
 
     def test_search_by_app_id(self):
-        qs = self._filter(data={'app': six.text_type(amo.FIREFOX.id)})
+        qs = self._filter(data={'app': str(amo.FIREFOX.id)})
         assert 'must' not in qs['query']['bool']
         assert 'must_not' not in qs['query']['bool']
         filter_ = qs['query']['bool']['filter']
         assert {'term': {'app': amo.FIREFOX.id}} in filter_
 
-        qs = self._filter(data={'app': six.text_type(amo.ANDROID.id)})
+        qs = self._filter(data={'app': str(amo.ANDROID.id)})
         assert 'must' not in qs['query']['bool']
         assert 'must_not' not in qs['query']['bool']
         filter_ = qs['query']['bool']['filter']
@@ -506,139 +749,54 @@ class TestSearchParameterFilter(FilterTestsBase):
 
     def test_search_by_appversion_app_invalid(self):
         with self.assertRaises(serializers.ValidationError) as context:
-            self._filter(data={'appversion': '46.0',
-                               'app': 'internet_explorer'})
+            self._filter(data={'appversion': '46.0', 'app': 'internet_explorer'})
         assert context.exception.detail == ['Invalid "app" parameter.']
 
     def test_search_by_appversion_invalid(self):
         with self.assertRaises(serializers.ValidationError) as context:
-            self._filter(data={'appversion': 'not_a_version',
-                               'app': 'firefox'})
+            self._filter(data={'appversion': 'not_a_version', 'app': 'firefox'})
         assert context.exception.detail == ['Invalid "appversion" parameter.']
 
     def test_search_by_appversion(self):
-        qs = self._filter(data={'appversion': '46.0',
-                                'app': 'firefox'})
+        qs = self._filter(data={'appversion': '46.0', 'app': 'firefox'})
         assert 'must' not in qs['query']['bool']
         assert 'must_not' not in qs['query']['bool']
         filter_ = qs['query']['bool']['filter']
         assert {'term': {'app': amo.FIREFOX.id}} in filter_
-        assert {'range': {'current_version.compatible_apps.1.min':
-                {'lte': 46000000200100}}} in filter_
-        assert {'range': {'current_version.compatible_apps.1.max':
-                {'gte': 46000000000100}}} in filter_
-
-    def test_search_by_platform_invalid(self):
-        with self.assertRaises(serializers.ValidationError) as context:
-            self._filter(
-                data={'platform': six.text_type(amo.PLATFORM_WIN.id + 42)})
-
-        with self.assertRaises(serializers.ValidationError) as context:
-            self._filter(data={'platform': 'nosuchplatform'})
-        assert context.exception.detail == ['Invalid "platform" parameter.']
-
-    def test_search_by_platform_id(self):
-        qs = self._filter(
-            data={'platform': six.text_type(amo.PLATFORM_WIN.id)})
-        assert 'must' not in qs['query']['bool']
-        assert 'must_not' not in qs['query']['bool']
-        filter_ = qs['query']['bool']['filter']
-        assert {'terms': {'platforms': [
-            amo.PLATFORM_WIN.id, amo.PLATFORM_ALL.id]}} in filter_
-
-        qs = self._filter(
-            data={'platform': six.text_type(amo.PLATFORM_LINUX.id)})
-        assert 'must' not in qs['query']['bool']
-        assert 'must_not' not in qs['query']['bool']
-        filter_ = qs['query']['bool']['filter']
-        assert {'terms': {'platforms': [
-            amo.PLATFORM_LINUX.id, amo.PLATFORM_ALL.id]}} in filter_
-
-    def test_search_by_platform_string(self):
-        qs = self._filter(data={'platform': 'windows'})
-        assert 'must' not in qs['query']['bool']
-        assert 'must_not' not in qs['query']['bool']
-        filter_ = qs['query']['bool']['filter']
-        assert {'terms': {'platforms': [
-            amo.PLATFORM_WIN.id, amo.PLATFORM_ALL.id]}} in filter_
-
-        qs = self._filter(data={'platform': 'win'})
-        assert 'must' not in qs['query']['bool']
-        assert 'must_not' not in qs['query']['bool']
-        filter_ = qs['query']['bool']['filter']
-        assert {'terms': {'platforms': [
-            amo.PLATFORM_WIN.id, amo.PLATFORM_ALL.id]}} in filter_
-
-        qs = self._filter(data={'platform': 'darwin'})
-        assert 'must' not in qs['query']['bool']
-        assert 'must_not' not in qs['query']['bool']
-        filter_ = qs['query']['bool']['filter']
-        assert {'terms': {'platforms': [
-            amo.PLATFORM_MAC.id, amo.PLATFORM_ALL.id]}} in filter_
-
-        qs = self._filter(data={'platform': 'mac'})
-        assert 'must' not in qs['query']['bool']
-        assert 'must_not' not in qs['query']['bool']
-        filter_ = qs['query']['bool']['filter']
-        assert {'terms': {'platforms': [
-            amo.PLATFORM_MAC.id, amo.PLATFORM_ALL.id]}} in filter_
-
-        qs = self._filter(data={'platform': 'macosx'})
-        assert 'must' not in qs['query']['bool']
-        assert 'must_not' not in qs['query']['bool']
-        filter_ = qs['query']['bool']['filter']
-        assert {'terms': {'platforms': [
-            amo.PLATFORM_MAC.id, amo.PLATFORM_ALL.id]}} in filter_
-
-        qs = self._filter(data={'platform': 'linux'})
-        assert 'must' not in qs['query']['bool']
-        assert 'must_not' not in qs['query']['bool']
-        filter_ = qs['query']['bool']['filter']
-        assert {'terms': {'platforms': [
-            amo.PLATFORM_LINUX.id, amo.PLATFORM_ALL.id]}} in filter_
-
-    def test_search_by_category_slug_no_app_or_type(self):
-        with self.assertRaises(serializers.ValidationError) as context:
-            self._filter(data={'category': 'other'})
-        assert context.exception.detail == ['Invalid "app" parameter.']
-
-    def test_search_by_category_id_no_app_or_type(self):
-        with self.assertRaises(serializers.ValidationError) as context:
-            self._filter(data={'category': 1})
-        assert context.exception.detail == ['Invalid "app" parameter.']
+        assert {
+            'range': {'current_version.compatible_apps.1.min': {'lte': 46000000200100}}
+        } in filter_
+        assert {
+            'range': {'current_version.compatible_apps.1.max': {'gte': 46000000000100}}
+        } in filter_
 
     def test_search_by_category_slug(self):
-        category = CATEGORIES[amo.FIREFOX.id][amo.ADDON_EXTENSION]['other']
-        qs = self._filter(data={
-            'category': 'other',
-            'app': 'firefox',
-            'type': 'extension'
-        })
+        category = CATEGORIES[amo.ADDON_EXTENSION]['other']
+        qs = self._filter(
+            data={'category': 'other', 'app': 'firefox', 'type': 'extension'}
+        )
         assert 'must' not in qs['query']['bool']
         assert 'must_not' not in qs['query']['bool']
         filter_ = qs['query']['bool']['filter']
         assert {'terms': {'category': [category.id]}} in filter_
 
     def test_search_by_category_slug_multiple_types(self):
-        category_a = CATEGORIES[amo.FIREFOX.id][amo.ADDON_EXTENSION]['other']
-        category_b = CATEGORIES[amo.FIREFOX.id][amo.ADDON_PERSONA]['other']
-        qs = self._filter(data={
-            'category': 'other',
-            'app': 'firefox',
-            'type': 'extension,persona'
-        })
+        category_a = CATEGORIES[amo.ADDON_EXTENSION]['other']
+        category_b = CATEGORIES[amo.ADDON_STATICTHEME]['other']
+        qs = self._filter(
+            data={
+                'category': 'other',
+                'app': 'firefox',
+                'type': 'extension,statictheme',
+            }
+        )
         assert 'must' not in qs['query']['bool']
         assert 'must_not' not in qs['query']['bool']
         filter_ = qs['query']['bool']['filter']
-        assert (
-            {'terms': {'category': [category_a.id, category_b.id]}} in filter_)
+        assert {'terms': {'category': [category_a.id, category_b.id]}} in filter_
 
     def test_search_by_category_id(self):
-        qs = self._filter(data={
-            'category': 1,
-            'app': 'firefox',
-            'type': 'extension'
-        })
+        qs = self._filter(data={'category': 1, 'app': 'firefox', 'type': 'extension'})
         assert 'must' not in qs['query']['bool']
         assert 'must_not' not in qs['query']['bool']
         filter_ = qs['query']['bool']['filter']
@@ -646,8 +804,7 @@ class TestSearchParameterFilter(FilterTestsBase):
 
     def test_search_by_category_invalid(self):
         with self.assertRaises(serializers.ValidationError) as context:
-            self._filter(
-                data={'category': 666, 'app': 'firefox', 'type': 'extension'})
+            self._filter(data={'category': 666, 'app': 'firefox', 'type': 'extension'})
         assert context.exception.detail == ['Invalid "category" parameter.']
 
     def test_search_by_tag(self):
@@ -663,6 +820,19 @@ class TestSearchParameterFilter(FilterTestsBase):
         filter_ = qs['query']['bool']['filter']
         assert {'term': {'tags': 'foo'}} in filter_
         assert {'term': {'tags': 'bar'}} in filter_
+
+    def test_search_by_tag_ignored(self):
+        # firefox57 is in the ignore list, we shouldn't filter the query with
+        # it.
+        qs = self._filter(data={'tag': 'firefox57'})
+        assert 'bool' not in qs.get('query', {})
+
+        qs = self._filter(data={'tag': 'foo,firefox57'})
+        assert 'must' not in qs['query']['bool']
+        assert 'must_not' not in qs['query']['bool']
+        filter_ = qs['query']['bool']['filter']
+        assert {'term': {'tags': 'foo'}} in filter_
+        assert {'term': {'tags': 'firefox57'}} not in filter_
 
     def test_search_by_author(self):
         qs = self._filter(data={'author': 'fooBar'})
@@ -689,7 +859,7 @@ class TestSearchParameterFilter(FilterTestsBase):
         filter_ = qs['query']['bool']['filter']
         assert len(filter_) == 1
         should = filter_[0]['bool']['should']
-        assert {'terms': {'listed_authors.id': ['123', '456']}} in should
+        assert {'terms': {'listed_authors.id': [123, 456]}} in should
         assert {'terms': {'listed_authors.username': []}} in should
 
         qs = self._filter(data={'author': '123,bar'})
@@ -698,7 +868,7 @@ class TestSearchParameterFilter(FilterTestsBase):
         filter_ = qs['query']['bool']['filter']
         assert len(filter_) == 1
         should = filter_[0]['bool']['should']
-        assert {'terms': {'listed_authors.id': ['123']}} in should
+        assert {'terms': {'listed_authors.id': [123]}} in should
         assert {'terms': {'listed_authors.username': ['bar']}} in should
 
     def test_exclude_addons(self):
@@ -712,7 +882,7 @@ class TestSearchParameterFilter(FilterTestsBase):
         assert len(filter_) == 1
         assert 'must' not in filter_[0]['bool']
         must_not = filter_[0]['bool']['must_not']
-        assert must_not == [{'terms': {'slug': [u'fooBar']}}]
+        assert must_not == [{'terms': {'slug': ['fooBar']}}]
 
         qs = self._filter(data={'exclude_addons': 1})
         assert 'must' not in qs['query']['bool']
@@ -721,7 +891,7 @@ class TestSearchParameterFilter(FilterTestsBase):
         assert len(filter_) == 1
         assert 'must' not in filter_[0]['bool']
         must_not = filter_[0]['bool']['must_not']
-        assert must_not == [{'ids': {'values': [u'1']}}]
+        assert must_not == [{'ids': {'values': [1]}}]
 
         qs = self._filter(data={'exclude_addons': 'fooBar,1'})
         assert 'must' not in qs['query']['bool']
@@ -736,59 +906,52 @@ class TestSearchParameterFilter(FilterTestsBase):
         assert 'must' not in filter_[0]['bool']
         assert 'must' not in filter_[1]['bool']
         must_not = filter_[0]['bool']['must_not']
-        assert {'ids': {'values': [u'1']}} in must_not
+        assert {'ids': {'values': [1]}} in must_not
         must_not = filter_[1]['bool']['must_not']
-        assert {'terms': {'slug': [u'fooBar']}} in must_not
+        assert {'terms': {'slug': ['fooBar']}} in must_not
 
     def test_search_by_featured_no_app_no_locale(self):
         qs = self._filter(data={'featured': 'true'})
         assert 'must' not in qs['query']['bool']
         filter_ = qs['query']['bool']['filter']
-        assert {'term': {'is_featured': True}} in filter_
+        assert {'term': {'is_recommended': True}} in filter_
 
         with self.assertRaises(serializers.ValidationError) as context:
             self._filter(data={'featured': 'false'})
         assert context.exception.detail == ['Invalid "featured" parameter.']
 
-    def test_search_by_featured_yes_app_no_locale(self):
-        qs = self._filter(data={'featured': 'true', 'app': 'firefox'})
-        assert 'must' not in qs['query']['bool']
+    def test_search_by_promoted(self):
+        qs = self._filter(data={'promoted': 'foo'})
         filter_ = qs['query']['bool']['filter']
-        assert len(filter_) == 2
-        assert filter_[0] == {'term': {'app': amo.FIREFOX.id}}
-        inner = filter_[1]['nested']['query']['bool']['filter']
-        assert len(inner) == 1
-        assert {'term': {'featured_for.application': amo.FIREFOX.id}} in inner
+        assert [{'terms': {'promoted.category': ['foo']}}] == filter_
 
-        with self.assertRaises(serializers.ValidationError) as context:
-            self._filter(data={'featured': 'true', 'app': 'foobaa'})
-        assert context.exception.detail == ['Invalid "app" parameter.']
-
-    def test_search_by_featured_yes_app_yes_locale(self):
-        qs = self._filter(data={'featured': 'true', 'app': 'firefox',
-                                'lang': 'fr'})
-        assert 'must' not in qs['query']['bool']
+        qs = self._filter(data={'promoted': 'foo', 'app': 'firefox'})
         filter_ = qs['query']['bool']['filter']
-        assert len(filter_) == 2
-        assert filter_[0] == {'term': {'app': amo.FIREFOX.id}}
-        inner = filter_[1]['nested']['query']['bool']['filter']
-        assert len(inner) == 2
-        assert {'term': {'featured_for.application': amo.FIREFOX.id}} in inner
-        assert {'terms': {'featured_for.locales': ['fr', 'ALL']}} in inner
+        assert {'terms': {'promoted.category': ['foo']}} in filter_
+        assert {'term': {'promoted.approved_for_apps': amo.FIREFOX.id}} in filter_
 
-        with self.assertRaises(serializers.ValidationError) as context:
-            self._filter(data={'featured': 'true', 'app': 'foobaa'})
-        assert context.exception.detail == ['Invalid "app" parameter.']
-
-    def test_search_by_featured_no_app_yes_locale(self):
-        qs = self._filter(data={'featured': 'true', 'lang': 'fr'})
-        assert 'must' not in qs['query']['bool']
-        assert 'must_not' not in qs['query']['bool']
+        # test multiple param values
+        qs = self._filter(data={'promoted': f'{RECOMMENDED_API_NAME},line'})
         filter_ = qs['query']['bool']['filter']
-        assert len(filter_) == 1
-        inner = filter_[0]['nested']['query']['bool']['filter']
-        assert len(inner) == 1
-        assert {'terms': {'featured_for.locales': ['fr', 'ALL']}} in inner
+        assert [
+            {'terms': {'promoted.category': ['line', RECOMMENDED_API_NAME]}}
+        ] == filter_
+
+        # test combining multiple values with the meta "badged" group
+        qs = self._filter(data={'promoted': f'badged,{RECOMMENDED_API_NAME},strategic'})
+        filter_ = qs['query']['bool']['filter']
+        assert [
+            {
+                'terms': {
+                    'promoted.category': [
+                        # recommended shouldn't be there twice
+                        'line',
+                        RECOMMENDED_API_NAME,
+                        'strategic',
+                    ]
+                }
+            }
+        ] == filter_
 
     def test_search_by_color(self):
         qs = self._filter(data={'color': 'ff0000'})
@@ -799,9 +962,14 @@ class TestSearchParameterFilter(FilterTestsBase):
         assert inner == [
             {'range': {'colors.s': {'gt': 6.375}}},
             {'range': {'colors.l': {'gt': 12.75, 'lt': 249.9}}},
-            {'bool': {'should': [
-                {'range': {'colors.h': {'gte': 229}}},
-                {'range': {'colors.h': {'lte': 26}}}]}},
+            {
+                'bool': {
+                    'should': [
+                        {'range': {'colors.h': {'gte': 229}}},
+                        {'range': {'colors.h': {'lte': 26}}},
+                    ]
+                }
+            },
             {'range': {'colors.ratio': {'gte': 0.25}}},
         ]
 
@@ -813,13 +981,42 @@ class TestSearchParameterFilter(FilterTestsBase):
         assert inner == [
             {'range': {'colors.s': {'gt': 6.375}}},
             {'range': {'colors.l': {'gt': 12.75, 'lt': 249.9}}},
-            {'bool': {'should': [
-                {'range': {'colors.h': {'gte': 228}}},
-                {'range': {'colors.h': {'lte': 25}}}]}},
+            {
+                'bool': {
+                    'should': [
+                        {'range': {'colors.h': {'gte': 228}}},
+                        {'range': {'colors.h': {'lte': 25}}},
+                    ]
+                }
+            },
             {'range': {'colors.ratio': {'gte': 0.25}}},
         ]
 
         qs = self._filter(data={'color': '#00ffff'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        inner = filter_[0]['nested']['query']['bool']['filter']
+        assert len(inner) == 4
+        assert inner == [
+            {'range': {'colors.s': {'gt': 6.375}}},
+            {'range': {'colors.l': {'gt': 12.75, 'lt': 249.9}}},
+            {'range': {'colors.h': {'gte': 101, 'lte': 153}}},
+            {'range': {'colors.ratio': {'gte': 0.25}}},
+        ]
+
+        qs = self._filter(data={'color': '#00ffffalotofjunk'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        inner = filter_[0]['nested']['query']['bool']['filter']
+        assert len(inner) == 4
+        assert inner == [
+            {'range': {'colors.s': {'gt': 6.375}}},
+            {'range': {'colors.l': {'gt': 12.75, 'lt': 249.9}}},
+            {'range': {'colors.h': {'gte': 101, 'lte': 153}}},
+            {'range': {'colors.ratio': {'gte': 0.25}}},
+        ]
+
+        qs = self._filter(data={'color': '00$#ff*$ff'})
         filter_ = qs['query']['bool']['filter']
         assert len(filter_) == 1
         inner = filter_[0]['nested']['query']['bool']['filter']
@@ -854,6 +1051,24 @@ class TestSearchParameterFilter(FilterTestsBase):
             {'range': {'colors.ratio': {'gte': 0.25}}},
         ]
 
+    def test_search_by_color_empty(self):
+        qs = self._filter(data={'color': ''})
+        # No filtering to apply.
+        assert not qs
+
+    def test_search_by_color_invalid(self):
+        with self.assertRaises(serializers.ValidationError) as context:
+            self._filter(data={'color': '#gggggg'})
+        assert context.exception.detail == ['Invalid "color" parameter.']
+
+        with self.assertRaises(serializers.ValidationError) as context:
+            self._filter(data={'color': '#$(@#*)'})
+        assert context.exception.detail == ['Invalid "color" parameter.']
+
+        with self.assertRaises(serializers.ValidationError) as context:
+            self._filter(data={'color': ' '})
+        assert context.exception.detail == ['Invalid "color" parameter.']
+
     def test_search_by_color_luminosity_extremes(self):
         qs = self._filter(data={'color': '080603'})
         filter_ = qs['query']['bool']['filter']
@@ -875,6 +1090,373 @@ class TestSearchParameterFilter(FilterTestsBase):
             {'range': {'colors.ratio': {'gte': 0.25}}},
         ]
 
+    def _test_threshold_filter_validity(self, param, ThresholdClass):
+        with self.assertRaises(serializers.ValidationError) as context:
+            self._filter(data={param: ''})
+        assert context.exception.detail == [f'Invalid "{param}" parameter.']
+
+        with self.assertRaises(serializers.ValidationError) as context:
+            self._filter(data={param: '3.1.4'})
+        assert context.exception.detail == [f'Invalid "{param}" parameter.']
+
+        with self.assertRaises(serializers.ValidationError) as context:
+            self._filter(data={param: 'lol'})
+        assert context.exception.detail == [f'Invalid "{param}" parameter.']
+
+        with self.assertRaises(serializers.ValidationError) as context:
+            self._filter(data={f'{param}__lt': ''})
+        assert context.exception.detail == [f'Invalid "{param}__lt" parameter.']
+
+        with self.assertRaises(serializers.ValidationError) as context:
+            self._filter(data={f'{param}__gt': '4a'})
+        assert context.exception.detail == [f'Invalid "{param}__gt" parameter.']
+
+        classes = ThresholdClass.get_classes()
+        assert [cls.query_param for cls in classes] == [
+            f'{param}__lt',
+            f'{param}__lte',
+            f'{param}__gt',
+            f'{param}__gte',
+            f'{param}',
+        ]
+
+    def test_ratings_filter(self):
+        qs = self._filter(data={'ratings__gt': '3.56'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'ratings.average': {'gt': 3.56}}},
+        ]
+
+        qs = self._filter(data={'ratings__lt': '3.56'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'ratings.average': {'lt': 3.56}}},
+        ]
+
+        qs = self._filter(data={'ratings__gte': '3.56'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'ratings.average': {'gte': 3.56}}},
+        ]
+
+        qs = self._filter(data={'ratings__lte': '3.56'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'ratings.average': {'lte': 3.56}}},
+        ]
+
+        qs = self._filter(data={'ratings': '3.56'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'ratings.average': {'lte': 3.56, 'gte': 3.56}}},
+        ]
+
+    def test_ratings_filter_validity(self):
+        self._test_threshold_filter_validity('ratings', AddonRatingQueryParam)
+
+    def test_users_filter(self):
+        qs = self._filter(data={'users__gt': '1234'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'average_daily_users': {'gt': 1234}}},
+        ]
+
+        qs = self._filter(data={'users__lt': '1234'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'average_daily_users': {'lt': 1234}}},
+        ]
+
+        qs = self._filter(data={'users__gte': '1234'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'average_daily_users': {'gte': 1234}}},
+        ]
+
+        qs = self._filter(data={'users__lte': '1234'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'average_daily_users': {'lte': 1234}}},
+        ]
+
+        qs = self._filter(data={'users': '1234'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'average_daily_users': {'lte': 1234, 'gte': 1234}}},
+        ]
+
+    def test_users_filter_validity(self):
+        self._test_threshold_filter_validity('users', AddonUsersQueryParam)
+        with self.assertRaises(serializers.ValidationError) as context:
+            self._filter(data={'users': '1.4567567'})
+        assert context.exception.detail == ['Invalid "users" parameter.']
+
+    def test_created_filter_timestamp(self):
+        qs = self._filter(data={'created__gt': '1735689600000'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'created': {'gt': 1735689600000}}},
+        ]
+
+        qs = self._filter(data={'created__lt': '1735689600000'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'created': {'lt': 1735689600000}}},
+        ]
+
+        qs = self._filter(data={'created__gte': '1735689600000'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'created': {'gte': 1735689600000}}},
+        ]
+
+        qs = self._filter(data={'created__lte': '1735689600000'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'created': {'lte': 1735689600000}}},
+        ]
+
+        qs = self._filter(data={'created': '1735689600000'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'created': {'lte': 1735689600000, 'gte': 1735689600000}}},
+        ]
+
+    def test_created_filter_datetime(self):
+        qs = self._filter(data={'created__gt': '2025-01-01T12:05'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'created': {'gt': datetime(2025, 1, 1, 12, 5)}}},
+        ]
+
+        qs = self._filter(data={'created__lt': '2025-01-01T12:05'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'created': {'lt': datetime(2025, 1, 1, 12, 5)}}},
+        ]
+
+        qs = self._filter(data={'created__gte': '2025-01-01T12:05'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'created': {'gte': datetime(2025, 1, 1, 12, 5)}}},
+        ]
+
+        qs = self._filter(data={'created__lte': '2025-01-01T12:05'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'created': {'lte': datetime(2025, 1, 1, 12, 5)}}},
+        ]
+
+        qs = self._filter(data={'created': '2025-01-01T12:05'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {
+                'range': {
+                    'created': {
+                        'lte': datetime(2025, 1, 1, 12, 5),
+                        'gte': datetime(2025, 1, 1, 12, 5),
+                    }
+                }
+            },
+        ]
+
+    def test_created_filter_date(self):
+        qs = self._filter(data={'created__gt': '2025-01-01'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'created': {'gt': date(2025, 1, 1)}}},
+        ]
+
+        qs = self._filter(data={'created__lt': '2025-01-01'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'created': {'lt': date(2025, 1, 1)}}},
+        ]
+
+        qs = self._filter(data={'created__gte': '2025-01-01'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'created': {'gte': date(2025, 1, 1)}}},
+        ]
+
+        qs = self._filter(data={'created__lte': '2025-01-01'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'created': {'lte': date(2025, 1, 1)}}},
+        ]
+
+        qs = self._filter(data={'created': '2025-01-01'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {
+                'range': {
+                    'created': {
+                        'lte': date(2025, 1, 1),
+                        'gte': date(2025, 1, 1),
+                    }
+                }
+            },
+        ]
+
+    def test_created_filter_validity(self):
+        self._test_threshold_filter_validity('created', AddonCreatedQueryParam)
+        with self.assertRaises(serializers.ValidationError) as context:
+            self._filter(data={'created': '3.56'})
+        assert context.exception.detail == ['Invalid "created" parameter.']
+
+    def test_updated_filter_timestamp(self):
+        qs = self._filter(data={'updated__gt': '1735689600000'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'last_updated': {'gt': 1735689600000}}},
+        ]
+
+        qs = self._filter(data={'updated__lt': '1735689600000'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'last_updated': {'lt': 1735689600000}}},
+        ]
+
+        qs = self._filter(data={'updated__gte': '1735689600000'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'last_updated': {'gte': 1735689600000}}},
+        ]
+
+        qs = self._filter(data={'updated__lte': '1735689600000'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'last_updated': {'lte': 1735689600000}}},
+        ]
+
+        qs = self._filter(data={'updated': '1735689600000'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'last_updated': {'lte': 1735689600000, 'gte': 1735689600000}}},
+        ]
+
+    def test_updated_filter_datetime(self):
+        qs = self._filter(data={'updated__gt': '2025-01-01T12:05'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'last_updated': {'gt': datetime(2025, 1, 1, 12, 5)}}},
+        ]
+
+        qs = self._filter(data={'updated__lt': '2025-01-01T12:05'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'last_updated': {'lt': datetime(2025, 1, 1, 12, 5)}}},
+        ]
+
+        qs = self._filter(data={'updated__gte': '2025-01-01T12:05'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'last_updated': {'gte': datetime(2025, 1, 1, 12, 5)}}},
+        ]
+
+        qs = self._filter(data={'updated__lte': '2025-01-01T12:05'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'last_updated': {'lte': datetime(2025, 1, 1, 12, 5)}}},
+        ]
+
+        qs = self._filter(data={'updated': '2025-01-01T12:05'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {
+                'range': {
+                    'last_updated': {
+                        'lte': datetime(2025, 1, 1, 12, 5),
+                        'gte': datetime(2025, 1, 1, 12, 5),
+                    }
+                }
+            },
+        ]
+
+    def test_updated_filter_date(self):
+        qs = self._filter(data={'updated__gt': '2025-01-01'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'last_updated': {'gt': date(2025, 1, 1)}}},
+        ]
+
+        qs = self._filter(data={'updated__lt': '2025-01-01'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'last_updated': {'lt': date(2025, 1, 1)}}},
+        ]
+
+        qs = self._filter(data={'updated__gte': '2025-01-01'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'last_updated': {'gte': date(2025, 1, 1)}}},
+        ]
+
+        qs = self._filter(data={'updated__lte': '2025-01-01'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {'range': {'last_updated': {'lte': date(2025, 1, 1)}}},
+        ]
+
+        qs = self._filter(data={'updated': '2025-01-01'})
+        filter_ = qs['query']['bool']['filter']
+        assert len(filter_) == 1
+        assert filter_ == [
+            {
+                'range': {
+                    'last_updated': {
+                        'lte': date(2025, 1, 1),
+                        'gte': date(2025, 1, 1),
+                    }
+                }
+            },
+        ]
+
+    def test_updated_filter_validity(self):
+        self._test_threshold_filter_validity('updated', AddonUpdatedQueryParam)
+        with self.assertRaises(serializers.ValidationError) as context:
+            self._filter(data={'updated': '3.56'})
+        assert context.exception.detail == ['Invalid "updated" parameter.']
+
 
 class TestCombinedFilter(FilterTestsBase):
     """
@@ -882,6 +1464,7 @@ class TestCombinedFilter(FilterTestsBase):
     expected query structure.
 
     """
+
     filter_classes = [SearchQueryFilter, ReviewedContentFilter, SortingFilter]
 
     def test_combined(self):
@@ -891,7 +1474,7 @@ class TestCombinedFilter(FilterTestsBase):
         assert 'must_not' not in bool_
 
         filter_ = bool_['filter']
-        assert {'terms': {'status': amo.REVIEWED_STATUSES}} in filter_
+        assert {'terms': {'status': list(amo.APPROVED_STATUSES)}} in filter_
         assert {'exists': {'field': 'current_version'}} in filter_
         assert {'term': {'is_disabled': False}} in filter_
 
@@ -899,15 +1482,18 @@ class TestCombinedFilter(FilterTestsBase):
 
         should = bool_['must'][0]['function_score']['query']['bool']['should']
         expected = {
-            'match': {
-                'name_l10n_english': {
-                    'analyzer': 'english', 'boost': 5.0, 'query': u'test',
-                    'operator': 'and', '_name': 'Match(name_l10n_english)',
-                }
+            'multi_match': {
+                '_name': 'MultiMatch(name_l10n_en-us,name_l10n_en-ca,name_l10n_en-gb)',
+                'analyzer': 'english',
+                'boost': 5.0,
+                'fields': ['name_l10n_en-us', 'name_l10n_en-ca', 'name_l10n_en-gb'],
+                'operator': 'and',
+                'query': 'test',
             }
         }
         assert expected in should
 
+    @time_machine.travel('2023-12-24', tick=False)
     def test_filter_featured_sort_random(self):
         qs = self._filter(data={'featured': 'true', 'sort': 'random'})
         bool_ = qs['query']['bool']
@@ -915,12 +1501,30 @@ class TestCombinedFilter(FilterTestsBase):
         assert 'must_not' not in bool_
 
         filter_ = bool_['filter']
-        assert {'terms': {'status': amo.REVIEWED_STATUSES}} in filter_
+        assert {'terms': {'status': list(amo.APPROVED_STATUSES)}} in filter_
         assert {'exists': {'field': 'current_version'}} in filter_
         assert {'term': {'is_disabled': False}} in filter_
 
         assert qs['sort'] == ['_score']
 
         assert bool_['must'][0]['function_score']['functions'] == [
-            {'random_score': {}}
+            {'random_score': {'seed': 17733072, 'field': 'id'}}
+        ]
+
+    @time_machine.travel('2023-12-24', tick=False)
+    def test_filter_promoted_sort_random(self):
+        qs = self._filter(data={'promoted': 'spotlight', 'sort': 'random'})
+        bool_ = qs['query']['bool']
+
+        assert 'must_not' not in bool_
+
+        filter_ = bool_['filter']
+        assert {'terms': {'status': list(amo.APPROVED_STATUSES)}} in filter_
+        assert {'exists': {'field': 'current_version'}} in filter_
+        assert {'term': {'is_disabled': False}} in filter_
+
+        assert qs['sort'] == ['_score']
+
+        assert bool_['must'][0]['function_score']['functions'] == [
+            {'random_score': {'seed': 17733072, 'field': 'id'}}
         ]

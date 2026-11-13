@@ -1,33 +1,52 @@
 from django import forms
 from django.contrib import admin
 from django.contrib.admin.widgets import ForeignKeyRawIdWidget
+from django.db.models import Prefetch
 from django.utils import translation
-from django.utils.html import format_html
+from django.utils.html import conditional_escape, format_html
 from django.utils.safestring import mark_safe
+from django.utils.translation import gettext
 
-import six
-
+from olympia import amo, promoted
+from olympia.addons.admin import AddonAdminByGuidOrSlugMixin
 from olympia.addons.models import Addon
+from olympia.amo.admin import AMOModelAdmin
+from olympia.amo.reverse import reverse
+from olympia.amo.templatetags.jinja_helpers import vite_asset
 from olympia.discovery.models import DiscoveryItem
+from olympia.hero.admin import (
+    PrimaryHeroImageAdmin,
+    PrimaryHeroInline,
+    SecondaryHeroAdmin,
+)
+from olympia.hero.models import PrimaryHeroImage, SecondaryHero
+from olympia.promoted.admin import (
+    PromotedAddonAdminInline,
+    PromotedApprovalInline,
+    PromotedGroupAdmin,
+)
+from olympia.promoted.models import PromotedGroup
+from olympia.shelves.admin import ShelfAdmin
+from olympia.shelves.models import Shelf
 
 
 # Popular locales, we typically don't want to show a string if it's not
 # translated in those.
-KEY_LOCALES_FOR_EDITORIAL_CONTENT = ('de', 'fr', 'es', 'pl', 'it', 'ja')
+KEY_LOCALES_FOR_EDITORIAL_CONTENT = ('de', 'fr', 'es-ES', 'pl', 'it', 'ja')
 
 
 class SlugOrPkChoiceField(forms.ModelChoiceField):
     """A ModelChoiceField that supports entering slugs instead of PKs for
     convenience."""
+
     def clean(self, value):
-        if (value and isinstance(value, six.string_types) and
-                not value.isdigit()):
+        if value and isinstance(value, str) and not value.isdigit():
             try:
-                value = self.queryset.values_list(
-                    'pk', flat=True).get(slug=value)
+                value = self.queryset.values_list('pk', flat=True).get(slug=value)
             except self.queryset.model.DoesNotExist:
-                value = value
-        return super(SlugOrPkChoiceField, self).clean(value)
+                # Leave value unchanged and let super().clean() reject it.
+                pass
+        return super().clean(value)
 
 
 class PositionFilter(admin.SimpleListFilter):
@@ -70,43 +89,210 @@ class PositionChinaFilter(PositionFilter):
     parameter_name = 'position_china'
 
 
-class DiscoveryItemAdmin(admin.ModelAdmin):
+class DiscoveryItemAdmin(AMOModelAdmin):
     class Media:
-        css = {
-            'all': ('css/admin/discovery.css',)
-        }
-    list_display = ('__str__', 'custom_addon_name', 'custom_heading',
-                    'position', 'position_china')
+        css = {'all': (vite_asset('css/admin-discovery.less'),)}
+
+    list_display = (
+        '__str__',
+        'position',
+        'position_china',
+    )
     list_filter = (PositionFilter, PositionChinaFilter)
     raw_id_fields = ('addon',)
     readonly_fields = ('previews',)
     view_on_site = False
 
+    def get_queryset(self, request):
+        # Select `addon` as well as it's `_current_version`.
+        # We are forced to use `prefetch_related` to ensure transforms
+        # are being run, though, we only care about translations
+        qset = DiscoveryItem.objects.all().prefetch_related(
+            Prefetch(
+                'addon',
+                queryset=(
+                    Addon.unfiltered.all()
+                    .select_related('_current_version')
+                    .only_translations()
+                ),
+            )
+        )
+        return qset
+
     def formfield_for_foreignkey(self, db_field, request=None, **kwargs):
         if db_field.name == 'addon':
             kwargs['widget'] = ForeignKeyRawIdWidget(
-                db_field.rel, self.admin_site, using=kwargs.get('using'))
-            kwargs['queryset'] = Addon.objects.public()
+                db_field.remote_field, self.admin_site, using=kwargs.get('using')
+            )
+            kwargs['queryset'] = Addon.objects.all()
             kwargs['help_text'] = db_field.help_text
             return SlugOrPkChoiceField(**kwargs)
-        return super(DiscoveryItemAdmin, self).formfield_for_foreignkey(
-            db_field, request, **kwargs)
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
     def build_preview(self, obj, locale):
         return format_html(
-            u'<div class="discovery-preview" data-locale="{}">'
-            u'<h2 class="heading">{}</h2>'
-            u'<div class="editorial-description">{}</div></div>',
+            '<div class="discovery-preview" data-locale="{}">'
+            '<h2 class="heading">{}</h2>'
+            '<div class="editorial-description">{}</div></div>',
             locale,
-            mark_safe(obj.heading),
-            mark_safe(obj.description))
+            obj.addon.name,
+            mark_safe(
+                gettext(obj.custom_description) or obj.addon_summary_fallback or ''
+            ),
+        )
 
     def previews(self, obj):
         translations = []
-        for locale in ('en-US', ) + KEY_LOCALES_FOR_EDITORIAL_CONTENT:
+        for locale in ('en-US',) + KEY_LOCALES_FOR_EDITORIAL_CONTENT:
             with translation.override(locale):
-                translations.append(self.build_preview(obj, locale))
-        return format_html(u''.join(translations))
+                translations.append(conditional_escape(self.build_preview(obj, locale)))
+        return mark_safe(''.join(translations))
 
 
+class PromotedAddon(promoted.models.PromotedAddon):
+    """Just a proxy class to have all the hero related objects in one
+    place under Discovery in django admin."""
+
+    class Meta:
+        proxy = True
+
+
+class PrimaryHeroImageUpload(PrimaryHeroImage):
+    """Just a proxy class to have all the hero related objects in one
+    place under Discovery in django admin."""
+
+    class Meta:
+        proxy = True
+        verbose_name_plural = 'primary hero images'
+
+
+class SecondaryHeroShelf(SecondaryHero):
+    """Just a proxy class to have all the hero shelf related objects in one
+    place under Discovery in django admin."""
+
+    class Meta(SecondaryHero.Meta):
+        proxy = True
+        verbose_name_plural = 'secondary hero shelves'
+
+
+class HomepageShelves(Shelf):
+    class Meta:
+        proxy = True
+        verbose_name_plural = 'homepage shelves'
+
+
+class DiscoveryAddon(Addon):
+    class Meta:
+        proxy = True
+
+
+class DiscoveryPromotedGroup(PromotedGroup):
+    class Meta:
+        proxy = True
+
+
+class AddonPromotionFilter(admin.SimpleListFilter):
+    title = 'Promotion'
+    parameter_name = 'promotion'
+
+    def lookups(self, request, model_admin):
+        return [
+            ('promoted', 'Promoted'),
+            ('not_promoted', 'Not Promoted'),
+        ]
+
+    def queryset(self, request, queryset):
+        is_null = self.value() != 'promoted'
+        if self.value():
+            return queryset.filter(promotedaddon__isnull=is_null).distinct()
+
+
+class AddonPromotedGroupFilter(admin.RelatedFieldListFilter):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.title = 'promoted group'
+
+
+class AddonApprovalFilter(admin.RelatedFieldListFilter):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.title = 'approved promoted group'
+
+
+class AddonPromotionApplicationFilter(admin.SimpleListFilter):
+    title = 'Application'
+    parameter_name = 'application'
+
+    def lookups(self, request, model_admin):
+        return [
+            (amo.ANDROID.id, amo.ANDROID.pretty),
+            (amo.FIREFOX.id, amo.FIREFOX.pretty),
+        ]
+
+    def queryset(self, request, queryset):
+        if self.value():
+            return queryset.filter(promotedaddon__application_id=self.value())
+
+
+DISCOVERY_ADDON_FIELDS = ['__str__', 'guid', 'addon', 'is_promoted']
+
+
+class DiscoveryAddonAdmin(AddonAdminByGuidOrSlugMixin, AMOModelAdmin):
+    model = DiscoveryAddon
+    inlines = [
+        PromotedAddonAdminInline,
+        PromotedApprovalInline,
+        PrimaryHeroInline,
+    ]
+    fields = DISCOVERY_ADDON_FIELDS
+    readonly_fields = DISCOVERY_ADDON_FIELDS
+    list_display = [field for field in DISCOVERY_ADDON_FIELDS if field != 'addon']
+    search_fields = (
+        'slug__startswith',
+        'guid__startswith',
+    )
+    list_filter = (
+        AddonPromotionFilter,
+        ('promotedaddon__promoted_group', AddonPromotedGroupFilter),
+        (
+            '_current_version__promoted_versions__promoted_group',
+            AddonApprovalFilter,
+        ),
+        'type',
+        AddonPromotionApplicationFilter,
+    )
+
+    def get_queryset(self, request):
+        # DiscoveryAddon is a proxy model, that doesn't play nice with
+        # translations (._meta.translated_fields is not set) but ultimately we
+        # don't need to return the proxy model here, so use `Addon` instead,
+        # removing other transforms while we're at it.
+        return Addon.unfiltered.all().only_translations()
+
+    def addon(self, obj):
+        if obj.pk:
+            return format_html(
+                '<a href="{}">{}</a>',
+                reverse('admin:addons_addon_change', args=[obj.pk]),
+                'addon',
+            )
+        return '-'
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+    def is_promoted(self, obj):
+        return obj.is_promoted
+
+    is_promoted.boolean = True
+
+
+admin.site.register(DiscoveryAddon, DiscoveryAddonAdmin)
+admin.site.register(DiscoveryPromotedGroup, PromotedGroupAdmin)
 admin.site.register(DiscoveryItem, DiscoveryItemAdmin)
+admin.site.register(PrimaryHeroImageUpload, PrimaryHeroImageAdmin)
+admin.site.register(SecondaryHeroShelf, SecondaryHeroAdmin)
+admin.site.register(HomepageShelves, ShelfAdmin)

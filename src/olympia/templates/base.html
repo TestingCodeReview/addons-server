@@ -14,57 +14,58 @@
     {% block rss_feed %}{% endblock %}
 
     {# L10n: {0} is an application, like Firefox. #}
-    <link title="{{ _('{0} Add-ons')|format_html(APP.pretty) }}"
+    <link title="{{ _('{0} Add-ons')|format_html(amo.FIREFOX.pretty) }}"
           rel="search" type="application/opensearchdescription+xml"
           href="{{ url('amo.opensearch') }}" />
 
     {% block site_css %}
-      {{ css('zamboni/css') }}
+      {{ vite_asset('css/fonts.less') }}
+      {{ vite_asset('css/zamboni.less') }}
+      {{ vite_asset('css/footer.less') }}
     {% endblock %}
 
     {% block extrahead %}{% endblock %}
 
     {% block restyle %}
-      {{ css('restyle/css') }}
+      {{ vite_asset('css/restyle.less') }}
     {% endblock %}
 
-    <noscript><link rel="stylesheet" href="{{ static('css/legacy/nojs.css') }}"></noscript>
+    <noscript>
+      {{ vite_asset('css/nojs.less') }}
+    </noscript>
 
-    {% if settings.DEBUG %}
-      {% if settings.LESS_LIVE_REFRESH %}
-        <meta id="live_refresh" name="live_refresh" value="1">
-      {% endif %}
-      {{ js('debug') }}
+    {% if settings.DEV_MODE %}
+      {{ vite_hmr_client() }}
     {% endif %}
 
-    {% if request.user.is_authenticated %}
+    {% if user.is_authenticated %}
       <meta name="csrf" content="{{ csrf_token }}">
     {% endif %}
 
-    {{ js('preload') }}
+    {{ vite_asset('js/preload.js') }}
   </head>
-  <body class="html-{{ DIR }} {{ request.APP.short }} moz-header-slim {% block bodyclass %}{% endblock %} restyle"
-        data-app="{{ request.APP.short }}"
-        data-appname="{{ request.APP.pretty }}"
-        data-appid="{{ request.APP.id }}"
-        data-anonymous="{{ (not request.user.is_authenticated)|json }}"
+  <body class="html-{{ DIR }} {{ amo.FIREFOX.short }} moz-header-slim {% block bodyclass %}{% endblock %} restyle"
+        data-app="{{ amo.FIREFOX.short }}"
+        data-appname="{{ amo.FIREFOX.pretty }}"
+        data-appid="{{ amo.FIREFOX.id }}"
+        data-anonymous="{{ (not user.is_authenticated)|json }}"
         data-readonly="{{ settings.READ_ONLY|json }}"
-        data-media-url="{{ MEDIA_URL }}"
-        data-static-url="{{ STATIC_URL }}"
         {% block bodyattrs %}{% endblock %}>
 
     <div id="main-wrapper">
-      {% set admin_message = get_config('site_notice') %}
-      {% if admin_message or settings.READ_ONLY %}
-        <div id="site-notice">
-          {% if admin_message %}
-            <p>{{ admin_message|safe }}</p>
-          {% endif %}
-          {% if settings.READ_ONLY %}
-            <p>{{ _("Some features are temporarily disabled while we perform website maintenance. We'll be back to full capacity shortly.") }}</p>
-          {% endif %}
-        </div>
-      {% endif %}
+      {% block site_notice %}
+        {% set admin_message = get_config(amo.config_keys.SITE_NOTICE) %}
+        {% if admin_message or settings.READ_ONLY %}
+          <div id="site-notice">
+            {% if admin_message %}
+              <p>{{ admin_message|safe }}</p>
+            {% endif %}
+            {% if settings.READ_ONLY %}
+              <p>{{ _("Some features are temporarily disabled while we perform website maintenance. We'll be back to full capacity shortly.") }}</p>
+            {% endif %}
+          </div>
+        {% endif %}
+      {% endblock %}
       <div class="section">
         {% block site_header %}
           <div class="header-bg">
@@ -74,40 +75,19 @@
                   <ul>
                     {% if not settings.READ_ONLY %}
                       {% block user_login_include %}
-                        {% include "impala/user_login.html" %}
+                        {% include "user_login.html" %}
                       {% endblock %}
                     {% endif %}
                     {% block aux_nav %}
-                      <li>
-                        <a href="#" id="other-apps"
-                           title="{{ _('Find add-ons for other applications') }}">
-                          {{ _('Other Applications') }}</a>
-                        <ul class="other-apps">
-                          {% for app in amo.APP_USAGE %}
-                            {% if app != request.APP %}
-                              <li id="app-{{ app.short }}" class="{{ app.short }}">
-                                <a href="{{ locale_url(app.short) }}">{{ app.pretty }}</a>
-                              </li>
-                            {% endif %}
-                          {% endfor %}
-                        </ul>
+                      <li class="nomenu">
+                        <a class="return" href="{{ url('home') }}">{{ _('Back to Add-ons') }}</a>
                       </li>
                     {% endblock aux_nav %}
                   </ul>
                 </nav>
-                {% block header_search %}
-                <div class="header-search" role="search">
-                  {% block search_form %}
-                    {% with query_term=query_term %}
-                      {% include 'impala/search.html' %}
-                    {% endwith %}
-                  {% endblock %}
-                </div>
-                {% endblock %}
                 <div id="masthead">
                   {% block site_header_title %}
-                  {% include "impala/header_title.html" %}
-                  {{ site_nav() }}
+                  {% include "header_title.html" %}
                   {% endblock %}
                   {% block navbar %}{% endblock %}
                   {% block site_stats %}{% endblock %}
@@ -115,17 +95,6 @@
               </div>
             </div> {# .header-bg #}
           </div> {# .amo-header-wrapper #}
-          {% if APP == amo.FIREFOX and waffle.switch('try-new-frontend') %}
-            <div class="site-balloon" id="try-new-frontend">
-              <p>
-                {{ _('AMO is getting a new look. Would you like to see it?') }}
-              </p>
-              <p>
-                <a href="#" class="mobile-link">{{ _('Visit the new site') }}</a>
-              </p>
-              <a href="#" class="close">{{ _('Close') }}</a>
-            </div>
-          {% endif %}
         {% endblock site_header %}
 
         {# Overridden in base_side_categories, which expands categories
@@ -140,39 +109,18 @@
         <span></span>
       </div>
       <div id="popup-staging">
-        <div id="add-to-collection" class="popup">
-          <div class="collection-add-login">
-            <p>{% trans %}
-              To create your own collections, you must have a Mozilla Add-ons account.
-            {% endtrans %}</p>
-            <p class="register-button">
-              <a class="button" href="{{ register_link() }}">{{ _('Create an Add-ons Account') }}</a>
-            </p>
-            <p>
-              {% trans login=login_link() %}
-                or <a href="{{ login }}">log in to your current account</a>
-              {% endtrans %}
-            </p>
-          </div>
-        </div>
         {% block popups %}
         {% endblock %}
       </div>
       {# js #}
       {% block site_js %}
-        <script src="{{ static('js/i18n/%s.js'|format(LANG)) }}"></script>
-        {{ js('common') }}
+        <script type="text/javascript" src="{{ static('js/i18n/%s.js'|format(LANG)) }}"></script>
+        {{ vite_asset('js/common.js') }}
       {% endblock %}
       {% block js %}{% endblock %}
       {% block footer %}
-        <div id="footer" role="contentinfo">
-          <div class="section">
-            {% block footer_extras %}
-            <img class="footerlogo" src="{{ static('img/zamboni/footer-logo-med.png') }}" alt="{{ _('Footer logo') }}">
-            {% endblock %}
-            {% include "footer.html" %}
-          </div> {# section #}
-        </div> {# footer #}
+          <div id="footer"></div>
+          {% include 'photon-footer.html' %}
       {% endblock %}
     </div>
   </body>

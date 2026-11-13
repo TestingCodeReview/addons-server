@@ -1,0 +1,77 @@
+<div id="modal-rollback-version" class="modal modal-rollback">
+    <h3>{{ _('Roll back to a previous version') }}</h3>
+    <form method="post" action="#rollback-version">
+        <table>
+        <tr>
+            <td colspan="3">
+                {% trans %}Users of this extension will roll back to the previous version you choose.{% endtrans %}
+                <a target="_blank" href="{{ settings.EXTENSION_WORKSHOP_URL }}/documentation/publish/version-rollback/">{{ _('Learn more') }}</a>
+            </td>
+        </tr>
+        <tr>
+            <td id="rollback-explainer-row"
+                data-template="{% trans current_version_number='n.n', selected_version_number='m.m' %}Current Version [{{ current_version_number }}] will roll back to Version [{{ selected_version_number }}]{% endtrans %}"
+                colspan="3"
+            >&nbsp;</td>
+        </tr>
+        {% if has_multiple_channels %}
+        <tr>
+        <td><label for="id_channel">{{ _('Distribution channel') }}</label></td>
+        <td>
+            {{ rollback_form.channel }}
+            {{ rollback_form.channel.errors }}
+        </td>
+        <td>&nbsp;</td>
+        </tr>
+        {% else %}
+        <input type="hidden" name="channel" value="{{ rollback_form.channel.value() }}">
+        {% endif %}
+        {% if has_listed_versions %}
+        <tr id="listed-version-row">
+        <td><label for="id_listed_version">{{ _('Version') }}</label></td>
+        <td data-current-version="{{ current_version.version }}">
+            {{ rollback_form.listed_version }}
+            {{ rollback_form.listed_version.errors }}
+        </td>
+        </tr>
+        {% endif %}
+        {% if has_unlisted_versions %}
+        <tr id="unlisted-version-row">
+        <td><label for="id_unlisted_version">{{ _('Version') }}</label></td>
+        <td data-current-version="{{ latest_approved_unlisted_version_number }}">
+            {{ rollback_form.unlisted_version }}
+            {{ rollback_form.unlisted_version.errors }}
+        </td>
+        </tr>
+        {% endif %}
+        {% if has_enterprise_versions %}
+        <tr id="enterprise-version-row">
+        <td><label for="id_enterprise_version">{{ _('Version') }}</label></td>
+        <td data-current-version="{{ latest_approved_enterprise_version_number }}">
+            {{ rollback_form.enterprise_version }}
+            {{ rollback_form.enterprise_version.errors }}
+        </td>
+        </tr>
+        {% endif %}
+        <tr>
+        <td><label for="id_new_version_string">{{ _('New version number') }}</label></td>
+        <td>
+            {{ rollback_form.new_version_string }}
+            {{ rollback_form.new_version_string.errors }}
+        </td>
+        </tr>
+        <tr><td colspan="3"><label for="id_release_notes">{{ _('Release Notes') }}</label></td></tr>
+        <tr><td colspan="3">
+            {{ rollback_form.release_notes }}
+            {{ rollback_form.release_notes.errors }}
+        </td></tr>
+        </table>
+        {{ rollback_form.non_field_errors() }}
+        {% csrf_token %}
+        <div class="modal-actions">
+        <button type="submit" class="submit" name="rollback-submit">{{ _('Roll back') }}</button>
+        <a href="#" class="close">{{ _('Cancel') }}</a>
+        </div>
+
+    </form>
+</div>

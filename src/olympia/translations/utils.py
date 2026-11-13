@@ -1,9 +1,13 @@
+from collections import defaultdict
+
+from django.conf import settings
+from django.db import models
 from django.template import engines
-from django.utils.encoding import force_text
+from django.utils.encoding import force_str
 
 import html5lib
 import jinja2
-import six
+import markupsafe
 
 
 def truncate_text(text, limit, killwords=False, end='...'):
@@ -21,8 +25,8 @@ def truncate_text(text, limit, killwords=False, end='...'):
     # Explicitly add "end" in any case, as Jinja can't know we're truncating
     # for real here, even though we might be at the end of a word.
     text = jinja2.filters.do_truncate(
-        engines['jinja2'].env, text, length=limit, killwords=killwords,
-        leeway=0, end='')
+        engines['jinja2'].env, text, length=limit, killwords=killwords, leeway=0, end=''
+    )
 
     return text + end, 0
 
@@ -49,7 +53,7 @@ def trim(tree, limit, killwords, end):
 def text_length(tree):
     """Find the length of the text content, excluding markup."""
     total = 0
-    for node in tree.getiterator():  # Traverse all the tree nodes.
+    for node in tree.iter():  # Traverse all the tree nodes.
         # In etree, a node has a text and tail attribute.
         # Eg: "<b>inner text</b> tail text <em>inner text</em>".
         if node.text:
@@ -69,7 +73,7 @@ def truncate(html, length, killwords=False, end='...'):
     """
     tree = html5lib.parseFragment(html)
     if text_length(tree) <= length:
-        return jinja2.Markup(html)
+        return markupsafe.Markup(html)
     else:
         # Get a truncated version of the tree.
         short, _ = trim(tree, length, killwords, end)
@@ -78,8 +82,9 @@ def truncate(html, length, killwords=False, end='...'):
         walker = html5lib.treewalkers.getTreeWalker('etree')
         stream = walker(short)
         serializer = html5lib.serializer.HTMLSerializer(
-            quote_attr_values='always', omit_optional_tags=False)
-        return jinja2.Markup(force_text(serializer.render(stream)))
+            quote_attr_values='always', omit_optional_tags=False
+        )
+        return markupsafe.Markup(force_str(serializer.render(stream)))
 
 
 def transfield_changed(field, initial, data):
@@ -95,8 +100,45 @@ def transfield_changed(field, initial, data):
                                                          'en-us': 'x',
                                                          'en-br': 'y'}
     """
-    initial = [(k, v.localized_string) for k, v in six.iteritems(initial)
-               if '%s_' % field in k and v is not None]
-    data = [('%s_%s' % (field, k), v) for k, v in six.iteritems(data[field])
-            if k != 'init']
+    initial = [
+        (k, v.localized_string)
+        for k, v in iter(initial.items())
+        if '%s_' % field in k and v is not None
+    ]
+    data = [(f'{field}_{k}', v) for k, v in iter(data[field].items()) if k != 'init']
     return set(initial) != set(data)
+
+
+def default_locale(obj):
+    """Get obj's default locale."""
+    if hasattr(obj, 'get_fallback'):
+        fallback = obj.get_fallback()
+        if isinstance(fallback, models.Field):
+            fallback = getattr(obj, fallback.name)
+        return fallback
+    else:
+        return settings.LANGUAGE_CODE
+
+
+def get_translation_differences(old_, new_):
+    out = {}
+    for field in {*old_, *new_}:
+        removed = list(old_[field] - new_[field])
+        added = list(new_[field] - old_[field])
+        if removed or added:
+            out[field] = {'removed': removed, 'added': added}
+    return out
+
+
+def fetch_translations_from_instance(instance, properties):
+    from .models import Translation
+
+    translation_ids_gen = (
+        (prop, getattr(instance, prop + '_id', None)) for prop in properties
+    )
+    translation_ids = {id_: prop for prop, id_ in translation_ids_gen if id_}
+    # Just get all the values together to make it simplier
+    out = defaultdict(set)
+    for trans in Translation.objects.filter(id__in=translation_ids):
+        out[translation_ids.get(trans.id, '_')].add(str(trans))
+    return out

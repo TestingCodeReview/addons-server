@@ -1,421 +1,299 @@
-# -*- coding: utf-8 -*-
-import datetime
-import os
-import time
+from unittest import mock
 
-from django.core.management.base import CommandError
-from django.utils.encoding import force_bytes
-from django.test.utils import override_settings
-
-import mock
+from celery import group
 
 from olympia import amo
 from olympia.addons import cron
-from olympia.addons.models import Addon, AppSupport
-from olympia.amo.tests import addon_factory, TestCase
+from olympia.addons.models import Addon, FrozenAddon
+from olympia.addons.tasks import (
+    update_addon_average_daily_users,
+    update_addon_weekly_downloads,
+)
+from olympia.amo.tests import TestCase, addon_factory
 from olympia.files.models import File
-from olympia.lib.es.utils import flag_reindexing_amo, unflag_reindexing_amo
-from olympia.stats.models import DownloadCount, UpdateCount
-from olympia.versions.models import Version
 
 
 class TestLastUpdated(TestCase):
-    fixtures = ['base/addon_3615', 'addons/listed', 'addons/persona']
-
-    def test_personas(self):
-        Addon.objects.update(type=amo.ADDON_PERSONA, status=amo.STATUS_PUBLIC)
-
-        cron.addon_last_updated()
-        for addon in Addon.objects.all():
-            assert addon.last_updated == addon.created
-
-        # Make sure it's stable.
-        cron.addon_last_updated()
-        for addon in Addon.objects.all():
-            assert addon.last_updated == addon.created
+    fixtures = ['base/addon_3615', 'addons/listed']
 
     def test_catchall(self):
         """Make sure the catch-all last_updated is stable and accurate."""
         # Nullify all datestatuschanged so the public add-ons hit the
         # catch-all.
-        (File.objects.filter(status=amo.STATUS_PUBLIC)
-         .update(datestatuschanged=None))
+        (File.objects.filter(status=amo.STATUS_APPROVED).update(datestatuschanged=None))
         Addon.objects.update(last_updated=None)
 
         cron.addon_last_updated()
-        for addon in Addon.objects.filter(status=amo.STATUS_PUBLIC,
-                                          type=amo.ADDON_EXTENSION):
+        for addon in Addon.objects.filter(
+            status=amo.STATUS_APPROVED, type=amo.ADDON_EXTENSION
+        ):
             assert addon.last_updated == addon.created
 
         # Make sure it's stable.
         cron.addon_last_updated()
-        for addon in Addon.objects.filter(status=amo.STATUS_PUBLIC):
+        for addon in Addon.objects.filter(status=amo.STATUS_APPROVED):
             assert addon.last_updated == addon.created
-
-    def test_appsupport(self):
-        ids = Addon.objects.values_list('id', flat=True)
-        cron.update_appsupport(ids)
-        assert AppSupport.objects.filter(app=amo.FIREFOX.id).count() == 3  # ??
-
-        # Run it again to test deletes.
-        cron.update_appsupport(ids)
-        assert AppSupport.objects.filter(app=amo.FIREFOX.id).count() == 3  # ??
-
-    def test_appsupport_listed(self):
-        AppSupport.objects.all().delete()
-        assert AppSupport.objects.filter(addon=3723).count() == 0
-        cron.update_addon_appsupport()
-        assert AppSupport.objects.filter(
-            addon=3723, app=amo.FIREFOX.id).count() == 0
-
-
-class TestHideDisabledFiles(TestCase):
-    msg = 'Moving disabled file: {source} => {destination}'
-
-    def setUp(self):
-        super(TestHideDisabledFiles, self).setUp()
-        p = amo.PLATFORM_ALL.id
-        self.addon = Addon.objects.create(type=amo.ADDON_EXTENSION)
-        self.version = Version.objects.create(addon=self.addon)
-        self.f1 = File.objects.create(version=self.version, platform=p,
-                                      filename='f1')
-        self.f2 = File.objects.create(version=self.version, filename='f2',
-                                      platform=p)
-
-    @mock.patch('olympia.files.models.os')
-    def test_leave_nondisabled_files(self, os_mock):
-        # All these addon/file status pairs should stay.
-        stati = ((amo.STATUS_PUBLIC, amo.STATUS_PUBLIC),
-                 (amo.STATUS_PUBLIC, amo.STATUS_AWAITING_REVIEW))
-        for addon_status, file_status in stati:
-            self.addon.update(status=addon_status)
-            File.objects.update(status=file_status)
-            cron.hide_disabled_files()
-            assert not os_mock.path.exists.called, (addon_status, file_status)
-
-    @mock.patch('olympia.files.models.File.move_file')
-    def test_move_user_disabled_addon(self, mv_mock):
-        # Use Addon.objects.update so the signal handler isn't called.
-        Addon.objects.filter(id=self.addon.id).update(
-            status=amo.STATUS_PUBLIC, disabled_by_user=True)
-        File.objects.update(status=amo.STATUS_PUBLIC)
-        cron.hide_disabled_files()
-        # Check that f2 was moved.
-        f2 = self.f2
-        mv_mock.assert_called_with(f2.file_path, f2.guarded_file_path,
-                                   self.msg)
-        # Check that f1 was moved as well.
-        f1 = self.f1
-        mv_mock.call_args = mv_mock.call_args_list[0]
-        mv_mock.assert_called_with(f1.file_path, f1.guarded_file_path,
-                                   self.msg)
-        # There's only 2 files, both should have been moved.
-        assert mv_mock.call_count == 2
-
-    @mock.patch('olympia.files.models.File.move_file')
-    def test_move_admin_disabled_addon(self, mv_mock):
-        Addon.objects.filter(id=self.addon.id).update(
-            status=amo.STATUS_DISABLED)
-        File.objects.update(status=amo.STATUS_PUBLIC)
-        cron.hide_disabled_files()
-        # Check that f2 was moved.
-        f2 = self.f2
-        mv_mock.assert_called_with(f2.file_path, f2.guarded_file_path,
-                                   self.msg)
-        # Check that f1 was moved as well.
-        f1 = self.f1
-        mv_mock.call_args = mv_mock.call_args_list[0]
-        mv_mock.assert_called_with(f1.file_path, f1.guarded_file_path,
-                                   self.msg)
-        # There's only 2 files, both should have been moved.
-        assert mv_mock.call_count == 2
-
-    @mock.patch('olympia.files.models.File.move_file')
-    def test_move_disabled_file(self, mv_mock):
-        Addon.objects.filter(id=self.addon.id).update(status=amo.STATUS_PUBLIC)
-        File.objects.filter(id=self.f1.id).update(status=amo.STATUS_DISABLED)
-        File.objects.filter(id=self.f2.id).update(
-            status=amo.STATUS_AWAITING_REVIEW)
-        cron.hide_disabled_files()
-        # Only f1 should have been moved.
-        f1 = self.f1
-        mv_mock.assert_called_with(f1.file_path, f1.guarded_file_path,
-                                   self.msg)
-        assert mv_mock.call_count == 1
-
-    @mock.patch('olympia.files.models.storage.exists')
-    @mock.patch('olympia.files.models.move_stored_file')
-    def test_move_disabled_addon_ioerror(self, mv_mock, storage_exists):
-        # raise an IOError for the first file, we need to make sure
-        # that the second one is still being properly processed
-        mv_mock.side_effect = [IOError, None]
-        storage_exists.return_value = True
-
-        # Use Addon.objects.update so the signal handler isn't called.
-        Addon.objects.filter(id=self.addon.id).update(
-            status=amo.STATUS_PUBLIC, disabled_by_user=True)
-        File.objects.update(status=amo.STATUS_PUBLIC)
-
-        cron.hide_disabled_files()
-
-        # Check that we called `move_stored_file` for f2 properly
-        f2 = self.f2
-        mv_mock.assert_called_with(
-            force_bytes(f2.file_path), force_bytes(f2.guarded_file_path))
-
-        # Check that we called `move_stored_file` for f1 properly
-        f1 = self.f1
-        mv_mock.call_args = mv_mock.call_args_list[0]
-        mv_mock.assert_called_with(
-            force_bytes(f1.file_path), force_bytes(f1.guarded_file_path))
-
-        # Make sure we called `mv` twice despite an `IOError` for the first
-        # file
-        assert mv_mock.call_count == 2
-
-
-class TestUnhideDisabledFiles(TestCase):
-
-    def setUp(self):
-        super(TestUnhideDisabledFiles, self).setUp()
-        p = amo.PLATFORM_ALL.id
-        self.addon = Addon.objects.create(type=amo.ADDON_EXTENSION)
-        self.version = Version.objects.create(addon=self.addon)
-        self.file_ = File.objects.create(version=self.version, platform=p,
-                                         filename=u'fé')
-
-    @mock.patch('olympia.files.models.os')
-    def test_leave_disabled_files(self, os_mock):
-        self.addon.update(status=amo.STATUS_DISABLED)
-        cron.unhide_disabled_files()
-        assert not os_mock.path.exists.called
-
-        self.addon.update(status=amo.STATUS_PUBLIC)
-        self.file_.update(status=amo.STATUS_DISABLED)
-        cron.unhide_disabled_files()
-        assert not os_mock.path.exists.called
-
-        self.addon.update(disabled_by_user=True)
-        self.file_.update(status=amo.STATUS_PUBLIC)
-        cron.unhide_disabled_files()
-        assert not os_mock.path.exists.called
-
-    @override_settings(GUARDED_ADDONS_PATH='/tmp/guarded-addons')
-    @mock.patch('olympia.files.models.File.unhide_disabled_file')
-    def test_move_not_disabled_files(self, unhide_mock):
-        fpath = 'src/olympia/files/fixtures/files/jetpack.xpi'
-        with amo.tests.copy_file(fpath, self.file_.guarded_file_path):
-            # Make sure this works correctly with bytestring base paths
-            # and doesn't raise a `UnicodeDecodeError`
-            # Reverts what got introduced in #11000 but accidently
-            # broke various other unicode-path related things
-            # (e.g file viewer extraction)
-            cron.unhide_disabled_files()
-            assert unhide_mock.called
 
 
 class TestAvgDailyUserCountTestCase(TestCase):
     fixtures = ['base/addon_3615']
 
     def setUp(self):
-        super(TestAvgDailyUserCountTestCase, self).setUp()
-        self.create_switch('local-statistics-processing')
+        super().setUp()
 
-    def test_13_day_window(self):
+    @mock.patch('olympia.addons.cron.get_addons_and_average_daily_users_from_bigquery')
+    def test_update_addon_average_daily_users_with_bigquery(self, get_mock):
         addon = Addon.objects.get(pk=3615)
-
-        # can't use a fixed date since we are relying on
-        # mysql to get us the `CURDATE()`
-        today = datetime.date.today()
-
-        # data is coming from `tab groups` add-on from
-        # jun 11 till may 29th 2017
-        stats = [
-            (today - datetime.timedelta(days=days_in_past), update_count)
-            for days_in_past, update_count in (
-                (1, 82708), (2, 78793), (3, 99586), (4, 104426), (5, 105431),
-                (6, 106065), (7, 98093), (8, 81710), (9, 78843), (10, 99383),
-                (11, 104431), (12, 105943), (13, 105039), (14, 100183),
-                (15, 82265)
-            )]
-
-        UpdateCount.objects.bulk_create([
-            UpdateCount(addon=addon, date=date, count=count)
-            for date, count in stats
-        ])
-
         addon.update(average_daily_users=0)
+        count = 56789
+        langpack = addon_factory(type=amo.ADDON_LPAPP, average_daily_users=0)
+        langpack_count = 12345
+        dictionary = addon_factory(type=amo.ADDON_DICT, average_daily_users=0)
+        dictionary_count = 5567
+        addon_without_count = addon_factory(type=amo.ADDON_DICT, average_daily_users=2)
+        deleted_addon = addon_factory(average_daily_users=0)
+        deleted_addon_count = 23456
+        deleted_addon.delete()
+        assert addon.average_daily_users == 0
+        assert langpack.average_daily_users == 0
+        assert dictionary.average_daily_users == 0
+        assert addon_without_count.average_daily_users == 2
+        assert deleted_addon.average_daily_users == 0
+
+        get_mock.return_value = [
+            (addon.guid, count),
+            (dictionary.guid, dictionary_count),
+            (langpack.guid, langpack_count),
+            (deleted_addon.guid, deleted_addon_count),
+        ]
 
         cron.update_addon_average_daily_users()
+        addon.refresh_from_db()
+        langpack.refresh_from_db()
+        dictionary.refresh_from_db()
+        addon_without_count.refresh_from_db()
+        deleted_addon.refresh_from_db()
 
+        get_mock.assert_called()
+        assert addon.average_daily_users == count
+        assert langpack.average_daily_users == langpack_count
+        assert dictionary.average_daily_users == dictionary_count
+        assert deleted_addon.average_daily_users == deleted_addon_count
+        # The value is 0 because the add-on does not exist in BigQuery.
+        assert addon_without_count.average_daily_users == 0
+
+    @mock.patch(
+        'olympia.addons.cron.flag_high_rating_addons_according_to_review_tier.si'
+    )
+    @mock.patch(
+        'olympia.addons.cron.flag_high_abuse_reports_addons_according_to_review_tier.si'
+    )
+    @mock.patch('olympia.addons.cron.add_high_adu_extensions_to_notable.si')
+    @mock.patch('olympia.addons.cron.create_chunked_tasks_signatures')
+    @mock.patch('olympia.addons.cron.get_addons_and_average_daily_users_from_bigquery')
+    def test_update_addon_average_daily_users_values_with_bigquery(
+        self,
+        get_mock,
+        create_chunked_mock,
+        add_high_adu_extensions_to_notable_mock,
+        flag_high_abuse_reports_addons_according_to_review_tier_mock,
+        flag_high_rating_addons_according_to_review_tier_mock,
+    ):
+        create_chunked_mock.return_value = group([])
+        addon = Addon.objects.get(pk=3615)
+        addon.update(average_daily_users=0)
+        count = 56789
+        langpack = addon_factory(type=amo.ADDON_LPAPP, average_daily_users=0)
+        langpack_count = 12345
+        dictionary = addon_factory(type=amo.ADDON_DICT, average_daily_users=0)
+        dictionary_count = 6789
+        addon_without_count = addon_factory(type=amo.ADDON_DICT, average_daily_users=2)
+        # This one should be ignored.
+        addon_factory(guid=None, type=amo.ADDON_LPAPP)
+        # This one should be ignored as well.
+        addon_factory(guid='', type=amo.ADDON_LPAPP)
+        # Deleted add-ons should still have their usage updated.
+        deleted_addon = addon_factory(average_daily_users=0)
+        deleted_addon_count = 23456
+        deleted_addon.delete()
+
+        get_mock.return_value = [
+            (addon.guid, count),
+            (langpack.guid, langpack_count),
+            (dictionary.guid, dictionary_count),
+            (deleted_addon.guid, deleted_addon_count),
+        ]
+
+        chunk_size = 123
+        cron.update_addon_average_daily_users(chunk_size)
+
+        create_chunked_mock.assert_called_with(
+            update_addon_average_daily_users,
+            [
+                (addon_without_count.guid, 0),
+                (addon.guid, count),
+                (langpack.guid, langpack_count),
+                (dictionary.guid, dictionary_count),
+                (deleted_addon.guid, deleted_addon_count),
+            ],
+            chunk_size,
+        )
+
+        assert add_high_adu_extensions_to_notable_mock.call_count == 1
+        assert (
+            flag_high_abuse_reports_addons_according_to_review_tier_mock.call_count == 1
+        )
+        assert flag_high_rating_addons_according_to_review_tier_mock.call_count == 1
+
+
+class TestUpdateAddonHotness(TestCase):
+    def setUp(self):
+        super().setUp()
+
+        self.extension = addon_factory()
+        self.unpopular_extension = addon_factory()
+        self.barely_popular_extension = addon_factory()
+        self.static_theme = addon_factory(type=amo.ADDON_STATICTHEME)
+        self.unpopular_theme = addon_factory(type=amo.ADDON_STATICTHEME)
+        self.barely_popular_theme = addon_factory(type=amo.ADDON_STATICTHEME)
+        self.awaiting_review = addon_factory(status=amo.STATUS_NOMINATED)
+        self.deleted_extension = addon_factory()
+        self.deleted_extension.delete()
+        self.previously_unknown_extension = addon_factory()
+
+        self.frozen_extension = addon_factory()
+        FrozenAddon.objects.create(addon=self.frozen_extension)
+        # This frozen add-on should be ignored.
+        FrozenAddon.objects.create(addon=addon_factory(guid=None))
+
+        self.not_in_bigquery = addon_factory(hotness=123)
+        self.deleted_not_in_bigquery = addon_factory(hotness=666)
+        self.deleted_not_in_bigquery.delete()
+
+    @mock.patch('olympia.addons.cron.flag_high_hotness_according_to_review_tier.si')
+    @mock.patch('olympia.addons.cron.get_averages_by_addon_from_bigquery')
+    def test_basic(self, get_averages_mock, flag_high_hotness_mock):
+        get_averages_mock.return_value = {
+            self.extension.guid: {
+                'avg_this_week': 827080,
+                'avg_previous_week': 787930,
+            },
+            self.static_theme.guid: {
+                'avg_this_week': 827080,
+                'avg_previous_week': 787930,
+            },
+            self.unpopular_extension.guid: {
+                'avg_this_week': 99,
+                'avg_previous_week': 150,
+            },
+            self.unpopular_theme.guid: {
+                'avg_this_week': 249,
+                'avg_previous_week': 300,
+            },
+            self.barely_popular_extension.guid: {
+                'avg_this_week': 100,
+                'avg_previous_week': 75,
+            },
+            self.barely_popular_theme.guid: {
+                'avg_this_week': 250,
+                'avg_previous_week': 188,
+            },
+            'unknown@guid': {
+                'avg_this_week': 10000,
+                'avg_previous_week': 10000,
+            },
+            self.awaiting_review.guid: {
+                'avg_this_week': 827080,
+                'avg_previous_week': 787930,
+            },
+            self.deleted_extension.guid: {
+                'avg_this_week': 1040,
+                'avg_previous_week': 1000,
+            },
+            self.previously_unknown_extension.guid: {
+                'avg_this_week': 4815,
+                'avg_previous_week': 0,
+            },
+        }
+
+        cron.update_addon_hotness()
+
+        assert self.extension.reload().hotness == 0.049687154950312847
+        assert self.static_theme.reload().hotness == 0.049687154950312847
+
+        # Unpopular extensions and static themes have a hotness of 0.
+        assert self.unpopular_extension.reload().hotness == 0
+        assert self.unpopular_theme.reload().hotness == 0
+
+        # Themes have different threshold for popularity, and we only start
+        # computing hotness for them above 250. This one barely matches that.
+        assert self.barely_popular_theme.reload().hotness == 0.32978723404255317
+
+        # For extensions it's above 100.
+        assert self.barely_popular_extension.reload().hotness == 0.3333333333333333
+
+        # Deleted or awaiting review add-ons get a hotness too.
+        assert self.awaiting_review.reload().hotness == 0.049687154950312847
+        assert self.deleted_extension.reload().hotness == 0.04
+
+        # Previously unknown (nothing last week), we still compute hotness.
+        assert self.previously_unknown_extension.reload().hotness == 4814.0
+
+        # Exclude frozen add-ons too.
+        assert self.frozen_extension.reload().hotness == 0
+        get_averages_mock.assert_called_once_with(
+            today=mock.ANY, exclude=[self.frozen_extension.guid]
+        )
+
+        assert self.not_in_bigquery.reload().hotness == 0
+        assert self.deleted_not_in_bigquery.reload().hotness == 0
+
+        assert flag_high_hotness_mock.call_count == 1
+
+
+class TestUpdateAddonWeeklyDownloads(TestCase):
+    @mock.patch('olympia.addons.cron.create_chunked_tasks_signatures')
+    @mock.patch('olympia.addons.cron.get_addons_and_weekly_downloads_from_bigquery')
+    def test_calls_create_chunked_tasks_signatures(self, get_mock, create_chunked_mock):
+        create_chunked_mock.return_value = group([])
+        addon = addon_factory(weekly_downloads=0)
+        count = 56789
+        langpack = addon_factory(type=amo.ADDON_LPAPP, weekly_downloads=0)
+        langpack_count = 12345
+        dictionary = addon_factory(type=amo.ADDON_DICT, weekly_downloads=0)
+        dictionary_count = 6789
+        addon_without_count = addon_factory(type=amo.ADDON_DICT, weekly_downloads=2)
+        # This one should be ignored.
+        addon_factory(guid=None, type=amo.ADDON_LPAPP)
+        # This one should be ignored as well.
+        addon_factory(guid='', type=amo.ADDON_LPAPP)
+        get_mock.return_value = [
+            (addon.addonguid.hashed_guid, count),
+            (langpack.addonguid.hashed_guid, langpack_count),
+            (dictionary.addonguid.hashed_guid, dictionary_count),
+        ]
+
+        chunk_size = 123
+        cron.update_addon_weekly_downloads(chunk_size)
+
+        create_chunked_mock.assert_called_with(
+            update_addon_weekly_downloads,
+            [
+                (addon_without_count.addonguid.hashed_guid, 0),
+                (addon.addonguid.hashed_guid, count),
+                (langpack.addonguid.hashed_guid, langpack_count),
+                (dictionary.addonguid.hashed_guid, dictionary_count),
+            ],
+            chunk_size,
+        )
+
+    @mock.patch('olympia.addons.cron.get_addons_and_weekly_downloads_from_bigquery')
+    def test_update_weekly_downloads(self, get_mock):
+        addon = addon_factory(weekly_downloads=0)
+        count = 56789
+        get_mock.return_value = [(addon.addonguid.hashed_guid, count)]
+
+        cron.update_addon_weekly_downloads()
         addon.refresh_from_db()
 
-        assert (
-            82708 + 78793 + 99586 + 104426 + 105431 + 106065 + 98093 +
-            81710 + 78843 + 99383 + 104431 + 105943) / 12 == 95451
-
-        assert addon.average_daily_users == 95451
-
-    def test_adu_flag(self):
-        addon = Addon.objects.get(pk=3615)
-
-        now = datetime.datetime.now()
-        counter = UpdateCount.objects.create(addon=addon, date=now,
-                                             count=1234)
-        counter.save()
-
-        assert \
-            addon.average_daily_users > addon.total_downloads + 10000, \
-            ('Unexpected ADU count. ADU of %d not greater than %d' % (
-                addon.average_daily_users, addon.total_downloads + 10000))
-
-        adu = cron.update_addon_average_daily_users
-        flag_reindexing_amo('new', 'old', 'alias')
-        try:
-            # Should fail.
-            self.assertRaises(CommandError, adu)
-
-            # Should work with the environ flag.
-            os.environ['FORCE_INDEXING'] = '1'
-            adu()
-        finally:
-            unflag_reindexing_amo()
-            os.environ.pop('FORCE_INDEXING', None)
-
-        addon = Addon.objects.get(pk=3615)
-        assert addon.average_daily_users == 1234
-
-    def test_total_and_average_downloads(self):
-        addon = Addon.objects.get(pk=3615)
-        old_total_downloads = addon.total_downloads
-        DownloadCount.objects.update_or_create(
-            addon=addon, date=datetime.date.today(), defaults={'count': 42})
-        DownloadCount.objects.update_or_create(
-            addon=addon,
-            date=datetime.date.today() - datetime.timedelta(days=1),
-            defaults={'count': 59})
-
-        addon_deleted = addon_factory()
-        addon_deleted.delete()
-        DownloadCount.objects.update_or_create(
-            addon=addon_deleted,
-            date=datetime.date.today(), defaults={'count': 666})
-
-        addon2 = addon_factory()
-        DownloadCount.objects.update_or_create(
-            addon=addon2,
-            date=datetime.date.today() - datetime.timedelta(days=366),
-            defaults={'count': 21})
-
-        addon_factory()  # No downloads for this add-on
-
-        cron.update_addon_download_totals()
-
-        addon.reload()
-        assert addon.total_downloads != old_total_downloads
-        assert addon.total_downloads == 101
-
-        addon2.reload()
-        assert addon2.total_downloads == 21
-
-    @mock.patch('olympia.addons.cron.Addon.objects.get')
-    def test_total_and_average_downloads_addon_doesnotexist(self, get_mock):
-        """Regression test
-
-        for https://github.com/mozilla/addons-server/issues/8711
-        """
-        get_mock.side_effect = Addon.DoesNotExist()
-
-        # Make sure that we don't raise an error when logging
-        cron.update_addon_download_totals()
-
-
-class TestCleanupImageFiles(TestCase):
-
-    @mock.patch('olympia.addons.cron.os')
-    def test_cleanup_image_files_exists(self, os_mock):
-        cron.cleanup_image_files()
-        assert os_mock.path.exists.called
-
-    @mock.patch('olympia.addons.cron.os.unlink')
-    @mock.patch('olympia.addons.cron.os.stat')
-    @mock.patch('olympia.addons.cron.os.listdir')
-    @mock.patch('olympia.addons.cron.os.path')
-    def test_cleanup_image_files_age(self, os_path_mock, os_listdir_mock,
-                                     os_stat_mock, os_unlink_mock):
-        os_path_mock.exists.return_value = True
-        os_listdir_mock.return_value = ['foo']
-
-        young = datetime.datetime.today() - datetime.timedelta(hours=10)
-        old = datetime.datetime.today() - datetime.timedelta(days=2)
-
-        # Don't delete too young files.
-        stat_mock = mock.Mock()
-        stat_mock.st_atime = time.mktime(young.timetuple())
-        os_stat_mock.return_value = stat_mock
-        cron.cleanup_image_files()
-        assert os_listdir_mock.called
-        assert os_stat_mock.called
-        assert not os_unlink_mock.called
-
-        # Delete old files.
-        stat_mock = mock.Mock()
-        stat_mock.st_atime = time.mktime(old.timetuple())
-        os_stat_mock.return_value = stat_mock
-        cron.cleanup_image_files()
-        assert os_listdir_mock.called
-        assert os_stat_mock.called
-        assert os_unlink_mock.called
-
-
-class TestDeliverHotness(TestCase):
-    def setUp(self):
-        self.persona = addon_factory(type=amo.ADDON_PERSONA)
-        self.extension = addon_factory()
-        self.static_theme = addon_factory(type=amo.ADDON_STATICTHEME)
-        self.awaiting_review = addon_factory(status=amo.STATUS_NOMINATED)
-
-        today = datetime.date.today()
-
-        stats = [
-            (today - datetime.timedelta(days=days_in_past), update_count)
-            for days_in_past, update_count in (
-                (1, 827080), (2, 787930), (3, 995860), (4, 1044260),
-                (5, 105431), (6, 106065), (7, 980930), (8, 817100), (9, 78843),
-                (10, 993830), (11, 104431), (12, 105943), (13, 105039),
-                (14, 100183), (15, 82265), (16, 100183), (17, 82265),
-                (18, 100183), (19, 82265), (20, 100183), (21, 82265),
-
-            )]
-
-        for obj in (self.persona, self.extension, self.static_theme,
-                    self.awaiting_review):
-            UpdateCount.objects.bulk_create([
-                UpdateCount(addon=obj, date=date, count=count)
-                for date, count in stats
-            ])
-
-    @mock.patch('olympia.addons.cron.time.sleep', lambda *a, **kw: None)
-    def test_basic(self):
-        cron.deliver_hotness()
-
-        # Personas are excluded
-        assert self.persona.reload().hotness == 0
-
-        assert self.extension.reload().hotness == 1.652672126445855
-        assert self.static_theme.reload().hotness == 1.652672126445855
-
-        # Only public add-ons get hotness calculated
-        assert self.awaiting_review.reload().hotness == 0
-
-    @mock.patch('olympia.addons.cron.time.sleep', lambda *a, **kw: None)
-    def test_avoid_overwriting_values(self):
-        cron.deliver_hotness()
-
-        assert self.extension.reload().hotness == 1.652672126445855
-
-        # Make sure we don't update add-ons if nothing changed
-        with mock.patch('olympia.addons.cron.Addon.update') as mocked_update:
-            cron.deliver_hotness()
-
-        assert not mocked_update.called
+        assert addon.weekly_downloads == count

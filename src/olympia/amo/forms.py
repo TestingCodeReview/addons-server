@@ -1,31 +1,13 @@
-from django import forms
-from django.conf import settings
+import itertools
 
-from olympia.amo.fields import ReCaptchaField
-from olympia.translations.fields import TranslatedField
+from django import forms
 from django.utils.functional import cached_property
 
-
-class AbuseForm(forms.Form):
-    recaptcha = ReCaptchaField(label='')
-    text = forms.CharField(required=True,
-                           label='',
-                           widget=forms.Textarea())
-
-    def __init__(self, *args, **kwargs):
-        self.request = kwargs.pop('request')
-        self.has_recaptcha = True
-
-        super(AbuseForm, self).__init__(*args, **kwargs)
-
-        if (not self.request.user.is_anonymous or
-                not settings.NOBOT_RECAPTCHA_PRIVATE_KEY):
-            del self.fields['recaptcha']
-            self.has_recaptcha = False
+from olympia.amo.utils import BaseModelSerializerAndFormMixin
+from olympia.translations.fields import TranslatedField
 
 
-class AMOModelForm(forms.ModelForm):
-
+class AMOModelForm(BaseModelSerializerAndFormMixin, forms.ModelForm):
     @cached_property
     def changed_data(self):
         """
@@ -39,9 +21,9 @@ class AMOModelForm(forms.ModelForm):
         changed_data = forms.ModelForm.changed_data.__get__(self)[:]
 
         changed_translation_fields = [
-            field.name for field in Model._meta.get_fields()
-            if isinstance(field, TranslatedField) and
-            field.name in changed_data
+            field.name
+            for field in Model._meta.get_fields()
+            if isinstance(field, TranslatedField) and field.name in changed_data
         ]
 
         # If there are translated fields, pull the model from the database
@@ -57,3 +39,32 @@ class AMOModelForm(forms.ModelForm):
                     changed_data.remove(field)
 
         return changed_data
+
+
+class LimitedModelChoiceField(forms.ModelChoiceField):
+    limit_choice_count = 100  # django docs suggest 100 is the max you should use
+
+    def __init__(self, queryset, *, limit_choice_count=None, **kwargs):
+        if limit_choice_count is not None:
+            self.limit_choice_count = limit_choice_count
+        self.to_field_name = kwargs.get('to_field_name', None)
+        super().__init__(queryset, **kwargs)
+
+    def _set_queryset(self, queryset):
+        if hasattr(self, '_choices'):
+            del self._choices
+        super()._set_queryset(queryset)
+
+    queryset = property(forms.ModelChoiceField.queryset.fget, _set_queryset)
+
+    def _get_choices(self):
+        # If self._choices is set, we called this before.
+        if hasattr(self, '_choices'):
+            return self._choices
+
+        count = self.limit_choice_count + (1 if self.empty_label else 0)
+        # We need to limit the choices, but we can't slice the queryset.
+        self._choices = list(itertools.islice(self.iterator(self), count))
+        return self._choices
+
+    choices = property(_get_choices, forms.ModelChoiceField.choices.fset)

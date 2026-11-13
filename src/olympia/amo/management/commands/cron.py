@@ -1,5 +1,5 @@
 import argparse
-
+from datetime import datetime
 from importlib import import_module
 
 from django.conf import settings
@@ -12,6 +12,10 @@ log = logger.getLogger('z.cron')
 
 
 class Command(BaseCommand):
+    """Cron jobs are defined in
+    https://github.com/mozilla-it/webservices-infra/blob/main/amo/k8s/addons-server/values.yaml
+    """
+
     help = 'Run one of the predefined cron jobs'
 
     def add_arguments(self, parser):
@@ -22,20 +26,34 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         if not options['name']:
-            log.error("Cron called without args")
-            raise CommandError('These jobs are available:\n%s' % '\n'.join(
-                sorted(settings.CRON_JOBS.keys())))
+            log.error('Cron called without args')
+            raise CommandError(
+                'These jobs are available:\n%s'
+                % '\n'.join(sorted(settings.CRON_JOBS.keys()))
+            )
 
-        name, args = options['name'], options['cron_args']
+        name, args_and_kwargs = options['name'], options['cron_args']
+        args = [arg for arg in args_and_kwargs if '=' not in arg]
+        kwargs = dict(
+            kwarg.split('=', maxsplit=1)
+            for kwarg in args_and_kwargs
+            if kwarg not in args
+        )
 
         path = settings.CRON_JOBS.get(name)
         if not path:
-            log.error('Cron called with an unknown cron job: %s %s' %
-                      (name, args))
-            raise CommandError(u'Unrecognized job name: %s' % name)
+            log.error(f'Cron called with an unknown cron job: {name} {args} {kwargs}')
+            raise CommandError(f'Unrecognized job name: {name}')
 
         module = import_module(path)
 
-        log.info("Beginning job: %s %s" % (name, args))
-        getattr(module, name)(*args)
-        log.info("Ending job: %s %s" % (name, args))
+        start_ms = datetime.now().timestamp() * 1000
+        log.info(f'Beginning job: {name} {args} {kwargs} (start timestamp: {start_ms})')
+
+        getattr(module, name)(*args, **kwargs)
+
+        end_ms = datetime.now().timestamp() * 1000
+        log.info(
+            f'Ending job: {name} {args} {kwargs} '
+            f'(start timestamp: {start_ms}; milliseconds taken: {end_ms - start_ms})'
+        )

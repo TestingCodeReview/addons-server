@@ -1,0 +1,57 @@
+# CI for the pinguino frontend subproject (src/pinguino/devhub), which is self-contained
+# and not part of the olympia image — so it runs on its own Node toolchain rather
+# than through the image-based _test_* workflows. Path-filtered to only run when
+# pinguino changes.
+name: Test Pinguino
+
+on:
+  pull_request:
+    paths:
+      - 'src/pinguino/devhub/**'
+      - '.github/workflows/_test_pinguino.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/pinguino/devhub/**'
+      - '.github/workflows/_test_pinguino.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-pinguino-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src/pinguino/devhub
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: src/pinguino/devhub/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Lint (Biome)
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build

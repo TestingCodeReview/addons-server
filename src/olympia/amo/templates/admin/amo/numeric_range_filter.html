@@ -1,0 +1,29 @@
+<details data-filter-title="{{ title }}" open>
+<summary>By {{ title }}</summary>
+{% with choices.0 as all_choice %}
+<form method="GET" action=".">
+    <div>
+        {# Use .params.lists to properly support multiple values - so that if a filter using this template is present multiple times on the page, its current values are all passed to the new page when submitting this form #}
+        {% for key, values in all_choice.params.lists %}
+            {% for value in values %}
+                <input type="hidden" name="{{ key }}" value="{{ value }}" />
+            {% endfor %}
+        {% endfor %}
+    </div>
+    <ul>
+        <li {% if all_choice.selected %}class="selected"{% endif %}>
+            <a href="{{ all_choice.query_string }}">All</a>
+        </li>
+        <li>
+            {% for field in spec.form %}
+                {{ field.errors }}
+                {{ field.label_tag }} {{ field }}
+            {% endfor %}
+        </li>
+        <li>
+            <input type="submit" value="Submit" />
+        </li>
+    </ul>
+</form>
+{% endwith %}
+</details>

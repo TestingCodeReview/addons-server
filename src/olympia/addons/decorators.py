@@ -2,43 +2,55 @@ import functools
 
 from django import http
 from django.shortcuts import get_object_or_404
+from django.template.response import TemplateResponse
+from django.utils.translation import gettext
 
+import waffle
+from rest_framework import status
+from rest_framework.response import Response
+
+from olympia import amo
 from olympia.access import acl
 from olympia.addons.models import Addon
 
 
-def owner_or_unlisted_reviewer(request, addon):
-    return (acl.check_unlisted_addons_reviewer(request) or
-            # We don't want "admins" here, because it includes anyone with the
-            # "Addons:Edit" perm, we only want those with
-            # "Addons:ReviewUnlisted" perm (which is checked above).
-            acl.check_addon_ownership(request, addon, admin=False, dev=True))
-
-
-def addon_view(f, qs=Addon.objects.all):
+def addon_view(f, qs=Addon.objects.all, include_deleted_when_checking_versions=False):
     @functools.wraps(f)
     def wrapper(request, addon_id=None, *args, **kw):
         """Provides an addon instance to the view given addon_id, which can be
-        an Addon pk or a slug."""
-        assert addon_id, 'Must provide addon id or slug'
+        an Addon pk, guid or a slug."""
+        assert addon_id, 'Must provide addon id, guid or slug'
 
-        if addon_id and addon_id.isdigit():
-            addon = get_object_or_404(qs(), id=addon_id)
+        lookup_field = Addon.get_lookup_field(addon_id)
+        if lookup_field == 'slug':
+            addon = get_object_or_404(qs(), slug=addon_id)
+        else:
+            try:
+                if lookup_field == 'pk':
+                    addon = qs().get(id=addon_id)
+                elif lookup_field == 'guid':
+                    addon = qs().get(guid=addon_id)
+            except Addon.DoesNotExist as exc:
+                raise http.Http404 from exc
             # Don't get in an infinite loop if addon.slug.isdigit().
             if addon.slug and addon.slug != addon_id:
                 url = request.path.replace(addon_id, addon.slug, 1)
-
                 if request.GET:
                     url += '?' + request.GET.urlencode()
                 return http.HttpResponsePermanentRedirect(url)
-        else:
-            addon = get_object_or_404(qs(), slug=addon_id)
-        # If the addon is unlisted it needs either an owner/viewer/dev/support,
-        # or an unlisted addon reviewer.
-        if not (addon.has_listed_versions() or
-                owner_or_unlisted_reviewer(request, addon)):
+
+        # If the addon has no listed versions it needs either an author
+        # (owner/viewer/dev/support) or an unlisted addon reviewer.
+        has_listed_versions = addon.has_version_in_channel(
+            amo.CHANNEL_LISTED, include_deleted=include_deleted_when_checking_versions
+        )
+        if not (
+            has_listed_versions
+            or acl.author_or_unlisted_viewer_or_reviewer(request.user, addon)
+        ):
             raise http.Http404
         return f(request, addon, *args, **kw)
+
     return wrapper
 
 
@@ -50,3 +62,30 @@ def addon_view_factory(qs):
     # GOOD: lambda: Addon.objects.valid().filter(type=1)
     # BAD: Addon.objects.valid()
     return functools.partial(addon_view, qs=qs)
+
+
+def require_submissions_enabled(f):
+    """Require the enable-submissions waffle flag to be enabled."""
+
+    @functools.wraps(f)
+    def wrapper(request, *args, **kw):
+        flag = waffle.get_waffle_flag_model().get('enable-submissions')
+        if flag.is_active(request):
+            return f(request, *args, **kw)
+        reason = flag.note if hasattr(flag, 'note') else None
+        if getattr(request, 'is_api', True):
+            return Response(
+                {
+                    'error': gettext('Add-on uploads are temporarily unavailable.'),
+                    'reason': reason,
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        return TemplateResponse(
+            request,
+            'amo/submissions_disabled.html',
+            status=503,
+            context={'reason': reason},
+        )
+
+    return wrapper

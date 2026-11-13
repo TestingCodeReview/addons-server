@@ -1,12 +1,10 @@
-# -*- coding: utf-8 -*-
-
 from django.core.management.base import BaseCommand
-from django.utils import translation
-from django.test.utils import override_settings
 from django.db.models.signals import post_save
+from django.test.utils import override_settings
+from django.utils import translation
 
-from olympia.landfill.serializers import GenerateAddonsSerializer
 from olympia.addons.models import Addon, update_search_index
+from olympia.landfill.serializers import GenerateAddonsSerializer
 
 
 #  Featured collections on the homepage.
@@ -20,35 +18,38 @@ featured_collections = [
 
 #  Featured collections on the homepage.
 base_collections = [
-    u'bookmark-managers',
-    u'password-managers',
-    u'ad-blockers',
-    u'smarter-shopping',
-    u'be-more-productive',
-    u'watching-videos',
+    'bookmark-managers',
+    'password-managers',
+    'ad-blockers',
+    'smarter-shopping',
+    'be-more-productive',
+    'watching-videos',
+    'youtube-boosters',
+    'feed-readers',
+    'privacy-matters',
 ]
 
 #  Addons that exist in the carousel.
 #  Needs to be updated as the homepage is updated
 hero_addons = [
-    u'facebook-container'
-    u'midnight-lizard-quantum'
-    u'turbo-download-manager'
-    u'auth-helper'
-    u'ip-address-and-domain-info'
-    u'ublock-origin'
-    u'ghostery'
-    u'multi-account-containers'
-    u'transparent-standalone-image'
-    u'tabliss'
-    u'share-backported'
-    u'view-page-archive'
-    u'privacy-possum'
-    u'page-translate'
-    u'textmarkerpro'
-    u'forget_me_not'
-    u'groupspeeddial'
-    u'styl-us'
+    'facebook-container',
+    'midnight-lizard-quantum',
+    'turbo-download-manager',
+    'auth-helper',
+    'ip-address-and-domain-info',
+    'ublock-origin',
+    'ghostery',
+    'multi-account-containers',
+    'transparent-standalone-image',
+    'tabliss',
+    'share-backported',
+    'view-page-archive',
+    'privacy-possum',
+    'page-translate',
+    'textmarkerpro',
+    'forget_me_not',
+    'groupspeeddial',
+    'styl-us',
 ]
 
 
@@ -69,23 +70,21 @@ class Command(BaseCommand):
     def handle(self, *args, **kwargs):
         # Disconnect reindexing for every save, we'll reindex
         # once all addons were generated
-        post_save.disconnect(update_search_index, sender=Addon,
-                             dispatch_uid='addons.search.index')
+        post_save.disconnect(
+            update_search_index, sender=Addon, dispatch_uid='addons.search.index'
+        )
 
-        with override_settings(CELERY_ALWAYS_EAGER=True):
+        with override_settings(CELERY_TASK_ALWAYS_EAGER=True):
             translation.activate('en-US')
             serializer = GenerateAddonsSerializer()
             serializer.create_generic_featured_addons()
             serializer.create_featured_addon_with_version()
             serializer.create_featured_theme()
-            serializer.create_featured_collections()
             serializer.create_featured_themes()
-            for addon in featured_collections:
-                serializer.create_a_named_collection_and_addon(
-                    addon, author='mozilla')
             for addon in base_collections:
-                serializer.create_a_named_collection_and_addon(
-                    addon, author='mozilla')
+                serializer.create_a_named_collection_and_addon(addon, author='mozilla')
+            for addon in hero_addons:
+                serializer.create_a_named_collection_and_addon(addon, author='mozilla')
             for addon in hero_addons:
                 serializer.create_named_addon_with_author(addon)
             serializer.create_installable_addon()

@@ -1,0 +1,1148 @@
+import hashlib
+import hmac
+import itertools
+import json
+import os
+import uuid
+from collections import defaultdict
+
+from django.conf import settings
+from django.db import transaction
+from django.db.models import F
+from django.template.defaultfilters import slugify
+from django.urls import reverse
+
+import regex
+import requests
+import waffle
+import yara_x
+from django_statsd.clients import statsd
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util import Retry
+
+import olympia.core.logger
+from olympia import amo
+from olympia.addons.models import Addon
+from olympia.amo.celery import create_chunked_tasks_signatures, task
+from olympia.amo.decorators import use_primary_db
+from olympia.amo.middleware import REQUEST_ID_HEADER
+from olympia.amo.templatetags.jinja_helpers import absolutify
+from olympia.amo.utils import (
+    attach_trans_dict,
+    generate_lowercase_homoglyphs_variants_for_string,
+    normalize_string_for_name_checks,
+)
+from olympia.constants.scanners import (
+    ABORTED,
+    ABORTING,
+    COMPLETED,
+    NARC,
+    RUNNING,
+    SCANNER_RESULTS_MISSING_RULE_NAME,
+    WEBHOOK,
+    WEBHOOK_DURING_VALIDATION,
+    WEBHOOK_EVENTS,
+    WEBHOOK_EVENTS_AGGREGATED_BY_ON_VERSION_SCANNED,
+    WEBHOOK_EVENTS_SHOULD_RUN_ACTIONS_ON_RESULTS,
+    WEBHOOK_MAX_RETRIES,
+    WEBHOOK_ON_LISTING_CHANGED,
+    WEBHOOK_ON_VERSION_CREATED,
+    WEBHOOK_ON_VERSION_SCANNED,
+    YARA,
+)
+from olympia.devhub.tasks import validation_task
+from olympia.files.models import FileManifest, FileUpload
+from olympia.files.utils import ManifestJSONExtractor, SafeZip
+from olympia.versions.models import Version
+
+from .models import (
+    ImproperScannerQueryRuleStateError,
+    ScannerMatch,
+    ScannerQueryResult,
+    ScannerQueryRule,
+    ScannerResult,
+    ScannerRule,
+    ScannerWebhookEvent,
+)
+from .utils import validate_scanner_results
+
+
+log = olympia.core.logger.getLogger('z.scanners.task')
+
+
+class ScannerResultsMissingError(Exception):
+    """Raised to make Celery retry when some scanners owe us results."""
+
+
+def make_adapter_with_retry():
+    adapter = HTTPAdapter(
+        max_retries=Retry(
+            total=1,
+            allowed_methods=['POST'],
+            status_forcelist=[500, 502, 503, 504],
+        )
+    )
+    return adapter
+
+
+@validation_task
+def call_webhooks_during_validation(results, upload_pk):
+    log.info('Calling webhooks for FileUpload %s.', upload_pk)
+    upload = FileUpload.objects.get(pk=upload_pk)
+
+    try:
+        if not os.path.exists(upload.file_path):
+            raise ValueError(f'FileUpload "{upload.file_path}" does not exist.')
+
+        call_webhooks(
+            event_id=WEBHOOK_DURING_VALIDATION,
+            payload=build_webhook_payload(WEBHOOK_DURING_VALIDATION, upload=upload),
+            upload=upload,
+        )
+
+        log.info('All webhooks have been called for FileUpload %s.', upload_pk)
+    except Exception:
+        log.exception('Error while calling webhooks for FileUpload %s.', upload_pk)
+        if not waffle.switch_is_active('ignore-exceptions-in-scanner-tasks'):
+            raise
+
+    return results
+
+
+def call_webhooks(event_id, payload, upload=None, version=None, activity_log=None):
+    errors = []
+
+    for event in ScannerWebhookEvent.objects.filter(
+        event=event_id,
+        is_active=True,
+        webhook__is_active=True,
+    ).all():
+        request_id = uuid.uuid4().hex
+        log.info('Calling webhook "%s" request_id=%s.', event.webhook.name, request_id)
+        statsd_name = _get_webhook_statsd_name(event)
+
+        try:
+            scanner_result = ScannerResult.objects.create(
+                scanner=WEBHOOK,
+                webhook_event=event,
+                upload=upload,
+                version=version,
+                activity_log=activity_log,
+            )
+
+            _deliver_webhook(
+                scanner_result=scanner_result,
+                payload=payload,
+                request_id=request_id,
+            )
+
+            statsd.incr(f'{statsd_name}.success')
+        except Exception as exc:
+            statsd.incr(f'{statsd_name}.failure')
+            log.exception('Error while calling webhook "%s".', event.webhook.name)
+            # Keep going because a missing scanner result blocks auto-approval
+            # forever otherwise.
+            errors.append(exc)
+
+    if errors:
+        event_name = WEBHOOK_EVENTS.get(event_id, event_id)
+        raise ExceptionGroup(f'Error while calling "{event_name}" webhooks', errors)
+
+
+def _get_webhook_statsd_name(event):
+    event_name = WEBHOOK_EVENTS.get(event.event, event.event)
+    return f'devhub.webhook.{slugify(event.webhook.name)}.{event_name}'
+
+
+def _deliver_webhook(*, scanner_result, payload, request_id):
+    """Call the webhook for an existing ScannerResult and store what it
+    returned. Exceptions are left to the caller."""
+    event = scanner_result.webhook_event
+    previous_results = scanner_result.results
+
+    with statsd.timer(_get_webhook_statsd_name(event)):
+        data = _call_webhook(
+            webhook=event.webhook,
+            payload={
+                **payload,
+                'event': WEBHOOK_EVENTS.get(event.event, event.event),
+                'scanner_result_url': absolutify(
+                    reverse(
+                        'v5:scanner-result-patch',
+                        args=[scanner_result.pk],
+                    )
+                ),
+            },
+            request_id=request_id,
+        )
+
+    scanner_result.reload()
+    if scanner_result.results == previous_results:
+        # Don't overwrite the results the scanner may have sent while we were
+        # calling it.
+        scanner_result.results = data
+        # We don't pass `update_fields` because the `save()` method also
+        # updates other fields (e.g. has_matches, matched_rules).
+        scanner_result.save()
+        maybe_run_actions_for_webhook_result(scanner_result)
+
+    maybe_call_webhooks_on_version_scanned(scanner_result)
+
+
+def maybe_call_webhooks_on_version_scanned(scanner_result):
+    if (
+        scanner_result.version_id
+        and scanner_result.is_complete
+        and scanner_result.webhook_event.event
+        in WEBHOOK_EVENTS_AGGREGATED_BY_ON_VERSION_SCANNED
+    ):
+        call_webhooks_on_version_scanned.delay(version_pk=scanner_result.version_id)
+
+
+def maybe_run_actions_for_webhook_result(scanner_result):
+    """Queue the scanner actions for a webhook result that has just been
+    completed, if its event runs actions on results."""
+    if (
+        scanner_result.webhook_event.event
+        in WEBHOOK_EVENTS_SHOULD_RUN_ACTIONS_ON_RESULTS
+        and scanner_result.is_complete
+        and scanner_result.has_matches
+    ):
+        run_actions_for_scanner_result.delay(scanner_result.pk)
+
+
+@task
+@use_primary_db
+def call_webhooks_on_listing_changed(version_pk, *, reason):
+    """Call the webhooks subscribed to `on_listing_changed` after a change to
+    the listing or the authors of the add-on `version` belongs to."""
+    from olympia.scanners.serializers import (
+        WebhookAddonSerializer,
+        WebhookVersionSerializer,
+    )
+
+    log.info(
+        'Calling webhooks for listing change of Version %s (reason = %s)',
+        version_pk,
+        reason,
+    )
+
+    try:
+        version = Version.unfiltered.get(pk=version_pk)
+
+        call_webhooks(
+            event_id=WEBHOOK_ON_LISTING_CHANGED,
+            payload={
+                'addon': WebhookAddonSerializer(version.addon).data,
+                'version': WebhookVersionSerializer(version).data,
+                'reason': reason,
+            },
+            version=version,
+        )
+    except Exception:
+        log.exception('Error while calling webhooks for Version %s', version_pk)
+
+
+def build_webhook_payload(event_id, *, upload=None, version=None):
+    """Return the payload for the given event.
+
+    Only supports the events we might have to deliver more than once."""
+    from olympia.scanners.serializers import (
+        WebhookAddonSerializer,
+        WebhookVersionSerializer,
+    )
+
+    if event_id == WEBHOOK_DURING_VALIDATION:
+        return {'download_url': upload.get_authenticated_download_url()}
+
+    if event_id == WEBHOOK_ON_VERSION_CREATED:
+        return {
+            'addon': WebhookAddonSerializer(version.addon).data,
+            'version': WebhookVersionSerializer(version).data,
+        }
+
+    if event_id == WEBHOOK_ON_VERSION_SCANNED:
+        return {
+            'addon': WebhookAddonSerializer(version.addon).data,
+            'version': WebhookVersionSerializer(version).data,
+            'scanner_results': _build_scanner_results(version),
+        }
+
+    raise ValueError(f'No payload for webhook event {event_id}')
+
+
+def _build_scanner_results(version):
+    """Return the results of the events aggregated into `on_version_scanned`,
+    as a mapping of event name to scanner name to results."""
+    # Always expose every aggregated event, even when no scanner is listening
+    # to it, so that the payload has a stable shape.
+    scanner_results = {
+        WEBHOOK_EVENTS[event_id]: {}
+        for event_id in WEBHOOK_EVENTS_AGGREGATED_BY_ON_VERSION_SCANNED
+    }
+
+    # Only completed results, including those of webhooks deactivated since
+    # the version was created.
+    for result in (
+        ScannerResult.objects.filter(
+            ScannerResult.complete_q,
+            version=version,
+            webhook_event__event__in=WEBHOOK_EVENTS_AGGREGATED_BY_ON_VERSION_SCANNED,
+        )
+        .select_related('webhook_event__webhook')
+        .order_by('pk')
+    ):
+        # When a scanner has more than one result for this event and this
+        # version, the last one (by pk) wins.
+        event_name = WEBHOOK_EVENTS[result.webhook_event.event]
+        scanner_results[event_name][result.webhook_event.webhook.name] = result.results
+
+    return scanner_results
+
+
+def _build_payload_for_result(scanner_result):
+    """Return the payload to send again for an existing scanner result, or None
+    when it cannot be rebuilt."""
+    event_id = scanner_result.webhook_event.event
+
+    if event_id == WEBHOOK_DURING_VALIDATION:
+        upload = scanner_result.upload
+        if not upload or not os.path.exists(upload.file_path):
+            log.error(
+                'Cannot call the webhook again for scanner result %s because '
+                'its file upload is gone.',
+                scanner_result.pk,
+            )
+            return None
+        return build_webhook_payload(event_id, upload=upload)
+
+    return build_webhook_payload(event_id, version=scanner_result.version)
+
+
+def _record_missing_results(scanner_result):
+    """Store artificial results for a scanner that never sent us any, so that
+    the version stops waiting on it."""
+    event = scanner_result.webhook_event
+    scanner_result.results = {'matchedRules': [SCANNER_RESULTS_MISSING_RULE_NAME]}
+    scanner_result.save()
+
+    statsd.incr(f'{_get_webhook_statsd_name(event)}.missing_results')
+    log.error(
+        'Giving up on webhook "%s" for version %s, recording missing results '
+        'on scanner result %s.',
+        event.webhook.name,
+        scanner_result.version_id,
+        scanner_result.pk,
+    )
+
+    # This is the last thing we do for this version, so this is also our last
+    # chance to send `on_version_scanned`: the results it aggregates are now
+    # complete, even though we made some of them up.
+    maybe_call_webhooks_on_version_scanned(scanner_result)
+
+
+@task
+@use_primary_db
+def call_webhooks_on_version_scanned(version_pk):
+    """Call the webhooks subscribed to `on_version_scanned` for this version,
+    once we have the results the event aggregates.
+
+    Safe to call as often as we want: it does nothing until the version is
+    ready, and nothing again once the results exist. Creating them is what
+    makes this run the one that delivers the event, so it is also the run that
+    starts waiting for the answers."""
+    version = Version.unfiltered.get(pk=version_pk)
+
+    if is_waiting_on_scanner_webhook_events(
+        version=version, event_ids=WEBHOOK_EVENTS_AGGREGATED_BY_ON_VERSION_SCANNED
+    ):
+        return
+
+    # The results of the scanners subscribed to `on_version_scanned`, which
+    # they will fill in. Not to be confused with the results we send them.
+    pending_results = []
+    with transaction.atomic():
+        # Lock the version row, so that two runs cannot create two results for
+        # the same event and deliver it twice. `exists()` drops the manager's
+        # `select_related()`, so we only lock that row.
+        Version.unfiltered.select_for_update().filter(pk=version_pk).exists()
+
+        for event in ScannerWebhookEvent.to_wait_for(
+            version=version, event_ids=[WEBHOOK_ON_VERSION_SCANNED]
+        ):
+            if ScannerResult.objects.filter(
+                version=version, webhook_event=event
+            ).exists():
+                # We have already delivered this event.
+                continue
+
+            pending_results.append(
+                ScannerResult.objects.create(
+                    scanner=WEBHOOK, webhook_event=event, version=version
+                )
+            )
+
+    if not pending_results:
+        return
+
+    # Built once: every scanner gets the same results.
+    payload = build_webhook_payload(WEBHOOK_ON_VERSION_SCANNED, version=version)
+
+    for scanner_result in pending_results:
+        event = scanner_result.webhook_event
+        statsd_name = _get_webhook_statsd_name(event)
+        request_id = uuid.uuid4().hex
+        log.info(
+            'Calling webhook "%s" for version %s request_id=%s.',
+            event.webhook.name,
+            version_pk,
+            request_id,
+        )
+
+        try:
+            _deliver_webhook(
+                scanner_result=scanner_result,
+                payload=payload,
+                request_id=request_id,
+            )
+            statsd.incr(f'{statsd_name}.success')
+        except Exception:
+            statsd.incr(f'{statsd_name}.failure')
+            log.exception(
+                'Error while calling webhook "%s" for version %s.',
+                event.webhook.name,
+                version_pk,
+            )
+
+    if any(not result.is_complete for result in pending_results):
+        # Some scanners will answer later. Start a chain to wait for them: the
+        # one started when the version was created only waits for the events
+        # we aggregate.
+        log.info(
+            'Waiting for the `on_version_scanned` results of version %s.', version_pk
+        )
+        wait_for_scanner_results.apply_async(
+            kwargs={
+                'version_pk': version_pk,
+                'event_ids': [WEBHOOK_ON_VERSION_SCANNED],
+            },
+            countdown=settings.SCANNER_WEBHOOK_RETRY_DELAY,
+        )
+
+
+def scanner_webhook_events_to_wait_for(version):
+    """The events `version` is currently waiting on, i.e. which of the two
+    steps of `wait_for_scanner_results` it is in."""
+    if is_waiting_on_scanner_webhook_events(
+        version=version, event_ids=WEBHOOK_EVENTS_AGGREGATED_BY_ON_VERSION_SCANNED
+    ):
+        return WEBHOOK_EVENTS_AGGREGATED_BY_ON_VERSION_SCANNED
+    return [WEBHOOK_ON_VERSION_SCANNED]
+
+
+def is_waiting_on_scanner_webhook_events(*, version, event_ids):
+    """Return whether `version` is still waiting on any active scanner webhook
+    subscribed to one of `event_ids`.
+
+    For each of those events we are simultaneously waiting for two things:
+
+    1. The async task triggered by the event to run and create a `ScannerResult`
+       for the version.
+    2. The scanner to populate `results` on that result, which means the scanner
+       finished (see `ScannerResult.is_complete`).
+
+    Returns True as long as at least one expected scanner result is missing or
+    has not yet been completed by the scanner.
+    """
+    # If there is no event, that means no active scanner is listening to those
+    # events, so the version isn't waiting on scanners.
+    events = ScannerWebhookEvent.to_wait_for(version=version, event_ids=event_ids)
+    expected_event_ids = set(events.values_list('pk', flat=True))
+    if not expected_event_ids:
+        return False
+
+    # We collect the events rather than count the results, because a single
+    # event can have more than one result for a version.
+    completed_event_ids = set(
+        ScannerResult.objects.filter(
+            ScannerResult.complete_q,
+            version=version,
+            webhook_event__in=expected_event_ids,
+        ).values_list('webhook_event_id', flat=True)
+    )
+
+    return not expected_event_ids.issubset(completed_event_ids)
+
+
+@task(
+    bind=True,
+    autoretry_for=(ScannerResultsMissingError,),
+    max_retries=WEBHOOK_MAX_RETRIES,
+    default_retry_delay=settings.SCANNER_WEBHOOK_RETRY_DELAY,
+)
+@use_primary_db
+def wait_for_scanner_results(self, version_pk, event_ids=None):
+    """Call the webhooks subscribed to `event_ids` that still owe us results
+    again, retrying at a fixed interval until they answer, then record
+    artificial results matching the SCANNER_RESULTS_MISSING rule to stop
+    waiting.
+
+    We wait in two steps because `on_version_scanned` cannot be sent before we
+    have the results it aggregates: a chain started for those events hands over
+    to a chain started for `on_version_scanned` once they are all in."""
+    # This is needed to handle tasks queued before we added the `event_ids`
+    # param to this function's signature.
+    if event_ids is None:
+        event_ids = WEBHOOK_EVENTS_AGGREGATED_BY_ON_VERSION_SCANNED
+
+    if waffle.switch_is_active('disable-wait-for-scanner-results'):
+        log.info(
+            'Not waiting for scanner results for version %s, switch is active.',
+            version_pk,
+        )
+        return
+
+    version = Version.unfiltered.get(pk=version_pk)
+    events = ScannerWebhookEvent.to_wait_for(version=version, event_ids=event_ids)
+    pending = [
+        scanner_result
+        for scanner_result in ScannerResult.objects.filter(
+            version=version, webhook_event__in=events
+        ).select_related('webhook_event__webhook')
+        if not scanner_result.is_complete
+    ]
+
+    if not pending:
+        log.info('All scanners have sent their results for version %s.', version_pk)
+        # The results `on_version_scanned` aggregates may be what we were
+        # waiting for. Does nothing once the event has been sent.
+        call_webhooks_on_version_scanned.delay(version_pk=version_pk)
+        return
+
+    give_up = self.request.retries >= WEBHOOK_MAX_RETRIES
+    still_pending = False
+
+    for scanner_result in pending:
+        if give_up:
+            _record_missing_results(scanner_result)
+            continue
+
+        event = scanner_result.webhook_event
+        statsd_name = _get_webhook_statsd_name(event)
+        try:
+            payload = _build_payload_for_result(scanner_result)
+            if payload is None:
+                # There is nothing we could send again, so no point waiting.
+                _record_missing_results(scanner_result)
+                continue
+
+            request_id = uuid.uuid4().hex
+            log.info(
+                'Calling webhook "%s" again for version %s retry=%s/%s request_id=%s.',
+                event.webhook.name,
+                version_pk,
+                self.request.retries + 1,
+                WEBHOOK_MAX_RETRIES,
+                request_id,
+            )
+            _deliver_webhook(
+                scanner_result=scanner_result,
+                payload=payload,
+                request_id=request_id,
+            )
+            statsd.incr(f'{statsd_name}.success')
+        except Exception:
+            statsd.incr(f'{statsd_name}.failure')
+            log.exception(
+                'Error while calling webhook "%s" again for version %s.',
+                event.webhook.name,
+                version_pk,
+            )
+
+        if not scanner_result.is_complete:
+            still_pending = True
+
+    if still_pending:
+        raise ScannerResultsMissingError(
+            f'Still waiting on scanner results for version {version_pk}.'
+        )
+
+
+def _call_webhook(*, webhook, payload, request_id):
+    with requests.Session() as http:
+        adapter = make_adapter_with_retry()
+        http.mount('http://', adapter)
+        http.mount('https://', adapter)
+
+        data = json.dumps(payload)
+        digest = hmac.new(
+            webhook.api_key.encode(),
+            msg=data.encode(),
+            digestmod=hashlib.sha256,
+        ).hexdigest()
+
+        response = http.post(
+            url=webhook.url,
+            data=data,
+            timeout=settings.SCANNER_TIMEOUT,
+            headers={
+                'Content-Type': 'application/json',
+                'Authorization': f'HMAC-SHA256 {digest}',
+                REQUEST_ID_HEADER: request_id,
+            },
+        )
+
+    # A 204 HTTP status code means the scanner skipped the event, so we can
+    # early return, and we'll set the `results` to `None`.
+    if response.status_code == 204:
+        return None
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        # Log the response body when JSON decoding has failed.
+        raise ValueError(response.text) from exc
+
+    if response.status_code not in [200, 201, 202] or 'error' in data:
+        raise ValueError(data)
+
+    # A 202 is an acknowledgment, results are sent later via the API.
+    if response.status_code != 202:
+        validate_scanner_results(data)
+    elif 'matchedRules' in data:
+        raise ValueError("'matchedRules' is not allowed in a 202 response")
+
+    return data
+
+
+@task
+@use_primary_db
+def run_actions_for_scanner_result(scanner_result_pk):
+    """Execute the scanner actions for the rules newly matched by a scanner
+    result, i.e. not matched by an older result for the same event and
+    version."""
+    log.info('Starting run actions task for ScannerResult %s.', scanner_result_pk)
+    scanner_result = ScannerResult.objects.get(pk=scanner_result_pk)
+    matched_rule_pks = set(scanner_result.matched_rules.values_list('pk', flat=True))
+    previously_matched_rule_pks = set(
+        ScannerMatch.objects.filter(
+            result__version=scanner_result.version_id,
+            result__webhook_event=scanner_result.webhook_event_id,
+            # Only look at older results, otherwise two results matching the
+            # same rule close together would each skip because of the other.
+            result__pk__lt=scanner_result.pk,
+        ).values_list('rule_id', flat=True)
+    )
+    rule_pks = sorted(matched_rule_pks - previously_matched_rule_pks)
+
+    if not rule_pks:
+        log.info(
+            'No new matched rule for ScannerResult %s, not running any action.',
+            scanner_result_pk,
+        )
+        return
+
+    ScannerResult.run_actions(scanner_result.version, rules=rule_pks)
+    log.info('Ending run actions task for ScannerResult %s.', scanner_result_pk)
+
+
+@task
+@use_primary_db
+def run_narc_on_version(version_pk, *, run_actions_on_match=True):
+    log.info('Starting narc task for Version %s.', version_pk)
+    try:
+        version = (
+            Version.unfiltered.all()
+            .no_transforms()
+            .select_related('file__file_manifest')
+            .get(pk=version_pk)
+        )
+        scanner_result, initial_run = ScannerResult.objects.get_or_create(
+            scanner=NARC, version=version
+        )
+        with statsd.timer('devhub.narc'):
+            scanner_result, has_new_matches = _run_narc(
+                version=version, scanner_result=scanner_result
+            )
+        scanner_result.save()
+
+        if initial_run:
+            statsd_suffix = ''
+        else:
+            statsd_suffix = '.rerun'
+        if scanner_result.has_matches:
+            statsd.incr(f'devhub.narc{statsd_suffix}.has_matches')
+        for scanner_rule in scanner_result.matched_rules.all():
+            statsd.incr(f'devhub.narc{statsd_suffix}.rule.{scanner_rule.id}.match')
+        if not initial_run and has_new_matches:
+            statsd.incr(f'devhub.narc{statsd_suffix}.results_differ')
+
+        if run_actions_on_match and has_new_matches:
+            ScannerResult.run_actions(version)
+    except Exception:
+        statsd.incr('devhub.narc.failure')
+        log.exception('Error in scanner "narc" task for Version %s.', version_pk)
+        # Not part of the submission process, so we can always raise.
+        raise
+    else:
+        statsd.incr('devhub.narc.success')
+    log.info('Ending scanner "narc" task for Version %s.', version_pk)
+
+
+def _run_narc(*, scanner_result, version, rules=None):
+    if not rules:
+        rules = ScannerRule.objects.filter(
+            scanner=NARC, is_active=True, definition__isnull=False
+        ).exclude(definition='')
+    results = (
+        # Convert existing results to a list of strings to allow results to be
+        # hashed to avoid adding duplicates when re-scanning. See result.add()
+        # call below and the conversion back at the end before saving as well.
+        {
+            json.dumps(result, sort_keys=True)
+            for result in (scanner_result.results or [])
+        }
+    )
+    addon = version.addon
+    if not hasattr(addon, 'translations'):
+        attach_trans_dict(Addon, [addon], field_names=['name', 'summary'])
+    name_values_from_db = dict(addon.translations[addon.name_id])
+    summary_values_from_db = dict(addon.translations[addon.summary_id])
+    values_from_authors = [
+        author.display_name
+        for author in addon.authors.all()
+        if author.display_name is not None
+    ]
+    # Because we're running on a Version, not a FileUpload, we should already
+    # have a FileManifest, so we don't even need to parse the XPI to grab the
+    # fields we want to look at - we can just build a dict with the data needed
+    # for resolve_webext_translations() to work.
+    try:
+        manifest_data = version.file.file_manifest.manifest_data
+        data = {
+            'name': manifest_data.get('name'),
+            # The dictionary key needs to match the Addon field that will
+            # determine the max length to obey. `description` in the manifest
+            # is used to populate Addon.summary, so the dictionary key needs to
+            # be called `summary`.
+            'summary': manifest_data.get('description'),
+            'default_locale': manifest_data.get('default_locale'),
+        }
+    except FileManifest.DoesNotExist:
+        # Something else should stop us if the FileManifest is absent, NARC
+        # shouldn't fail for that. This means validation was forced by an admin
+        # or something similar.
+        data = {}
+    # Find all translations from the XPI if necessary for fields we care about,
+    # using the dictionary built from the manifest above.
+    resolved_translations = Addon.resolve_webext_translations(
+        data, version.file.file, fields=('name', 'summary')
+    )
+    # If we find None or a string, we returned early without bothering to open
+    # the XPI because the `name` wasn't present or translated in the manifest.
+    # We still build a dict for ease of use later.
+    name_values_from_xpi = resolved_translations.get('name', {})
+    if name_values_from_xpi is None or isinstance(name_values_from_xpi, str):
+        name_values_from_xpi = {None: name_values_from_xpi or ''}
+    # As mentioned above, the dictionary key for the `description` field in the
+    # manifest is called `summary`.
+    description_values_from_xpi = resolved_translations.get('summary', {})
+    if description_values_from_xpi is None or isinstance(
+        description_values_from_xpi, str
+    ):
+        description_values_from_xpi = {None: description_values_from_xpi or ''}
+
+    # Gather all values into a dict to avoid repeating the same costly search
+    # on duplicate values.
+    values = defaultdict(list)
+    for source, (locale, value) in itertools.chain(
+        zip(itertools.repeat('xpi'), name_values_from_xpi.items()),
+        zip(itertools.repeat('xpi_description'), description_values_from_xpi.items()),
+        zip(itertools.repeat('db_addon'), name_values_from_db.items()),
+        zip(itertools.repeat('db_addon_summary'), summary_values_from_db.items()),
+        zip(
+            itertools.repeat('author'),
+            zip(itertools.repeat(None), sorted(values_from_authors)),
+        ),
+        [('slug', (None, addon.slug))],
+    ):
+        values[value].append({'source': source, 'locale': locale})
+
+    # Run each rule on the values we've accumulated.
+    for rule in rules:
+        # We're using `regex`, which is faster/more powerful than the default
+        # `re` module.
+        definition = regex.compile(str(rule.definition), regex.I | regex.E)
+        # For each rule, build a set of the sources to ignore according to the
+        # rule configuration....
+        rule_sources = set()
+        if rule.configuration.get('examine_slug'):
+            rule_sources.add('slug')
+        if rule.configuration.get('examine_xpi_names'):
+            rule_sources.add('xpi')
+        if rule.configuration.get('examine_xpi_descriptions'):
+            rule_sources.add('xpi_description')
+        if rule.configuration.get('examine_authors_names'):
+            rule_sources.add('author')
+        if rule.configuration.get('examine_listing_names'):
+            rule_sources.add('db_addon')
+        if rule.configuration.get('examine_listing_summaries'):
+            rule_sources.add('db_addon_summary')
+
+        for value, sources in values.items():
+            # ... Then for each value we have, look at what sources it came
+            # from, removing those we want to ignore for this rule.
+            sources_to_examine = [
+                source_info
+                for source_info in sources
+                if source_info['source'] in rule_sources
+            ]
+
+            # We are left with a set of sources we're interested in: if it's
+            # empty that means the value is only present in sources the rule
+            # configuration wants to ignore, so we continue to the next one.
+            if not sources_to_examine:
+                continue
+
+            value = str(value)
+            variants = [(value, None)]
+            normalized_value = normalize_string_for_name_checks(value)
+            if (
+                rule.configuration.get('examine_normalized_variants')
+                and normalized_value != value
+            ):
+                variants.append((normalized_value, 'normalized'))
+            homoglyph_variants = set(
+                generate_lowercase_homoglyphs_variants_for_string(normalized_value)
+            )
+            if (
+                rule.configuration.get('examine_homoglyphs_variants')
+                and homoglyph_variants
+            ):
+                variants.extend(
+                    (homoglyph_variant, 'homoglyph')
+                    for homoglyph_variant in homoglyph_variants
+                    if homoglyph_variant != value.lower()
+                    and homoglyph_variant != normalized_value.lower()
+                )
+
+            for variant_string, variant_type in variants:
+                if match := definition.search(variant_string):
+                    for source_info in sources_to_examine:
+                        result = {
+                            'rule': rule.name,
+                            'meta': {
+                                'locale': source_info['locale'],
+                                'source': source_info['source'],
+                                'string': variant_string,
+                            },
+                        }
+                        if any(fuzzy_counts := match.fuzzy_counts):
+                            result['meta']['fuzzy_counts'] = fuzzy_counts
+                        if variant_type is not None:
+                            result['meta']['variant'] = variant_type
+                            result['meta']['original_string'] = value
+                        results.add(json.dumps(result, sort_keys=True))
+
+    has_new_matches = False
+    new_results = [json.loads(result) for result in sorted(results)]
+    if new_results != scanner_result.results:
+        # Either we're scanning this version for the first time, or it's a new
+        # run following some change, but in any case we found new results. We
+        # might need to run ScannerResult.run_actions() as a result, see below.
+        has_new_matches = True
+    scanner_result.results = new_results
+    return scanner_result, has_new_matches
+
+
+@validation_task
+def run_yara(results, upload_pk):
+    """
+    Apply a set of Yara rules on a FileUpload and store the Yara results
+    (matches).
+
+    This task is intended to be run as part of the submission process only.
+    When a version is created from a FileUpload, the files are removed. In
+    addition, we usually delete old FileUpload entries after 180 days.
+
+    - `results` are the validation results passed in the validation chain. This
+       task is a validation task, which is why it must receive the validation
+       results as first argument.
+    - `upload_pk` is the FileUpload ID.
+    """
+    return _run_yara(results, upload_pk)
+
+
+def _run_yara(results, upload_pk):
+    log.info('Starting yara task for FileUpload %s.', upload_pk)
+
+    try:
+        upload = FileUpload.objects.get(pk=upload_pk)
+        scanner_result = ScannerResult(upload=upload, scanner=YARA)
+        _run_yara_for_path(scanner_result, upload.file_path)
+        scanner_result.save()
+
+        if scanner_result.has_matches:
+            statsd.incr('devhub.yara.has_matches')
+            for scanner_rule in scanner_result.matched_rules.all():
+                statsd.incr(f'devhub.yara.rule.{scanner_rule.id}.match')
+
+        statsd.incr('devhub.yara.success')
+        log.info('Ending scanner "yara" task for FileUpload %s.', upload_pk)
+    except Exception:
+        statsd.incr('devhub.yara.failure')
+        log.exception('Error in scanner "yara" task for FileUpload %s.', upload_pk)
+        if not waffle.switch_is_active('ignore-exceptions-in-scanner-tasks'):
+            raise
+
+    return results
+
+
+def _run_yara_for_path(scanner_result, path, definition=None):
+    """
+    Inner function to run yara on a particular path and add results to the
+    given scanner_result. The caller is responsible for saving the
+    scanner_result to the database.
+
+    Takes an optional definition to run a single arbitrary yara rule, otherwise
+    uses all active yara ScannerRules.
+    """
+    with statsd.timer('devhub.yara'):
+        if definition is None:
+            # Retrieve then concatenate all the active/valid Yara rules.
+            definition = '\n'.join(
+                ScannerRule.objects.filter(
+                    scanner=YARA, is_active=True, definition__isnull=False
+                ).values_list('definition', flat=True)
+            )
+        # Initialize external variables so that compilation works, we'll
+        # override them later when matching.
+        externals = ScannerRule.get_yara_externals()
+
+        zip_file = SafeZip(source=path, ignore_filename_errors=True)
+
+        compiler = yara_x.Compiler()
+        # Initialize the global variables (externals).
+        for k, v in externals.items():
+            compiler.define_global(k, v)
+        # Add the yara rule definition.
+        compiler.add_source(definition)
+        # Create a scanner instance so that we can override the externals per
+        # file (in the loop below).
+        scanner = yara_x.Scanner(compiler.build())
+        options = yara_x.ScanOptions()
+        options.set_module_metadata(
+            'amo',
+            json.dumps(
+                {
+                    'manifest': (
+                        ManifestJSONExtractor(zip_file.read('manifest.json')).data
+                        if zip_file.exists('manifest.json')
+                        else {}
+                    )
+                }
+            ).encode('utf-8'),
+        )
+
+        for zip_info in zip_file.info_list:
+            if not zip_info.is_dir():
+                file_content = zip_file.read(zip_info)
+                filename = zip_info.filename
+                # Fill externals variable for this file.
+                externals['filename'] = filename
+                externals['is_json_file'] = filename.endswith('.json')
+                externals['is_manifest_file'] = filename == 'manifest.json'
+                externals['is_locale_file'] = filename.startswith(
+                    '_locales/'
+                ) and filename.endswith('/messages.json')
+
+                for k, v in externals.items():
+                    scanner.set_global(k, v)
+
+                for match in scanner.scan_with_options(
+                    file_content, options
+                ).matching_rules:
+                    # Also add the filename to the meta dict in results.
+                    meta = {**dict(match.metadata), 'filename': filename}
+                    scanner_result.add_yara_result(
+                        rule=match.identifier, tags=match.tags, meta=meta
+                    )
+        zip_file.close()
+
+
+@task
+@use_primary_db
+def mark_scanner_query_rule_as_completed_or_aborted(query_rule_pk):
+    """
+    Mark a ScannerQueryRule as completed/aborted.
+    """
+    rule = ScannerQueryRule.objects.get(pk=query_rule_pk)
+    try:
+        if rule.state == RUNNING:
+            log.info('Marking Scanner Query Rule %s as completed', rule.pk)
+            rule.change_state_to(COMPLETED)
+        elif rule.state == ABORTING:
+            log.info('Marking Scanner Query Rule %s as aborted', rule.pk)
+            rule.change_state_to(ABORTED)
+    except ImproperScannerQueryRuleStateError:
+        log.error(
+            'Not marking rule as completed or aborted for rule %s in '
+            'mark_scanner_query_rule_as_completed_or_aborted, its state is '
+            '%s',
+            rule.pk,
+            rule.get_state_display(),
+        )
+
+
+@task
+def run_scanner_query_rule(query_rule_pk):
+    """
+    Run a specific ScannerQueryRule on multiple Versions.
+
+    Needs the rule to be a the SCHEDULED state, otherwise does nothing.
+    """
+    # We're not forcing this task to happen on primary db to let the replicas
+    # handle the Version query below, but we want to fetch the rule using the
+    # primary db in all cases.
+    rule = ScannerQueryRule.objects.using('default').get(pk=query_rule_pk)
+    try:
+        rule.change_state_to(RUNNING)
+    except ImproperScannerQueryRuleStateError:
+        log.error(
+            'Not proceeding with run_scanner_query_rule on rule %s because '
+            'its state is %s',
+            rule.pk,
+            rule.get_state_display(),
+        )
+        return
+    log.info('Fetching versions for run_scanner_query_rule on rule %s', rule.pk)
+    # Build a huge list of all pks we're going to run the tasks on.
+    qs = Version.unfiltered.filter(
+        addon__type=amo.ADDON_EXTENSION, file__isnull=False
+    ).exclude(file__file='')
+    if not rule.run_on_disabled_addons:
+        qs = qs.exclude(addon__status=amo.STATUS_DISABLED)
+    if rule.run_on_specific_channels:
+        qs = qs.filter(channel__in=rule.run_on_specific_channels)
+    if rule.run_on_current_version_only:
+        qs = qs.filter(pk=F('addon___current_version'))
+    if rule.created_after:
+        qs = qs.filter(created__gte=rule.created_after)
+    if rule.exclude_promoted_addons:
+        qs = qs.exclude(addon__promotedaddon__isnull=False)
+    qs = qs.values_list('id', flat=True).order_by('-pk')
+    # Build the workflow using a group of tasks dealing with 250 files at a
+    # time, chained to a task that marks the query as completed.
+    chunk_size = 250
+    chunked_tasks = create_chunked_tasks_signatures(
+        run_scanner_query_rule_on_versions_chunk,
+        list(qs),
+        chunk_size,
+        task_args=(query_rule_pk,),
+    )
+    # Force the group id to be generated for those tasks, and store it in the
+    # result backend.
+    group_result = chunked_tasks.freeze()
+    group_result.save()
+    rule.update(
+        task_count=len(chunked_tasks), celery_group_result_id=uuid.UUID(group_result.id)
+    )
+    workflow = chunked_tasks | mark_scanner_query_rule_as_completed_or_aborted.si(
+        query_rule_pk
+    )
+    log.info(
+        'Running workflow of %s tasks for run_scanner_query_rule on rule %s',
+        len(chunked_tasks),
+        rule.pk,
+    )
+    # Fire it up.
+    workflow.apply_async()
+
+
+@task(ignore_result=False)  # We want the results to track completion rate.
+def run_scanner_query_rule_on_versions_chunk(version_pks, query_rule_pk):
+    """
+    Task to run a specific ScannerQueryRule on a list of versions.
+
+    Needs the rule to be a the RUNNING state, otherwise does nothing.
+    """
+    log.info(
+        'Running Scanner Query Rule %s on versions %s-%s.',
+        query_rule_pk,
+        version_pks[0],
+        version_pks[-1],
+    )
+    # Like run_scanner_query_rule() we don't want to decorate this function to
+    # force it to run on the primary, we want to leverage the replicas as much
+    # as possible while avoiding raising if replication lag causes the rule not
+    # to exist yet when the task is triggered.
+    rule = ScannerQueryRule.objects.all().get_with_primary_fallback(pk=query_rule_pk)
+    if rule.state != RUNNING:
+        log.info(
+            'Not doing anything for Scanner Query Rule %s on versions %s-%s '
+            'since rule state is %s.',
+            query_rule_pk,
+            version_pks[0],
+            version_pks[-1],
+            rule.get_state_display(),
+        )
+        return
+    qs = (
+        Version.unfiltered.all()
+        .select_related('addon__addonguid', 'blockversion')
+        .prefetch_related('addon__promotedaddon')
+        .no_transforms()
+        .filter(pk__in=version_pks)
+        .order_by('pk')
+    )
+    if rule.scanner == NARC:
+        qs = qs.select_related('addon', 'file__file_manifest').prefetch_related(
+            # We don't need their roles or whether they are listed, so we can
+            # use a simple prefetch. Otherwise this would not work correctly,
+            # see Addon._attach_authors().
+            'addon__authors'
+        )
+        # Attaching translations is not lazy so do this last, it evaluates the
+        # queryset.
+        attach_trans_dict(
+            Addon, [version.addon for version in qs], field_names=['name', 'summary']
+        )
+    results = []
+    for version in qs:
+        try:
+            if result := _run_scanner_query_rule_on_version(version, rule):
+                results.append(result)
+        except Exception:
+            log.exception(
+                'Error in run_scanner_query_rule_on_version task for Version %s.',
+                version.pk,
+            )
+    ScannerQueryResult.objects.bulk_create(results)
+
+
+def _run_scanner_query_rule_on_version(version, rule):
+    """
+    Run a specific ScannerQueryRule on a Version.
+    """
+    file_ = version.file
+    scanner_result = ScannerQueryResult(version=version, scanner=rule.scanner)
+    if rule.scanner == YARA:
+        _run_yara_for_path(scanner_result, file_.file.path, definition=rule.definition)
+    elif rule.scanner == NARC:
+        _run_narc(scanner_result=scanner_result, version=version, rules=[rule])
+    else:
+        raise NotImplementedError
+
+    # Unlike ScannerResult, we only want to save ScannerQueryResult if there is
+    # a match, there would be too many things to save otherwise and we don't
+    # really care about non-matches.
+    if not scanner_result.results:
+        return None
+
+    # Make sure to use our prefetch_related() here to avoid extra queries.
+    scanner_result.was_blocked = version.is_blocked
+    scanner_result.was_promoted = version.addon.promotedaddon.exists()
+    # We're going to create results in bulk in the parent, bypassing .save() so
+    # we need to add the matched_rule ourselves.
+    scanner_result.matched_rule = rule
+    return scanner_result
